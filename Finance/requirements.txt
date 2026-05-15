@@ -3,8 +3,16 @@ python-dotenv==1.1.1
 langchain-openai==0.3.30
 langchain-core==0.3.74
 baostock==0.8.9
+akshare>=1.14.0
 peft==0.17.0
 langchain-mcp-adapters==0.1.9
 transformers==4.51.3
 huggingface-hub==0.34.4
-uv==0.8.12
+streamlit==1.45.0
+fastapi==0.115.12
+uvicorn==0.34.2
+httpx==0.28.1
+google-genai>=0.3.0
+backoff>=2.2.0
+openpyxl>=3.1.0
+fpdf2>=2.8.0

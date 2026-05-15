@@ -11,6 +11,8 @@ import re
 from src.utils.state_definition import AgentState
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
+from src.utils.model_config import get_model_config_for_agent
+from src.utils.pdf_generator import markdown_to_pdf
 from dotenv import load_dotenv
 
 # 从.env文件加载环境变量
@@ -48,19 +50,19 @@ def truncate_report_at_baseline_time(report_content: str, current_time_info: str
     for pattern in baseline_patterns:
         match = re.search(pattern, report_content, re.MULTILINE | re.IGNORECASE)
         if match:
-            # 找到匹配位置，截断到该行的末尾
-            end_pos = match.end()
-
-            # 查找该行的结束位置（换行符）
-            line_end = report_content.find('\n', end_pos)
+            # 找到"分析基准时间"行，检查它是否在报告开头（标题之后）
+            # 如果是，说明这是正常的报告结构，返回完整内容
+            line_end = report_content.find('\n', match.end())
             if line_end == -1:
-                # 如果没有换行符，说明是最后一行，直接截断
-                truncated_content = report_content[:end_pos].strip()
-            else:
-                # 截断到该行结束
-                truncated_content = report_content[:line_end].strip()
-
-            logger.info(f"截断报告在'分析基准时间'行之后，截断位置: {end_pos}")
+                line_end = match.end()
+            # 如果基准时间行在报告前500字符内，说明是正常的报告头部，
+            # 保留完整内容（标题+基准时间+正文），只在末尾做LLM续写截断
+            if match.start() < 500:
+                logger.info(f"分析基准时间在报告头部(位置{match.start()})，保留完整内容")
+                return report_content.strip()
+            # 如果基准时间出现在报告中部（重复标题），截断到此处
+            truncated_content = report_content[:line_end].strip()
+            logger.info(f"截断报告在重复'分析基准时间'行，截断位置: {match.end()}")
             return truncated_content
 
     # 如果没有找到匹配的模式，尝试查找包含时间信息的行
@@ -119,7 +121,7 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
     # 记录 Agent开始时间，用于计算执行时长
     agent_start_time = time.time()
 
-    # 获取之前 Agent的分析结果
+    # 获取之前 Agent的分析结果（mimo 大上下文，无需截断）
     fundamental_analysis = current_data.get(
         "fundamental_analysis", "Not available")
     technical_analysis = current_data.get(
@@ -244,8 +246,24 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
           - 适合的投资者类型（稳健型/成长型/风险偏好型）
         ]
 
+        ## 数据可靠性声明
+        [必须包含以下内容：
+        - 列出各分析模块的数据完整度（如：基本面数据完整/技术面数据部分缺失）
+        - 标注哪些结论有直接数据支撑，哪些是分析师推断
+        - 如果某个分析模块的数据完全缺失，必须在此明确声明
+        - 声明格式："数据可靠性评估：[高/中/低]，具体说明..."]
+
         ## 附录：数据来源与限制
-        [说明数据来源(Baostock、百度新闻等)，以及分析过程中遇到的任何数据限制或缺失]
+        [说明数据来源(MCP工具、Tushare、新浪等)，以及分析过程中遇到的任何数据限制或缺失]
+
+        ⛔ 防幻觉输出规则（必须严格遵守）：
+        1. 报告中使用以下标记区分信息来源：
+           - **[数据]** 开头 = 该陈述有API返回的具体数据支持
+           - **[判断]** 开头 = 该陈述是分析师的推断或观点
+        2. 每个关键结论前必须标注 [数据] 或 [判断]
+        3. 如果某个分析模块数据缺失，必须写"该模块数据不可用"而不是编造内容
+        4. 评分章节中的分数是判断，但必须引用 [数据] 段落中的具体数值作为依据
+        5. 绝对禁止编造任何数值、新闻、公司名、或未在分析输入中出现的事实
 
         输出必须是有效的Markdown格式，使用适当的标题、项目符号和格式。
         不要包含任何代码块标记，如```markdown或```，直接输出纯Markdown内容。
@@ -260,6 +278,7 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         - 严格按照上述格式和结构生成报告，确保每个章节都有实质性内容
         - 分析要有数据支撑，避免空洞的定性描述，尽量引用具体数字
         - **评分必须为0-100之间的具体整数**，不得省略
+        - **所有陈述必须标注 [数据] 或 [判断]，不可遗漏**
 
         如果某些分析数据不完整或有错误，请在报告中明确说明，并尽可能基于可用信息提供有价值的分析。
         """
@@ -295,10 +314,11 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         # 使用OpenAI API生成报告
         logger.info(f"{WAIT_ICON} SummaryAgent: Using OpenAI API...")
 
-        # 创建OpenAI模型
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+        # 模型配置：优先 state 覆盖（快筛），否则使用 agent 分配的模型 (MiMo-V2.5-Pro)
+        model_cfg = get_model_config_for_agent("summary_agent", current_data)
+        api_key = model_cfg["api_key"]
+        base_url = model_cfg["base_url"]
+        model_name = model_cfg["model_name"]
 
         # 验证必要的环境变量是否存在
         if not all([api_key, base_url, model_name]):
@@ -333,8 +353,9 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
             api_key=api_key,
             base_url=base_url,
             temperature=1.0,
+            request_timeout=720,
             max_tokens=32000,
-            extra_body={"thinking": {"type": "enabled"}}
+            extra_body={"thinking": {"type": "enabled"}}  # 大上下文+深度思考，需要充足时间
         )
 
         # 记录LLM交互开始时间
@@ -361,14 +382,14 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         final_report = final_report.replace(
             "```markdown", "").replace("```", "").strip()
 
-        # 使用正则表达式截断"分析基准时间"那一行之后的内容
-        final_report = truncate_report_at_baseline_time(final_report, current_time_info)
+        # 保留完整报告内容（LLM可能产生少量后记，但不影响正文阅读）
+        # truncate_report_at_baseline_time 存在逻辑缺陷已被禁用
 
         logger.info(
             f"{SUCCESS_ICON} SummaryAgent: Final report generated for {company_name} ({stock_code}).")
         logger.debug(f"Final report preview: {final_report[:300]}...")
 
-        # 将报告保存到Markdown文件
+        # 将报告保存到文件
         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
         # 处理公司名称和股票代码，确保文件名有意义
@@ -390,6 +411,7 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
             safe_file_prefix = f"report_{safe_company_name}_{clean_stock_code}"
 
         report_filename = f"{safe_file_prefix}_{timestamp}.md"
+        pdf_filename = f"{safe_file_prefix}_{timestamp}.pdf"
 
         # 确保reports目录存在
         reports_dir = os.path.join(os.path.dirname(os.path.dirname(
@@ -397,23 +419,42 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         os.makedirs(reports_dir, exist_ok=True)
 
         report_path = os.path.join(reports_dir, report_filename)
+        pdf_path = os.path.join(reports_dir, pdf_filename)
 
-        # 将报告写入文件
+        # 将报告写入 Markdown 文件（保留作为备份）
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(final_report)
 
         logger.info(
             f"{SUCCESS_ICON} SummaryAgent: Report saved to {report_path}")
 
+        # 生成 PDF 版本
+        try:
+            markdown_to_pdf(
+                final_report, pdf_path,
+                company_name=company_name,
+                stock_code=stock_code
+            )
+            logger.info(
+                f"{SUCCESS_ICON} SummaryAgent: PDF report saved to {pdf_path}")
+        except Exception as pdf_err:
+            logger.warning(
+                f"Failed to generate PDF report: {pdf_err}. "
+                f"Markdown report is still available at {report_path}"
+            )
+            pdf_path = None
+
         # 返回更新后的状态，包含最终报告
         current_data["final_report"] = final_report
         current_data["report_path"] = report_path
+        current_data["report_pdf_path"] = pdf_path
 
         # 记录 Agent执行成功
         total_execution_time = time.time() - agent_start_time
         execution_logger.log_agent_complete(agent_name, {
             "final_report_length": len(final_report),
             "report_path": report_path,
+            "report_pdf_path": pdf_path,
             "report_preview": final_report,
             "llm_execution_time": llm_execution_time,
             "total_execution_time": total_execution_time
@@ -464,19 +505,34 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
             safe_file_prefix = f"error_report_{safe_company_name}_{clean_stock_code}"
 
         report_filename = f"{safe_file_prefix}_{timestamp}.md"
+        pdf_filename = f"{safe_file_prefix}_{timestamp}.pdf"
 
         reports_dir = os.path.join(os.path.dirname(os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))), "reports")
         os.makedirs(reports_dir, exist_ok=True)
 
         report_path = os.path.join(reports_dir, report_filename)
+        pdf_path = os.path.join(reports_dir, pdf_filename)
 
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(error_report)
 
         logger.info(
             f"{ERROR_ICON} SummaryAgent: Error report saved to {report_path}")
+
+        # 尝试生成 PDF 版本
+        try:
+            markdown_to_pdf(
+                error_report, pdf_path,
+                company_name=company_name,
+                stock_code=stock_code
+            )
+        except Exception as pdf_err:
+            logger.warning(f"Failed to generate error PDF: {pdf_err}")
+            pdf_path = None
+
         current_data["report_path"] = report_path
+        current_data["report_pdf_path"] = pdf_path
 
         execution_logger.log_agent_complete(
             agent_name, current_data, time.time() - agent_start_time, False, str(e))

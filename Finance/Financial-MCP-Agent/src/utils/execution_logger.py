@@ -176,8 +176,19 @@ class ExecutionLogger:
         # 保存报告日志
         self._save_json(report_log, "reports/final_report_info.json")
 
-        # 保存报告副本
+        # 保存报告 Markdown 副本
         self._save_text(report_content, "reports/final_report.md")
+
+        # 保存报告 PDF 副本
+        try:
+            from src.utils.pdf_generator import markdown_to_pdf
+            pdf_path = str(self.execution_dir / "reports" / "final_report.pdf")
+            markdown_to_pdf(report_content, pdf_path)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug(
+                "Failed to generate PDF for execution log: %s", e
+            )
 
         return report_log
 

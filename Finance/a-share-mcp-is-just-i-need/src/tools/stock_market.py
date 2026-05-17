@@ -211,3 +211,78 @@ def register_stock_market_tools(app: FastMCP, active_data_source: FinancialDataS
             start_date=start_date,
             end_date=end_date,
         )
+
+    @app.tool()
+    def get_st_risk_data(code: str) -> str:
+        """
+        检测A股股票的ST风险状态。
+        通过AkShare/Sina接口获取股票当前名称，判断是否包含ST/*ST标记。
+
+        参数:
+            code: 股票代码（例如：'sh.600000', 'sz.000001'）
+
+        返回:
+            Markdown格式的ST风险数据表格，包含当前ST状态、ST类型、风险等级
+        """
+        import akshare as ak
+
+        symbol = code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+        logger.info(f"Tool 'get_st_risk_data' called for {code} (symbol={symbol})")
+
+        try:
+            df = ak.stock_info_a_code_name()
+            if df is None or df.empty:
+                return (
+                    "| 项目 | 值 |\\n"
+                    "|------|----|\\n"
+                    "| ST状态 | 数据不可用 |\\n"
+                    "| 数据来源 | AkShare/Sina返回空数据 |\\n"
+                    "| 说明 | ST风险数据暂时不可用，请通过其他渠道核实 |"
+                )
+
+            row = df[df["code"] == symbol]
+            if row.empty:
+                return (
+                    f"| 项目 | 值 |\\n"
+                    f"|------|----|\\n"
+                    f"| 股票代码 | {symbol} |\\n"
+                    f"| ST状态 | 正常（未在ST名单中） |\\n"
+                    f"| 数据来源 | AkShare/Sina stock_info_a_code_name |\\n"
+                    f"| 说明 | 当前股票名称不含ST/*ST标记，未进入风险警示板 |"
+                )
+
+            name = str(row.iloc[0]["name"])
+            is_st = "ST" in name or "*ST" in name
+
+            if is_st:
+                st_type = "退市风险警示（*ST）" if "*ST" in name else "其他风险警示（ST）"
+                return (
+                    f"| 项目 | 值 |\\n"
+                    f"|------|----|\\n"
+                    f"| 股票代码 | {symbol} |\\n"
+                    f"| 当前名称 | {name} |\\n"
+                    f"| ST状态 | ⚠️ **已标记ST** |\\n"
+                    f"| ST类型 | {st_type} |\\n"
+                    f"| 数据来源 | AkShare/Sina stock_info_a_code_name |\\n"
+                    f"| 风险提示 | 该股票当前处于风险警示板，存在退市风险，投资需极度谨慎 |"
+                )
+
+            return (
+                f"| 项目 | 值 |\\n"
+                f"|------|----|\\n"
+                f"| 股票代码 | {symbol} |\\n"
+                f"| 当前名称 | {name} |\\n"
+                f"| ST状态 | 正常 |\\n"
+                f"| 数据来源 | AkShare/Sina stock_info_a_code_name |"
+            )
+
+        except Exception as e:
+            logger.warning(f"get_st_risk_data failed for {code}: {e}")
+            return (
+                f"| 项目 | 值 |\\n"
+                f"|------|----|\\n"
+                f"| ST状态 | 查询失败 |\\n"
+                f"| 错误信息 | {str(e)[:100]} |\\n"
+                f"| 数据来源 | AkShare/Sina |\\n"
+                f"| 说明 | ST风险数据暂时不可用，请通过其他渠道核实 |"
+            )

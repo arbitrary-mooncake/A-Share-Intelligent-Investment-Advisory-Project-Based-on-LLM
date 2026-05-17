@@ -17,6 +17,8 @@ from src.utils.state_definition import AgentState
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
+from src.utils.cache_utils import read_cache, write_cache
+from src.utils.model_config import get_model_config_for_agent
 from dotenv import load_dotenv
 
 # 从.env文件加载环境变量
@@ -48,6 +50,31 @@ async def fundamental_agent(state: AgentState) -> AgentState:
     current_metadata = state.get("metadata", {})
     user_query = current_data.get("query")
 
+    # 检查中间产物缓存（当天同一股票不重复分析）
+    # 快筛股票池通过 skip_cache=True 跳过缓存，确保不与正式池交叉污染
+    skip_cache = current_data.get("skip_cache", False)
+    cache_date = current_data.get("current_date", "")
+    cache_code = current_data.get("stock_code", "")
+    if not skip_cache and cache_date and cache_code:
+        cached = read_cache("fundamental_analysis", cache_code, cache_date)
+        if cached:
+            logger.info(f"{SUCCESS_ICON} FundamentalAgent: 命中缓存，跳过分析 ({cache_code})")
+            current_data["fundamental_analysis"] = cached
+            current_metadata["fundamental_agent_executed"] = True
+            current_metadata["fundamental_agent_cached"] = True
+            return {"data": current_data,
+                    "messages": current_messages + [{"role": "assistant", "content": "基本面分析已完成（缓存）"}],
+                    "metadata": current_metadata}
+
+    # ETF 标的跳过基本面分析
+    if current_data.get("is_etf", False):
+        logger.info(f"{SUCCESS_ICON} FundamentalAgent: ETF标的，跳过基本面分析")
+        current_data["fundamental_analysis"] = "该标的为ETF产品，不适用基本面分析（无ROE、毛利率、财报等财务指标）。"
+        current_metadata["fundamental_agent_executed"] = True
+        return {"data": current_data,
+                "messages": current_messages + [{"role": "assistant", "content": "ETF标的，已跳过基本面分析"}],
+                "metadata": current_metadata}
+
     # 记录 Agent开始执行，包含关键信息
     execution_logger.log_agent_start(agent_name, {
         "user_query": user_query,
@@ -72,10 +99,11 @@ async def fundamental_agent(state: AgentState) -> AgentState:
     agent_start_time = time.time()
 
     try:
-        # 使用API调用
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+        # 模型配置：优先 state 覆盖（快筛），否则使用 agent 分配的模型 (Kimi K2.6)
+        model_cfg = get_model_config_for_agent("fundamental_agent", current_data)
+        api_key = model_cfg["api_key"]
+        base_url = model_cfg["base_url"]
+        model_name = model_cfg["model_name"]
 
         # 验证必要的环境变量是否存在
         if not all([api_key, base_url, model_name]):
@@ -96,15 +124,24 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            temperature=0.6,  # kimi-k2.5 instant 模式要求值
+            temperature=0.6,
+            request_timeout=360,
             max_tokens=8000,  # 基本面分析需要更多输出空间
-            extra_body={"thinking": {"type": "disabled"}}  # 工具调用时必须关闭思考模式
+            extra_body={"thinking": {"type": "disabled"}}  # ReAct工具调用模式，关闭思考以提速
         )
 
         # 2. 获取MCP工具集
         logger.info(f"{WAIT_ICON} FundamentalAgent: Fetching MCP tools...")
         try:
-            mcp_tools = await get_mcp_tools()
+            mcp_tools = await get_mcp_tools(tool_filter=[
+                "get_stock_basic_info", "get_stock_industry",
+                "get_profit_data", "get_balance_data", "get_cash_flow_data",
+                "get_growth_data", "get_operation_data", "get_dupont_data",
+                "get_dividend_data", "get_adjust_factor_data",
+                "tushare_stock_info", "tushare_fina_indicator",
+                "tushare_dividend", "tushare_ev_ebitda", "tushare_daily_basic",
+                "tushare_st_status", "get_st_risk_data",
+            ])
             if not mcp_tools:
                 logger.error(
                     f"{ERROR_ICON} FundamentalAgent: No MCP tools available.")
@@ -162,6 +199,19 @@ async def fundamental_agent(state: AgentState) -> AgentState:
    - 历史分红记录、股息率
    - 股东变化趋势（机构/散户持仓比例）
 
+4.5. ST风险警示分析（⚠️ 必查项 — 优先使用Tushare，备用AkShare/Sina）
+   - 先调用 tushare_st_status 工具查询ST状态历史（Tushare数据最全，包含历史变更记录）
+   - 若 tushare_st_status 无数据或调用失败，立即调用 get_st_risk_data 作为备用
+   - 分析当前ST状态：是否为ST/*ST、进入风险警示板的具体日期
+   - ST类型判断：退市风险警示（*ST）还是其他风险警示（ST）
+   - 触发原因分析（结合已获取的财务数据）：
+     * 是否连续两年净利润为负
+     * 最近一期净资产是否为负
+     * 审计报告是否为无法表示意见或否定意见
+     * 是否存在重大信息披露违法违规
+   - 退市风险等级评估：综合ST类型+财务指标恶化程度+持续时间
+   - 如果所有ST查询工具都失败，必须明确标注"ST数据不可用，无法完成ST风险评估"
+
 5. 行业对比分析
    - 核心财务指标与同行业可比公司对比
    - 公司在行业中的相对优势和劣势
@@ -175,7 +225,25 @@ async def fundamental_agent(state: AgentState) -> AgentState:
 - 分析必须有数据支撑，引用具体的财务数字，避免空洞的定性描述
 - 如果某些数据无法获取，请说明原因并基于可用数据提供分析
 
-请使用可用的工具获取实际数据进行分析，而不是基于假设。"""
+请使用可用的工具获取实际数据进行分析，而不是基于假设。
+
+⛔ 输出格式要求（防幻觉机制）：
+请将分析输出严格分为两个区域：
+
+## 📊 数据事实区
+列出通过工具调取到的所有客观数据，每条标注数据来源工具：
+- [工具名] 具体数值（如：ROE=15.2%，来自fina_indicator）
+- [tushare_st_status/get_st_risk_data] ST状态：当前状态/历史变更/ST类型
+- [工具名] 具体数值
+- ...
+如果某项数据工具无法获取，必须标注「数据不可用」而不是推测数值。
+
+## 🔍 分析判断区
+基于上述数据事实进行分析和推断。每个判断必须：
+1. 引用数据事实区的具体数值
+2. 明确标注推断性质：使用「【基于数据的推断】」或「【行业知识补充】」前缀
+3. 如果某个结论无法从数据中直接得出，必须声明「此为分析师推断，非直接数据」
+4. 不得在任何地方编造数据事实区没有的数值"""
 
             logger.info(f"Agent input: {agent_input}")
 
@@ -190,7 +258,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             }
 
             # 调用 Agent执行分析
-            response = await agent.ainvoke(input_data)
+            response = await agent.ainvoke(input_data, config={"recursion_limit": 30})
 
             end_time = time.time()
             execution_time = end_time - start_time
@@ -251,6 +319,9 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             
             # 8. 更新状态，保存分析结果和元数据
             current_data["fundamental_analysis"] = final_output
+            # 写入中间产物缓存（当天有效，快筛模式跳过）
+            if not skip_cache and cache_date and cache_code:
+                write_cache("fundamental_analysis", cache_code, cache_date, final_output)
             current_metadata["fundamental_agent_executed"] = True
             current_metadata["fundamental_agent_timestamp"] = str(time.time())
             current_metadata["fundamental_agent_execution_time"] = f"{execution_time:.2f} seconds"

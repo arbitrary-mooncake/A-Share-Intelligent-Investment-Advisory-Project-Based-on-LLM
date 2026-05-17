@@ -1,320 +1,367 @@
 """
-NewsAnalysis Agent: Performs news analysis with sentiment and risk assessment using ReAct Agent framework.
-新闻分析 Agent：使用ReAct Agent框架进行新闻分析，包含情感分析和风险评估
+NewsAnalysis Agent: 新闻分析 Agent — 并行多源采集 + 深度分析
+
+架构（200s预算）：
+  Phase 1 (≤70s): asyncio.gather 并行调用 2 路新闻源
+    - crawl_news(clean_stock_code) → 主要数据源（akshare东方财富）
+    - crawl_news(company_name)    → 名称备选查询
+  Phase 2 (<1s): 数据聚合
+  Phase 3 (≤130s): LLM 深度分析（直接调用 openai，不由 langchain 代理）
 """
+import asyncio
 import os
-import json
-from typing import Dict, Any, List, Optional
-from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.outputs import ChatResult, ChatGeneration
-from langgraph.prebuilt import create_react_agent
+from typing import Dict, Any
+from openai import AsyncOpenAI
+import httpx
 import time
 
 from src.utils.state_definition import AgentState
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
+from src.utils.cache_utils import read_cache, write_cache
+from src.utils.model_config import get_model_config_for_agent
 from dotenv import load_dotenv
 
-# 从.env文件加载环境变量
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
 
+# 工具超时（秒）—— 并行调用，总工具阶段 ≤ TOOL_TIMEOUT
+TOOL_TIMEOUT = 70
+# LLM 阶段超时预算（httpx read 超时；asyncio.wait_for 在此基础上 +10s）
+LLM_TIMEOUT = 120
+
+
+def _extract_code(stock_code: str) -> str:
+    """提取纯数字股票代码，去除交易所前缀"""
+    return stock_code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+
+
+def _deduplicate_news(news_items: list) -> list:
+    """按标题去重，保留首次出现的条目"""
+    seen = set()
+    result = []
+    for item in news_items:
+        title = item.get("title", "")
+        key = title.strip()[:60]
+        if key and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+async def _call_tool_with_timeout(tool, kwargs: dict, timeout: float, label: str) -> str:
+    """调用单个MCP工具，带超时保护"""
+    try:
+        result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=timeout)
+        text = str(result).strip()
+        if len(text) > 25:
+            logger.info(f"{SUCCESS_ICON} NewsAgent: {label} 获取成功 ({len(text)} 字符)")
+            return text
+        else:
+            logger.warning(f"NewsAgent: {label} 返回过短 ({len(text)} 字符)")
+            return ""
+    except asyncio.TimeoutError:
+        logger.warning(f"NewsAgent: {label} 超时({timeout}s)，跳过")
+        return ""
+    except Exception as e:
+        logger.warning(f"NewsAgent: {label} 调用失败: {e}")
+        return ""
+
+
+def _build_fallback_output(news_text: str, news_parts: list, company_name: str,
+                           stock_code: str, current_date: str) -> str:
+    """当LLM调用失败时，用原始新闻数据构建降级输出（仅陈述数据，不做分析判断）"""
+    if not news_text:
+        return (
+            f"## 📊 数据事实区\n"
+            f"新闻数据有限。经过多路新闻源并行查询，当前时段均未获取到与{company_name}相关的新闻数据。\n\n"
+            f"## 🔍 分析判断区\n"
+            f"由于新闻数据不可用，无法进行分析。请注意：本声明基于实际工具查询结果，非推断。\n"
+        )
+    return (
+        f"## 📊 数据事实区\n"
+        f"以下是通过东方财富新闻接口获取的 {company_name}（{stock_code}）原始新闻数据"
+        f"（采集日期：{current_date}）。因LLM分析服务暂时不可用，仅列出数据事实，不做分析判断。\n\n"
+        f"{news_text}\n\n"
+        f"## 🔍 分析判断区\n"
+        f"⚠️ LLM分析服务暂时不可用，以上为原始新闻数据，未经过AI分析处理。"
+        f"请人工查阅上述新闻进行判断。\n"
+    )
+
 
 async def news_agent(state: AgentState) -> AgentState:
     """
-    使用ReAct框架进行新闻分析，包含情感分析和风险评估，直接集成MCP工具
-    
-    Args:
-        state: 包含用户查询的当前 Agent状态
+    新闻分析 Agent：并行多源采集 + LLM深度分析
 
-    Returns:
-        更新后的AgentState，包含新闻分析结果
+    严格防幻觉：LLM 仅分析工具返回的真实新闻数据，
+    无数据时如实声明，不使用训练数据编造信息。
     """
-    logger.info(
-        f"{WAIT_ICON} NewsAgent: Starting news analysis using ReAct framework.")
+    logger.info(f"{WAIT_ICON} NewsAgent: Starting parallel multi-source news analysis.")
 
-    # 获取执行日志记录器，用于记录 Agent的执行过程
     execution_logger = get_execution_logger()
     agent_name = "news_agent"
 
-    # 从状态中提取当前数据、消息和元数据
     current_data = state.get("data", {})
     current_messages = state.get("messages", [])
     current_metadata = state.get("metadata", {})
-    user_query = current_data.get("query")
 
-    # 记录 Agent开始执行，包含关键信息
+    # 缓存检查
+    skip_cache = current_data.get("skip_cache", False)
+    cache_date = current_data.get("current_date", "")
+    cache_code = current_data.get("stock_code", "")
+    if not skip_cache and cache_date and cache_code:
+        cached = read_cache("news_analysis", cache_code, cache_date)
+        if cached:
+            logger.info(f"{SUCCESS_ICON} NewsAgent: 命中缓存，跳过分析 ({cache_code})")
+            current_data["news_analysis"] = cached
+            current_metadata["news_agent_executed"] = True
+            current_metadata["news_agent_cached"] = True
+            return {"data": current_data,
+                    "messages": current_messages + [{"role": "assistant", "content": "新闻分析已完成（缓存）"}],
+                    "metadata": current_metadata}
+
     execution_logger.log_agent_start(agent_name, {
-        "user_query": user_query,
         "stock_code": current_data.get("stock_code"),
         "company_name": current_data.get("company_name"),
         "input_data_keys": list(current_data.keys())
     })
 
-    # 验证用户查询是否存在
-    if not user_query:
-        logger.error(
-            f"{ERROR_ICON} NewsAgent: User query is missing in state data.")
-        current_data["news_analysis_error"] = "User query is missing."
-
-        # 记录 Agent执行失败
-        execution_logger.log_agent_complete(
-            agent_name, current_data, 0, False, "User query is missing")
-
-        return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
-
-    # 记录 Agent开始时间，用于计算执行时长
     agent_start_time = time.time()
 
+    # 提取基本信息
+    stock_code = current_data.get("stock_code", "")
+    company_name = current_data.get("company_name", "")
+    current_time_info = current_data.get("current_time_info", "")
+    current_date = current_data.get("current_date", "")
+
+    if not company_name:
+        logger.error(f"{ERROR_ICON} NewsAgent: 缺少公司名称")
+        current_data["news_analysis_error"] = "缺少公司名称"
+        current_data["news_analysis"] = "新闻分析失败：缺少公司名称。"
+        return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
+
+    clean_code = _extract_code(stock_code) if stock_code else ""
+
+    # ── Phase 1: 并行采集 ──────────────────────────────────
+    logger.info(f"{WAIT_ICON} NewsAgent: Phase 1 — 并行获取新闻工具...")
+    phase1_start = time.time()
+
     try:
-        # 使用API调用
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
-
-        # 验证必要的环境变量是否存在
-        if not all([api_key, base_url, model_name]):
-            logger.error(f"{ERROR_ICON} NewsAgent: Missing OpenAI environment variables.")
-            current_data["news_analysis_error"] = "Missing OpenAI environment variables."
-            execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, "Missing OpenAI environment variables")
-            return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
-
-        logger.info(f"{WAIT_ICON} NewsAgent: Creating ChatOpenAI with model {model_name}")
-        # 创建LLM实例，设置合适的参数
-        llm = ChatOpenAI(
-            model=model_name,
-            api_key=api_key,
-            base_url=base_url,
-            temperature=1.0,  # kimi-k2.5 思考模式要求 temperature=1.0
-            max_tokens=32000,  # 思考模式需要足够的token预算
-            extra_body={"thinking": {"type": "enabled"}}  # 开启深度推理模式
-        )
-
-        # 2. 获取MCP工具集
-        logger.info(f"{WAIT_ICON} NewsAgent: Fetching MCP tools...")
-        try:
-            mcp_tools = await get_mcp_tools()
-            if not mcp_tools:
-                logger.error(
-                    f"{ERROR_ICON} NewsAgent: No MCP tools available.")
-                current_data["news_analysis_error"] = "No MCP tools available."
-
-                # 记录 Agent执行失败
-                execution_logger.log_agent_complete(agent_name, current_data, time.time(
-                ) - agent_start_time, False, "No MCP tools available")
-
-                return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
-
-            logger.info(
-                f"{SUCCESS_ICON} NewsAgent: Successfully loaded {len(mcp_tools)} tools.")
-
-            # 打印可用工具列表，便于调试
-            tool_names = [tool.name for tool in mcp_tools]
-            logger.info(f"Available tools: {tool_names}")
-
-            # 3. 创建ReAct Agent - 只传入LLM和工具
-            logger.info(
-                f"{WAIT_ICON} NewsAgent: Creating ReAct agent...")
-            agent = create_react_agent(llm, mcp_tools)
-
-            # 4. 准备输入数据，构建详细的新闻分析请求
-            stock_code = current_data.get('stock_code', 'Unknown')
-            company_name = current_data.get('company_name', 'Unknown')
-            current_time_info = current_data.get('current_time_info', '未知时间')
-            current_date = current_data.get('current_date', '未知日期')
-
-            # 构建详细的新闻分析请求，包含多个分析维度
-            agent_input = f"""请对{company_name}（股票代码：{stock_code}）进行新闻分析。
-
-当前时间：{current_time_info}
-当前日期：{current_date}
-
-请进行以下新闻分析：
-1. 爬取与{company_name}相关的最新新闻（至少5条）
-2. 对每条新闻进行情感分析，评估新闻对公司的情感影响（1-5分：1=负面，2=轻微负面，3=中性，4=正面，5=极正面）
-3. 对每条新闻进行风险评估，评估新闻对公司的风险影响（1-5分：1=极低风险，2=低风险，3=中等风险，4=高风险，5=极高风险）
-4. 分析新闻对股价的潜在影响
-5. 识别关键新闻事件和趋势
-6. 提供基于新闻的综合投资建议
-
-请使用可用的工具获取实际新闻数据进行分析，确保情感分析和风险评估的准确性。如果某些新闻无法获取，请基于可用信息提供尽可能全面的分析。"""
-
-            logger.info(f"Agent input: {agent_input}")
-
-            # 5. 调用ReAct Agent - 使用正确的messages格式
-            logger.info(
-                f"{WAIT_ICON} NewsAgent: Calling ReAct agent...")
-            start_time = time.time()
-
-            # LangGraph ReAct Agent需要messages格式的输入
-            input_data = {
-                "messages": [HumanMessage(content=agent_input)]
-            }
-
-            # 调用 Agent执行分析
-            response = await agent.ainvoke(input_data)
-
-            end_time = time.time()
-            execution_time = end_time - start_time
-
-            logger.info(
-                f"ReAct agent execution completed in {execution_time:.2f} seconds")
-
-            # 6. 提取分析结果
-            final_output = "No analysis generated."
-
-            if "messages" in response and isinstance(response["messages"], list):
-                messages = response["messages"]
-                # 查找最后一条AI消息，这通常包含最终的分析结果
-                ai_messages = [
-                    msg for msg in messages if isinstance(msg, AIMessage)]
-                if ai_messages:
-                    last_ai_message = ai_messages[-1]
-                    final_output = last_ai_message.content
-                    logger.info(
-                        f"Successfully extracted analysis from AI message.")
-                else:
-                    logger.warning("No AI messages found in response")
-                    # 如果没有AI消息，尝试获取所有消息的内容
-                    all_content = []
-                    for msg in messages:
-                        if hasattr(msg, 'content') and msg.content:
-                            all_content.append(str(msg.content))
-                    if all_content:
-                        final_output = "\n".join(all_content)
-            else:
-                logger.error(f"Unexpected response format: {type(response)}")
-                logger.error(
-                    f"Response keys: {response.keys() if isinstance(response, dict) else 'Not a dict'}")
-
-            logger.info(
-                f"Final extracted analysis length: {len(final_output)} characters")
-            print(f"NEWSAGENT: {final_output}")
-            # 7. 记录LLM交互，用于后续分析和优化
-            model_config = {
-                "model": model_name,
-                "temperature": 1.0,
-                "max_tokens": 32000,
-                "thinking": "enabled",
-                "api_base": base_url
-            }
-            
-            execution_logger.log_llm_interaction(
-                agent_name=agent_name,
-                interaction_type="react_agent",
-                input_messages=[{"role": "user", "content": agent_input}],
-                output_content=final_output,
-                model_config=model_config,
-                execution_time=execution_time
-            )
-
-            logger.info(
-                f"{SUCCESS_ICON} NewsAgent: Successfully completed news analysis.")
-            
-            # 8. 更新状态，保存分析结果和元数据
-            current_data["news_analysis"] = final_output
-            current_metadata["news_agent_executed"] = True
-            current_metadata["news_agent_timestamp"] = str(time.time())
-            current_metadata["news_agent_execution_time"] = f"{execution_time:.2f} seconds"
-
-            # 9. 添加消息记录，保持对话历史
-            new_message = {"role": "assistant", "content": "新闻分析已完成"}
-            updated_messages = current_messages + [new_message]
-
-            # 记录 Agent执行成功
-            total_execution_time = time.time() - agent_start_time
-            execution_logger.log_agent_complete(agent_name, {
-                "news_analysis_length": len(final_output),
-                "analysis_preview": final_output[:500] if len(final_output) > 500 else final_output,
-                "llm_execution_time": execution_time,
-                "total_execution_time": total_execution_time
-            }, total_execution_time, True)
-
-            return {
-                "data": current_data,
-                "messages": updated_messages,
-                "metadata": current_metadata
-            }
-
-        except Exception as e:
-            logger.error(
-                f"{ERROR_ICON} NewsAgent: Error in MCP or agent execution: {e}", exc_info=True)
-            current_data[
-                "news_analysis_error"] = f"Error in MCP or agent execution: {e}"
-            current_data["news_analysis"] = f"新闻分析过程中出现错误: {str(e)}"
-            current_metadata["news_agent_error"] = str(e)
-
-            # 记录 Agent执行失败
-            execution_logger.log_agent_complete(
-                agent_name, current_data, time.time() - agent_start_time, False, str(e))
-
-            return {
-                "data": current_data,
-                "messages": current_messages,
-                "metadata": current_metadata
-            }
-
+        news_tools = await get_mcp_tools(tool_filter=["crawl_news", "get_st_risk_data"])
     except Exception as e:
-        logger.error(
-            f"{ERROR_ICON} NewsAgent: Error during execution: {e}", exc_info=True)
-        current_data["news_analysis_error"] = f"Error during execution: {e}"
-        current_metadata["news_agent_error"] = str(e)
+        logger.error(f"{ERROR_ICON} NewsAgent: 获取MCP工具失败: {e}")
+        news_tools = []
 
-        # 记录 Agent执行失败
-        execution_logger.log_agent_complete(
-            agent_name, current_data, time.time() - agent_start_time, False, str(e))
+    if not news_tools:
+        logger.error(f"{ERROR_ICON} NewsAgent: 无可用新闻工具")
+        current_data["news_analysis"] = "新闻分析失败：新闻工具不可用。"
+        current_metadata["news_agent_error"] = "No news tools available"
+        return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
-        return {
-            "data": current_data,
-            "messages": current_messages,
-            "metadata": current_metadata
-        }
+    # 构建并行任务
+    tasks = []
+    task_labels = []
 
+    for tool in news_tools:
+        if tool.name == "crawl_news":
+            # 主查询：股票代码 → 必定命中（aks share已验证）
+            if clean_code:
+                tasks.append(_call_tool_with_timeout(
+                    tool, {"query": clean_code, "top_k": 10}, TOOL_TIMEOUT,
+                    f"crawl_news(code={clean_code})"
+                ))
+                task_labels.append(f"crawl_news(code)")
+            # 备选查询：公司名称
+            tasks.append(_call_tool_with_timeout(
+                tool, {"query": company_name, "top_k": 10}, TOOL_TIMEOUT,
+                f"crawl_news(name={company_name})"
+            ))
+            task_labels.append(f"crawl_news(name)")
 
-# 本地测试函数
-async def test_news_agent():
-    """新闻分析 Agent的测试函数"""
-    from src.utils.state_definition import AgentState
-    from datetime import datetime
+        elif tool.name == "tushare_news":
+            if clean_code:
+                tasks.append(_call_tool_with_timeout(
+                    tool, {"code": clean_code}, TOOL_TIMEOUT,
+                    f"tushare_news(code={clean_code})"
+                ))
+                task_labels.append(f"tushare_news")
 
-    # 准备测试数据，包含当前时间信息
-    current_datetime = datetime.now()
-    current_date_cn = current_datetime.strftime("%Y年%m月%d日")
-    current_date_en = current_datetime.strftime("%Y-%m-%d")
-    current_weekday_cn = ["星期一", "星期二", "星期三", "星期四",
-                          "星期五", "星期六", "星期日"][current_datetime.weekday()]
-    current_time = current_datetime.strftime("%H:%M:%S")
-    current_time_info = f"{current_date_cn} ({current_date_en}) {current_weekday_cn} {current_time}"
+        elif tool.name == "get_st_risk_data":
+            if clean_code:
+                sh_code = f"sh.{clean_code}" if (clean_code.startswith("6") or clean_code.startswith("688")) else f"sz.{clean_code}"
+                tasks.append(_call_tool_with_timeout(
+                    tool, {"code": sh_code}, 5.0,
+                    f"st_risk(code={sh_code})"
+                ))
+                task_labels.append(f"st_risk")
 
-    # 创建测试状态，模拟真实的用户查询
-    test_state = AgentState(
-        messages=[],
-        data={
-            "query": "分析嘉友国际的新闻情况",
-            "stock_code": "sh.603871",
-            "company_name": "嘉友国际",
-            "current_date": current_date_en,
-            "current_date_cn": current_date_cn,
-            "current_time": current_time,
-            "current_weekday_cn": current_weekday_cn,
-            "current_time_info": current_time_info,
-            "analysis_timestamp": current_datetime.isoformat()
-        },
-        metadata={}
+    # 并行执行（带整体保护，防止 gather 自身异常）
+    try:
+        results = await asyncio.gather(*tasks) if tasks else []
+    except Exception as gather_err:
+        logger.error(f"{ERROR_ICON} NewsAgent: 并行工具调用异常: {gather_err}")
+        results = []
+    phase1_elapsed = time.time() - phase1_start
+
+    # 聚合结果
+    news_parts = []
+    success_count = 0
+    for label, text in zip(task_labels, results):
+        if text:
+            # 只保留有实质内容的（过滤掉"未找到"等短回复）
+            is_empty = ("未找到" in text[:50] and len(text) < 100)
+            if not is_empty:
+                news_parts.append(f"### {label}\n{text}")
+                success_count += 1
+            else:
+                logger.info(f"NewsAgent: {label} 返回空结果")
+
+    news_text = "\n\n".join(news_parts) if news_parts else ""
+    logger.info(
+        f"{SUCCESS_ICON if success_count else WAIT_ICON} NewsAgent: Phase 1 完成 "
+        f"({phase1_elapsed:.1f}s, {success_count}/{len(task_labels)} 路有数据)"
     )
 
-    # 运行 Agent并输出结果
-    result = await news_agent(test_state)
-    print("News Analysis Result:")
-    print(result.get("data", {}).get("news_analysis", "No analysis found"))
+    # ── Phase 2: LLM 深度分析 ──────────────────────────────
+    logger.info(f"{WAIT_ICON} NewsAgent: Phase 2 — LLM 深度分析...")
 
-    return result
+    # 模型配置
+    model_cfg = get_model_config_for_agent("news_agent", current_data)
+    api_key = model_cfg["api_key"]
+    base_url = model_cfg["base_url"]
+    model_name = model_cfg["model_name"]
 
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(test_news_agent())
+    if not all([api_key, base_url, model_name]):
+        logger.error(f"{ERROR_ICON} NewsAgent: Missing OpenAI environment variables.")
+        current_data["news_analysis_error"] = "Missing OpenAI environment variables."
+        return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
+
+    # 直接使用 openai 客户端（绕开 langchain），确保 httpx 超时可控
+    _client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=httpx.Timeout(connect=15.0, read=float(LLM_TIMEOUT), write=30.0, pool=10.0),
+        max_retries=1,
+    )
+    _messages = [
+        {"role": "system", "content": (
+            "你是一位资深的A股新闻分析师，擅长从新闻中提取关键信息并进行情感和风险分析。\n\n"
+            "分析要求：\n"
+            "0. **ST风险筛查**：优先检查是否有ST风险数据(st_risk标签)，若当前股票已标记ST/*ST，必须在分析中重点标注该风险，并在所有判断中考虑ST状态的影响\n"
+            "1. 逐条分析每一条新闻的核心内容和潜在影响\n"
+            "2. 对多条新闻进行综合归纳，识别关键事件和趋势\n"
+            "3. 评估新闻对股价的短期和中期潜在影响\n"
+            "4. 区分市场情绪和基本面变化\n"
+            "5. 提供基于新闻的综合判断\n\n"
+            "⛔ 输出格式要求（防幻觉机制）：\n"
+            "请将分析输出严格分为两个区域：\n\n"
+            "## 📊 数据事实区\n"
+            "列出上述新闻数据中的每一条真实新闻，逐条标注：序号、标题、来源、发布时间、核心内容摘要。\n"
+            "如果新闻数据不足或无新闻数据，必须标注「新闻数据有限」而不是编造任何新闻。\n\n"
+            "## 🔍 分析判断区\n"
+            "基于上述新闻事实进行分析。每个判断必须引用数据事实区的具体新闻条目编号，"
+            "使用「【基于新闻的推断】」标注推断性质。"
+            "不得在任何地方编造数据事实区没有的数值、事件或新闻。"
+            "不得使用模型训练数据中的知识来补充新闻事实。"
+        )}
+    ]
+    if news_text:
+        _messages.append({"role": "user", "content": (
+            f"请对{company_name}（股票代码：{stock_code}）进行新闻分析。\n\n"
+            f"当前时间：{current_time_info}\n"
+            f"当前日期：{current_date}\n\n"
+            f"## 新闻原始数据\n{news_text}\n\n"
+            f"请基于以上新闻数据逐条分析，输出格式请严格遵循系统指令中的要求。"
+        )})
+    else:
+        _messages.append({"role": "user", "content": (
+            f"请对{company_name}（股票代码：{stock_code}）进行新闻分析。\n\n"
+            f"当前时间：{current_time_info}\n"
+            f"当前日期：{current_date}\n\n"
+            f"## 新闻原始数据\n"
+            f"经过多路新闻源并行查询，当前时段均未获取到与{company_name}相关的新闻数据。\n\n"
+            f"请如实声明「新闻数据有限」，不得编造任何新闻内容。"
+        )})
+
+    logger.info(f"{WAIT_ICON} NewsAgent: Calling LLM (model={model_name}, {len(news_text)} 字符输入)...")
+    phase2_start = time.time()
+
+    try:
+        response = await asyncio.wait_for(
+            _client.chat.completions.create(
+                model=model_name,
+                messages=_messages,
+                temperature=1.0,
+                max_tokens=32000,
+                extra_body={"enable_thinking": True},  # DashScope 格式（非 OpenAI thinking 格式）
+            ),
+            timeout=float(LLM_TIMEOUT + 10)  # 130s：略大于HTTP read超时(120s)
+        )
+        phase2_elapsed = time.time() - phase2_start
+        final_output = response.choices[0].message.content if response.choices else "No analysis generated."
+        logger.info(f"NewsAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
+        llm_success = True
+
+    except asyncio.TimeoutError:
+        phase2_elapsed = time.time() - phase2_start
+        logger.error(f"{ERROR_ICON} NewsAgent: LLM 超时 ({phase2_elapsed:.0f}s)，降级返回原始数据")
+        final_output = _build_fallback_output(news_text, news_parts, company_name, stock_code, current_date)
+        llm_success = False
+
+    except Exception as llm_err:
+        phase2_elapsed = time.time() - phase2_start
+        err_msg = str(llm_err) or type(llm_err).__name__
+        logger.error(f"{ERROR_ICON} NewsAgent: LLM 失败 ({err_msg})，降级返回原始数据")
+        final_output = _build_fallback_output(news_text, news_parts, company_name, stock_code, current_date)
+        llm_success = False
+
+    # 记录LLM交互
+    model_config_log = {
+        "model": model_name,
+        "temperature": 1.0,
+        "max_tokens": 32000,
+        "thinking": "enabled (enable_thinking)",
+        "api_base": base_url
+    }
+    try:
+        execution_logger.log_llm_interaction(
+            agent_name=agent_name,
+            interaction_type="direct_llm_parallel_sources",
+            input_messages=_messages,
+            output_content=final_output,
+            model_config=model_config_log,
+            execution_time=phase2_elapsed
+        )
+    except Exception:
+        pass  # 日志记录失败不影响主流程
+
+    logger.info(f"{SUCCESS_ICON if llm_success else WAIT_ICON} NewsAgent: 分析完成 (总耗时 {time.time() - agent_start_time:.1f}s)")
+
+    # 更新状态
+    current_data["news_analysis"] = final_output
+    if not skip_cache and cache_date and cache_code:
+        write_cache("news_analysis", cache_code, cache_date, final_output)
+    current_metadata["news_agent_executed"] = True
+    current_metadata["news_agent_timestamp"] = str(time.time())
+
+    total_time = time.time() - agent_start_time
+    current_metadata["news_agent_execution_time"] = f"{total_time:.2f} seconds"
+
+    execution_logger.log_agent_complete(agent_name, {
+        "news_analysis_length": len(final_output),
+        "analysis_preview": final_output[:500],
+        "sources_queried": len(task_labels),
+        "sources_with_data": success_count,
+        "phase1_time": phase1_elapsed,
+        "phase2_time": phase2_elapsed,
+        "llm_success": llm_success,
+        "total_time": total_time,
+    }, total_time, True)
+
+    return {
+        "data": current_data,
+        "messages": current_messages + [{"role": "assistant", "content": "新闻分析已完成"}],
+        "metadata": current_metadata
+    }

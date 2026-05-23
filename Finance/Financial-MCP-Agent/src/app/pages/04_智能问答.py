@@ -87,6 +87,98 @@ def _auto_name(question: str) -> str:
 
 
 # ──────────────────────────────────────────────
+# 渲染函数（必须在主流程之前定义）
+# ──────────────────────────────────────────────
+
+def _render_messages():
+    for msg in st.session_state.get("qa_messages", []):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+
+def _render_chat_input(session_id, session_name):
+    if not session_id:
+        st.chat_input("请先在左侧选择或创建会话窗口", disabled=True)
+        return
+
+    prompt = st.chat_input("输入您的投资分析问题...", key="main_input")
+
+    if not prompt:
+        return
+
+    prompt = prompt.strip()
+    if not prompt:
+        return
+
+    # 自动命名
+    msg_count = len(st.session_state.get("qa_messages", []))
+    if msg_count == 0 and session_name in ("新对话", "对话"):
+        auto_name = _auto_name(prompt)
+        _sync_call(qa_rename_session(session_id, auto_name))
+        _refresh_sessions()
+
+    st.session_state["qa_messages"].append({"role": "user", "content": prompt})
+
+    full_answer = ""
+    meta_info = ""
+
+    answer_placeholder = st.chat_message("assistant")
+    with answer_placeholder:
+        status_el = st.empty()
+        answer_el = st.empty()
+
+    try:
+        async def _stream():
+            nonlocal full_answer, meta_info
+            async for event in qa_ask_stream(question=prompt, session_id=session_id):
+                etype = event.get("type")
+                edata = event.get("data")
+
+                if etype == "meta":
+                    parts = [f"复杂度:{edata.get('complexity', '')}"]
+                    if edata.get("company_name"):
+                        parts.append(f"股票:{edata['company_name']}")
+                    meta_info = " | ".join(parts)
+
+                elif etype == "status":
+                    status_el.caption(f"⏳ {edata.get('message', '')}")
+
+                elif etype == "answer":
+                    status_el.empty()
+                    full_answer += str(edata)
+                    answer_el.markdown(full_answer + "▌")
+
+                elif etype == "clarify":
+                    status_el.empty()
+                    answer_el.warning(edata.get("message", ""))
+                    full_answer = f"(_需澄清: {edata.get('message', '')}_)"
+
+                elif etype == "error":
+                    status_el.empty()
+                    answer_el.error(str(edata))
+                    full_answer = f"(_请求失败: {edata}_)"
+
+                elif etype == "done":
+                    pass
+
+        _sync_call(_stream())
+
+    except Exception as e:
+        answer_el.error(f"请求失败: {e}")
+        full_answer = f"(_请求失败: {e}_)"
+
+    status_el.empty()
+    if full_answer:
+        answer_el.markdown(full_answer)
+        st.session_state["qa_messages"].append({
+            "role": "assistant", "content": full_answer, "meta": meta_info,
+        })
+        _refresh_sessions()
+
+    st.rerun()
+
+
+# ──────────────────────────────────────────────
 # 初始化状态
 # ──────────────────────────────────────────────
 if "qa_sessions" not in st.session_state:
@@ -216,103 +308,3 @@ else:
         _render_chat_input(active_id, current_name)
 
 
-# ──────────────────────────────────────────────
-# 渲染消息
-# ──────────────────────────────────────────────
-
-def _render_messages():
-    for msg in st.session_state.get("qa_messages", []):
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-
-# ──────────────────────────────────────────────
-# 底部输入 + 发送逻辑
-# ──────────────────────────────────────────────
-
-def _render_chat_input(session_id, session_name):
-    if not session_id:
-        st.chat_input("请先在左侧选择或创建会话窗口", disabled=True)
-        return
-
-    prompt = st.chat_input("输入您的投资分析问题...", key="main_input")
-
-    if not prompt:
-        return
-
-    prompt = prompt.strip()
-    if not prompt:
-        return
-
-    # 自动命名：首条消息后使用问题摘要
-    msg_count = len(st.session_state.get("qa_messages", []))
-    if msg_count == 0 and session_name in ("新对话", "对话"):
-        auto_name = _auto_name(prompt)
-        _sync_call(qa_rename_session(session_id, auto_name))
-        _refresh_sessions()
-
-    # 添加用户消息
-    st.session_state["qa_messages"].append({"role": "user", "content": prompt})
-
-    # 流式获取回答
-    full_answer = ""
-    meta_info = ""
-
-    answer_placeholder = st.chat_message("assistant")
-    with answer_placeholder:
-        status_el = st.empty()
-        answer_el = st.empty()
-
-    try:
-        async def _stream():
-            nonlocal full_answer, meta_info
-            async for event in qa_ask_stream(question=prompt, session_id=session_id):
-                etype = event.get("type")
-                edata = event.get("data")
-
-                if etype == "meta":
-                    complexity = edata.get("complexity", "")
-                    stock = edata.get("company_name", "")
-                    parts = [f"复杂度:{complexity}"]
-                    if stock:
-                        parts.append(f"股票:{stock}")
-                    meta_info = " | ".join(parts)
-
-                elif etype == "status":
-                    status_el.caption(f"⏳ {edata.get('message', '')}")
-
-                elif etype == "answer":
-                    status_el.empty()
-                    full_answer += str(edata)
-                    answer_el.markdown(full_answer + "▌")
-
-                elif etype == "clarify":
-                    status_el.empty()
-                    answer_el.warning(edata.get("message", ""))
-                    full_answer = f"(_需澄清: {edata.get('message', '')}_)"
-
-                elif etype == "error":
-                    status_el.empty()
-                    answer_el.error(str(edata))
-                    full_answer = f"(_请求失败: {edata}_)"
-
-                elif etype == "done":
-                    pass
-
-        _sync_call(_stream())
-
-    except Exception as e:
-        answer_el.error(f"请求失败: {e}")
-        full_answer = f"(_请求失败: {e}_)"
-
-    status_el.empty()
-    if full_answer:
-        answer_el.markdown(full_answer)
-        st.session_state["qa_messages"].append({
-            "role": "assistant",
-            "content": full_answer,
-            "meta": meta_info,
-        })
-        _refresh_sessions()
-
-    st.rerun()

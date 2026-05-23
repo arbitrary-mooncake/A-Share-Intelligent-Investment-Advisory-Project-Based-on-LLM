@@ -93,10 +93,26 @@ NO_DATA_NEEDED_PATTERNS = [
     r"怎么.*用|如何.*使用", r"帮助|help",
     r"谢谢|感谢|多谢|再见|拜拜|bye",
     r"什么是(?:股票|PE|PB|ROE|估值|K线|均线)",
-    # 无具体标的的泛投资讨论（不含股票代码且无行业关键词）
-    r"值得.*投资.*方向|好.*方向|有没有.*前景",
-    r"该不该.*买|该不该.*卖|值得.*买|值得.*卖",
 ]
+
+
+INVESTMENT_DECISION_PATTERNS = [
+    r"该不该买", r"该不该卖", r"值得买", r"值得卖", r"值得投资",
+    r"能.*买", r"能.*卖", r"要不要.*买", r"要不要.*卖",
+    r"建议.*买", r"建议.*卖", r"能不能.*买", r"能不能.*卖",
+    r"现在.*买|现在.*卖|现在.*入场|现在.*进场",
+]
+
+
+def _needs_clarify_for_investment(question: str) -> bool:
+    """投资决策类问题但无股票代码时，需要反问澄清"""
+    for pat in INVESTMENT_DECISION_PATTERNS:
+        if re.search(pat, question):
+            # 检查是否包含股票代码
+            codes = re.findall(r'(?<!\d)(?:[36]\d{5}|0\d{5}|8\d{5})(?!\d)', question)
+            if not codes:
+                return True
+    return False
 
 
 def _is_l0_question(question: str) -> bool:
@@ -258,6 +274,19 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
             recommended_thinking=False,
             recommended_react=False,
             recommended_template="l0",
+        )
+
+    # 投资决策类问题无股票代码 → 需要澄清
+    if _needs_clarify_for_investment(question):
+        return ComplexityResult(
+            level="L1", score=0,
+            triggers=["需要澄清: 投资决策需指定标的"],
+            score_detail={"澄清": "请提供股票代码或名称"},
+            need_clarify=True,
+            recommended_model="mimo-v2.5",
+            recommended_thinking=False,
+            recommended_react=False,
+            recommended_template="quick",
         )
 
     # Layer 1: 硬触发规则

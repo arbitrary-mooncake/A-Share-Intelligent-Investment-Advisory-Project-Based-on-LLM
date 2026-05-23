@@ -318,9 +318,12 @@ for s in sessions:
         current_name = s.get("name", "对话")
         break
 
-# 页面加载/切换时，从后端同步历史（无 pending 时才加载，避免覆盖流式中的消息）
-if active_id and not st.session_state.get("_qa_process"):
+# 仅在首次加载或切换会话时从后端同步历史
+# _qa_loaded_for 记录上次加载历史的会话ID，避免每次 rerun 都覆盖本地消息
+_last_loaded = st.session_state.get("_qa_loaded_for")
+if active_id and active_id != _last_loaded:
     _load_history(active_id)
+    st.session_state["_qa_loaded_for"] = active_id
 
 # ──────────────────────────────────────────────
 # 两栏布局
@@ -387,6 +390,7 @@ else:
                             st.rerun()
                         else:
                             st.session_state["qa_active_session"] = sid
+                            st.session_state["_qa_loaded_for"] = sid
                             _load_history(sid)
                             st.rerun()
 
@@ -404,6 +408,7 @@ else:
                             remaining = [s for s in st.session_state["qa_sessions"] if s["session_id"] != sid]
                             nxt = remaining[0]["session_id"] if remaining else None
                             st.session_state["qa_active_session"] = nxt
+                        st.session_state["_qa_loaded_for"] = nxt
                             if nxt:
                                 _load_history(nxt)
                             else:
@@ -428,6 +433,7 @@ else:
             result = _api_post("/api/qa/sessions", {"name": "新对话"})
             sid = result.get("session_id", "")
             st.session_state["qa_active_session"] = sid
+            st.session_state["_qa_loaded_for"] = sid
             st.session_state["qa_messages"] = []
             _refresh_sessions()
             st.rerun()

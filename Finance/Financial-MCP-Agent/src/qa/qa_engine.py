@@ -225,7 +225,7 @@ async def _assemble_with_fallback(
 ) -> EvidencePackage:
     """证据装配 + 降级保护"""
     try:
-        if task_plan.need_react:
+        if task_plan.need_react and complexity.level == "L4":
             logger.info(f"{WAIT_ICON} QA Engine: 使用 ReAct 路径...")
             evidence = await assemble_evidence_react(
                 stock_code, company_name,

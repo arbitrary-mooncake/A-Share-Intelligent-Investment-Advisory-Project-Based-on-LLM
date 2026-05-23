@@ -216,8 +216,9 @@ class TestTaskPlanner:
         assert plan_task("茅台PE多少", "L1").need_react is False
         assert plan_task("茅台走势怎么样", "L2").need_react is False
 
-    def test_l3_l4_needs_react(self):
-        assert plan_task("分析茅台估值", "L3").need_react is True
+    def test_l3_default_no_react_l4_react(self):
+        """L3默认不走ReAct(仅运行时升级可触发), L4稳定走ReAct"""
+        assert plan_task("分析茅台估值", "L3").need_react is False
         assert plan_task("深度分析茅台", "L4").need_react is True
 
     def test_extract_stock_code(self):
@@ -337,32 +338,33 @@ class TestIntegration:
         assert len(plan.tools) >= 1
 
     def test_full_pipeline_complex_question(self):
-        """复杂问题完整流程"""
+        """复杂问题：L4走ReAct，L3走快路径"""
         question = "把宁德时代和比亚迪从估值和现金流角度做个全面比较"
         complexity = analyze_complexity(question)
         plan = plan_task(question, complexity.level)
         assert complexity.level in ("L3", "L4")
-        assert plan.need_react is True or complexity.level == "L3"
+        # L4走ReAct，L3默认快路径（可运行时升级触发ReAct）
+        if complexity.level == "L4":
+            assert plan.need_react is True
+        else:
+            assert plan.need_react is False
 
     def test_runtime_upgrade_pipeline(self):
-        """运行时升级后的流程一致性"""
+        """运行时升级可将L1升级到L4，L4触发ReAct"""
         question = "茅台PE多少"
         complexity = analyze_complexity(question)
-        plan1 = plan_task(question, complexity.level)
+        assert complexity.level == "L1"
 
-        # 模拟运行时升级
+        # 模拟极端情况运行时升级
         complexity = try_runtime_upgrade(
             complexity,
             tool_success_rate=0.3, evidence_missing_count=5,
             contradictory_signals=True, actual_domain_count=5,
         )
-        plan2 = plan_task(question, complexity.level)
-
-        # 升级后规划应反映新复杂度
-        if complexity.level == "L4":
-            assert plan2.need_react is True
-        # 升级不会使plan倒退
-        assert plan2.need_react or not plan1.need_react
+        # 多条件叠加应触发L4
+        assert complexity.level == "L4"
+        plan = plan_task(question, complexity.level)
+        assert plan.need_react is True
 
     def test_stock_extraction_with_context(self):
         """Stock code extraction with and without session context"""

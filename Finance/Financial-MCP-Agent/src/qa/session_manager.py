@@ -340,7 +340,7 @@ _GLOBAL_CACHE_DIR = os.path.join(_QA_DATA_DIR, "global_cache")
 
 
 def get_global_cached_evidence(tool_name: str, kwargs: dict) -> Optional[str]:
-    """跨会话全局缓存（同股票+同工具+同参数复用）"""
+    """跨会话全局缓存（同股票+同工具+同参数复用，统一7天TTL）"""
     cache_key = _make_cache_key(tool_name, kwargs)
     cache_path = os.path.join(_GLOBAL_CACHE_DIR, f"{cache_key}.json")
     if not os.path.exists(cache_path):
@@ -348,9 +348,7 @@ def get_global_cached_evidence(tool_name: str, kwargs: dict) -> Optional[str]:
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # 实时数据(行情)缓存1小时，基本面数据缓存7天
-        ttl = 3600 if _is_realtime_tool(tool_name) else _CACHE_TTL_SECONDS
-        if time.time() - data.get("cached_at", 0) > ttl:
+        if time.time() - data.get("cached_at", 0) > _CACHE_TTL_SECONDS:
             os.remove(cache_path)
             return None
         return data.get("content", "")
@@ -372,12 +370,6 @@ def set_global_cached_evidence(tool_name: str, kwargs: dict, content: str):
             }, f, ensure_ascii=False)
     except Exception as e:
         logger.warning(f"写入全局缓存失败: {e}")
-
-
-def _is_realtime_tool(tool_name: str) -> bool:
-    """判断是否为实时行情类工具（缓存TTL更短）"""
-    realtime = ["kline", "k_data", "daily", "moneyflow", "rt_", "mins", "tick", "crawl_news"]
-    return any(kw in tool_name.lower() for kw in realtime)
 
 
 # ── 上下文压缩 ──────────────────────────────────

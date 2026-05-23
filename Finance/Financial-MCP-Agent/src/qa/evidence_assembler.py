@@ -93,6 +93,17 @@ async def assemble_evidence_fast(
         domains_queried=[],
     )
 
+    # 无股票代码时，跳过 MCP 工具调用，给出明确提示
+    if not stock_code and not company_name:
+        evidence.raw_text = (
+            "当前问题未指定具体的A股股票或公司，且A股数据工具主要覆盖个股、行业和板块数据。"
+            "对于黄金、商品期货、宏观经济等非A股标的的问题，请基于现有知识和行业理解作答，"
+            "明确说明数据来源限制，不编造任何数据。"
+        )
+        evidence.tool_call_summary = "无股票代码，跳过数据获取"
+        evidence.missing.append("未指定A股标的")
+        return evidence
+
     # 获取 MCP 工具
     try:
         all_mcp_tools = await get_mcp_tools(tool_filter=tools)

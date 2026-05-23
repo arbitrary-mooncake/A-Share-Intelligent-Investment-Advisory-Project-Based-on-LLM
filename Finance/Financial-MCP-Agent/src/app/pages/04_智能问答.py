@@ -240,29 +240,33 @@ def _process_pending():
                     full_answer = f"(_需澄清: {msg}_)"
 
     except requests.exceptions.Timeout:
+        full_answer = "请求超时，请稍后重试。"
         status_el.empty()
-        answer_el.error("请求超时，请重试")
-        full_answer = f"(_请求超时_)"
+        answer_el.error(full_answer)
     except requests.exceptions.ConnectionError:
+        full_answer = "无法连接后端服务，请确认服务已启动。"
         status_el.empty()
-        answer_el.error("无法连接后端服务，请确认服务已启动")
-        full_answer = f"(_连接失败_)"
+        answer_el.error(full_answer)
+    except requests.HTTPError as e:
+        full_answer = f"后端返回错误（{e.response.status_code}），请稍后重试。"
+        status_el.empty()
+        answer_el.error(full_answer)
     except Exception as e:
+        full_answer = f"请求异常: {e}"
         status_el.empty()
-        answer_el.error(f"请求失败: {e}")
-        full_answer = f"(_请求失败: {e}_)"
+        answer_el.error(full_answer)
 
     status_el.empty()
     answer_el.markdown(full_answer)
 
-    # 清除 pending，防止无限重试
-    st.session_state["_qa_process"] = None
-
-    if full_answer and not full_answer.startswith("(_"):
+    # 成功回答才保存到历史并清除 pending；失败保留 pending 供重试
+    if full_answer and not full_answer.startswith("请求"):
         st.session_state["qa_messages"].append({
             "role": "assistant", "content": full_answer, "meta": meta_info,
         })
-    _refresh_sessions()
+        st.session_state["_qa_process"] = None
+        _refresh_sessions()
+    # 失败不清理 _qa_process，下次渲染重试（_retry 计数器控制上限）
     st.rerun()
 
 

@@ -259,7 +259,7 @@ def _make_cache_key(tool_name: str, kwargs: dict) -> str:
 
 
 def get_cached_evidence(session_id: str, tool_name: str, kwargs: dict) -> Optional[str]:
-    """读取 per-session 数据缓存"""
+    """读取 per-session 数据缓存，返回时自动标注数据获取时间"""
     cache_dir = _get_session_cache_dir(session_id)
     cache_key = _make_cache_key(tool_name, kwargs)
     cache_path = os.path.join(cache_dir, f"{cache_key}.json")
@@ -274,9 +274,23 @@ def get_cached_evidence(session_id: str, tool_name: str, kwargs: dict) -> Option
         if time.time() - cached_at > _CACHE_TTL_SECONDS:
             os.remove(cache_path)
             return None
-        return data.get("content", "")
+        content = data.get("content", "")
+        return _stamp_cached_content(content, cached_at)
     except Exception:
         return None
+
+
+def _stamp_cached_content(content: str, cached_at: float) -> str:
+    """在缓存数据头部插入数据获取时间戳"""
+    from datetime import datetime
+    fetch_time = datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d %H:%M:%S")
+    age_days = (time.time() - cached_at) / 86400
+    age_note = f"{age_days:.0f}天前" if age_days >= 1 else "今天"
+    return (
+        f"[⚠️ 缓存数据 — 数据获取于 {fetch_time}（{age_note}），"
+        f"当前分析基准时间可能与此不同，请基于数据时效性判断结论可靠性]\n\n"
+        f"{content}"
+    )
 
 
 def set_cached_evidence(session_id: str, tool_name: str, kwargs: dict, content: str):
@@ -351,7 +365,8 @@ def get_global_cached_evidence(tool_name: str, kwargs: dict) -> Optional[str]:
         if time.time() - data.get("cached_at", 0) > _CACHE_TTL_SECONDS:
             os.remove(cache_path)
             return None
-        return data.get("content", "")
+        content = data.get("content", "")
+        return _stamp_cached_content(content, data.get("cached_at", 0))
     except Exception:
         return None
 

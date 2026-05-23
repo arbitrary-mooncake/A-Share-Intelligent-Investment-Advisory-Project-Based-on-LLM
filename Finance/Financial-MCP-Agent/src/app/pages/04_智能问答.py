@@ -387,6 +387,7 @@ else:
         st.caption(f"AI 投资研究助手 · ID: `{active_id or '未选择'}`")
 
         _render_messages()
+        _process_pending()
         _render_chat_input(active_id, current_name)
 
 

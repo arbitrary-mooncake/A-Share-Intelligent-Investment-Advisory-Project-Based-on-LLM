@@ -254,7 +254,7 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
             recommended_model="mimo-v2.5",
             recommended_thinking=False,
             recommended_react=False,
-            recommended_template="quick",
+            recommended_template="l0",
         )
 
     # Layer 1: 硬触发规则

@@ -200,7 +200,11 @@ def _process_pending():
                 elif current_event == "status":
                     status_el.caption(f"⏳ {data_str}")
 
-                elif current_event in (None, "answer_start", ""):
+                elif current_event == "answer_start":
+                    # 元数据事件，不显示
+                    pass
+
+                elif current_event in (None, ""):
                     # 普通文本块
                     status_el.empty()
                     full_answer += data_str

@@ -47,6 +47,14 @@ def _build_system_prompt(template: str, current_date: str) -> str:
         f"「⚠️ 你的问题不属于财经领域，以上回答仅供参考，建议咨询相关专业人士。」"
     )
 
+    if template == "l0":
+        # L0 超快速：极简prompt，极快响应
+        return (
+            f"你是AI投资研究助手。当前日期：{current_date}。\n"
+            f"简洁回答用户问题（100字内）。如果是非财经问题，正常作答但结尾加：\n"
+            f"「⚠️ 你的问题不属于财经领域，以上回答仅供参考。」"
+        )
+
     if template == "quick":
         return base + f"""
 
@@ -178,9 +186,8 @@ async def generate_answer_stream(
     )
 
     try:
-        max_tokens = 4096 if complexity.recommended_template == "quick" else (
-            8192 if complexity.recommended_template == "standard" else 16384
-        )
+        max_tokens_map = {"l0": 512, "quick": 4096, "standard": 8192, "deep": 16384}
+        max_tokens = max_tokens_map.get(complexity.recommended_template, 4096)
 
         stream = await client.chat.completions.create(
             model=model_name,

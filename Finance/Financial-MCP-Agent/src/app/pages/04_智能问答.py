@@ -23,12 +23,31 @@ st.set_page_config(page_title="AI 智能问答", page_icon="💬", layout="wide"
 # ──────────────────────────────────────────────
 st.markdown("""
 <style>
-/* 输入框区域加高 */
-.stChatInput textarea { min-height: 60px !important; font-size: 1rem !important; }
-.stChatInput { padding: 0.5rem 0 1rem 0 !important; }
-/* 消息区底部留白 */
-.stChatMessage { margin-bottom: 0.5rem; }
-.stChatMessage:last-child { margin-bottom: 2rem; }
+/* 页面撑满视口，flex列布局 */
+.main .block-container {
+    display: flex !important;
+    flex-direction: column !important;
+    min-height: calc(100vh - 4rem) !important;
+    padding-bottom: 0 !important;
+}
+/* 消息区自动撑满剩余空间 */
+.element-container:has(.stChatMessage) {
+    flex: 1;
+    overflow-y: auto;
+}
+/* 输入框固定在底部 */
+.stChatInput {
+    position: sticky !important;
+    bottom: 0 !important;
+    background: white !important;
+    padding: 0.75rem 0 1rem 0 !important;
+    border-top: 1px solid #eee !important;
+    z-index: 10 !important;
+}
+.stChatInput textarea {
+    min-height: 56px !important;
+    font-size: 0.95rem !important;
+}
 </style>
 """, unsafe_allow_html=True)
 

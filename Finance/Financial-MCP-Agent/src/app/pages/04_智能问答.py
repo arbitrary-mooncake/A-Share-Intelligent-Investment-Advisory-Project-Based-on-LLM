@@ -151,9 +151,17 @@ def _render_chat_input(session_id, session_name):
 
 def _process_pending():
     """Phase 2: 有 pending 消息时，流式获取 AI 回复并实时更新"""
-    pending = st.session_state.pop("_qa_process", None)
+    pending = st.session_state.get("_qa_process")
     if not pending:
         return
+    # 重试保护：失败超过3次放弃
+    retry = pending.get("_retry", 0)
+    if retry > 2:
+        st.session_state["_qa_process"] = None
+        st.error("多次尝试获取回答失败，请检查后端服务后重试")
+        return
+    pending["_retry"] = retry + 1
+    st.session_state["_qa_process"] = pending
 
     prompt = pending["prompt"]
     session_id = pending["session_id"]
@@ -247,12 +255,14 @@ def _process_pending():
     status_el.empty()
     answer_el.markdown(full_answer)
 
+    # 清除 pending，防止无限重试
+    st.session_state["_qa_process"] = None
+
     if full_answer and not full_answer.startswith("(_"):
         st.session_state["qa_messages"].append({
             "role": "assistant", "content": full_answer, "meta": meta_info,
         })
-        _refresh_sessions()
-
+    _refresh_sessions()
     st.rerun()
 
 
@@ -282,6 +292,10 @@ for s in sessions:
     if s["session_id"] == active_id:
         current_name = s.get("name", "对话")
         break
+
+# 页面加载/切换时，从后端同步历史（无 pending 时才加载，避免覆盖流式中的消息）
+if active_id and not st.session_state.get("_qa_process"):
+    _load_history(active_id)
 
 # ──────────────────────────────────────────────
 # 两栏布局

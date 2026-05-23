@@ -11,7 +11,10 @@ from dataclasses import dataclass, field
 
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
-from src.qa.session_manager import get_cached_evidence, set_cached_evidence
+from src.qa.session_manager import (
+    get_cached_evidence, set_cached_evidence,
+    get_global_cached_evidence, set_global_cached_evidence,
+)
 
 logger = setup_logger(__name__)
 
@@ -35,13 +38,19 @@ class EvidencePackage:
 
 async def _call_tool_safe(tool, kwargs: dict, timeout: float, label: str,
                          session_id: str = "") -> str:
-    """安全调用单个MCP工具，带超时、缓存和异常保护"""
-    # 先查缓存
+    """安全调用单个MCP工具，带超时、per-session缓存+全局缓存+异常保护"""
+    # 先查 per-session 缓存
     if session_id:
         cached = get_cached_evidence(session_id, label, kwargs)
         if cached:
-            logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 命中缓存 ({len(cached)} 字符)")
+            logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 命中会话缓存 ({len(cached)} 字符)")
             return cached
+
+    # 再查跨会话全局缓存
+    cached = get_global_cached_evidence(label, kwargs)
+    if cached:
+        logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 命中全局缓存 ({len(cached)} 字符)")
+        return cached
 
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=timeout)
@@ -50,6 +59,7 @@ async def _call_tool_safe(tool, kwargs: dict, timeout: float, label: str,
             logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 成功 ({len(text)} 字符)")
             if session_id:
                 set_cached_evidence(session_id, label, kwargs, text)
+            set_global_cached_evidence(label, kwargs, text)
             return text
         else:
             logger.warning(f"QA Evidence: {label} 返回过短 ({len(text)} 字符)")

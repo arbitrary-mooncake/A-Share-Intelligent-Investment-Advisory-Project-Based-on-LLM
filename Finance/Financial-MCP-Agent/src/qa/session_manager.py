@@ -107,10 +107,27 @@ class QASession:
         self.history.append(QAMessage(role=role, content=content))
         self.updated_at = time.time()
 
-    def get_history_for_llm(self, max_turns: int = 10) -> List[dict]:
-        """返回最近 N 轮对话，格式适配 LLM messages"""
-        recent = self.history[-max_turns * 2:]
-        return [{"role": m.role, "content": m.content} for m in recent]
+    def get_history_for_llm(self, max_turns: int = 12) -> List[dict]:
+        """
+        返回对话历史用于 LLM 上下文。
+        超过 max_turns 轮时，早期对话被压缩为摘要。
+        """
+        all_msgs = self.history
+        cutoff = max_turns * 2  # 每轮=user+assistant
+
+        if len(all_msgs) <= cutoff:
+            return [{"role": m.role, "content": m.content} for m in all_msgs]
+
+        # 压缩早期对话
+        old_messages = all_msgs[:-cutoff]
+        recent = all_msgs[-cutoff:]
+
+        if not self.summary:
+            self.summary = _compress_history(old_messages)
+
+        result = [{"role": "system", "content": f"[历史对话摘要] {self.summary}"}]
+        result.extend({"role": m.role, "content": m.content} for m in recent)
+        return result
 
 
 class SessionManager:
@@ -303,8 +320,97 @@ def clean_expired_cache():
                 cleaned += 1
         except Exception:
             pass
+    # 同时清理跨会话全局缓存
+    for cache_file in glob_module.glob(os.path.join(_QA_DATA_DIR, "global_cache", "*.json")):
+        try:
+            mtime = os.path.getmtime(cache_file)
+            if now - mtime > _CACHE_TTL_SECONDS:
+                os.remove(cache_file)
+                cleaned += 1
+        except Exception:
+            pass
     if cleaned:
         logger.info(f"清理了 {cleaned} 个过期QA数据缓存")
+
+
+# ── 跨会话全局缓存 ──────────────────────────────
+
+_GLOBAL_CACHE_DIR = os.path.join(_QA_DATA_DIR, "global_cache")
+
+
+def get_global_cached_evidence(tool_name: str, kwargs: dict) -> Optional[str]:
+    """跨会话全局缓存（同股票+同工具+同参数复用）"""
+    cache_key = _make_cache_key(tool_name, kwargs)
+    cache_path = os.path.join(_GLOBAL_CACHE_DIR, f"{cache_key}.json")
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 实时数据(行情)缓存1小时，基本面数据缓存7天
+        ttl = 3600 if _is_realtime_tool(tool_name) else _CACHE_TTL_SECONDS
+        if time.time() - data.get("cached_at", 0) > ttl:
+            os.remove(cache_path)
+            return None
+        return data.get("content", "")
+    except Exception:
+        return None
+
+
+def set_global_cached_evidence(tool_name: str, kwargs: dict, content: str):
+    """写入跨会话全局缓存"""
+    os.makedirs(_GLOBAL_CACHE_DIR, exist_ok=True)
+    cache_key = _make_cache_key(tool_name, kwargs)
+    cache_path = os.path.join(_GLOBAL_CACHE_DIR, f"{cache_key}.json")
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "tool_name": tool_name,
+                "cached_at": time.time(),
+                "content": content,
+            }, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"写入全局缓存失败: {e}")
+
+
+def _is_realtime_tool(tool_name: str) -> bool:
+    """判断是否为实时行情类工具（缓存TTL更短）"""
+    realtime = ["kline", "daily", "moneyflow", "rt_", "mins", "tick", "crawl_news"]
+    return any(kw in tool_name.lower() for kw in realtime)
+
+
+# ── 上下文压缩 ──────────────────────────────────
+
+def _compress_history(old_messages: list) -> str:
+    """将早期对话消息压缩为简短摘要"""
+    if not old_messages:
+        return ""
+
+    # 提取关键信息
+    stocks_mentioned = set()
+    topics = []
+    questions = []
+
+    import re
+    for msg in old_messages:
+        content = msg.content[:300]
+        # 提取股票代码
+        codes = re.findall(r'\b\d{5,6}\b', content)
+        stocks_mentioned.update(codes)
+        # 提取问题（用户消息）
+        if msg.role == "user":
+            q = content[:80].strip()
+            if q:
+                questions.append(q)
+
+    parts = []
+    if stocks_mentioned:
+        parts.append(f"涉及股票: {', '.join(sorted(stocks_mentioned)[:5])}")
+    if questions:
+        parts.append(f"主要问题: {'; '.join(questions[-5:])}")
+    parts.append(f"共{len(old_messages)}条历史消息")
+
+    return "。".join(parts)
 
 
 # ── 全局单例 ──────────────────────────────────────

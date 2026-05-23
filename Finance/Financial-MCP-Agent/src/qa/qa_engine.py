@@ -2,10 +2,12 @@
 QA引擎 — 智能问答总编排器
 
 协调复杂度分析 → 任务规划 → 证据装配 → 运行时升级 → 回答生成的完整流程。
-Phase 2: 增加运行时升级器(Layer 3)和优雅降级。
+Phase 3: 增加结构化监控日志。
 """
+import os
 import time
 import json
+from datetime import datetime
 from typing import AsyncGenerator, Optional
 
 from src.qa.session_manager import get_session_manager, QASession
@@ -22,6 +24,13 @@ from src.qa.answer_generator import generate_answer_stream
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 
 logger = setup_logger(__name__)
+
+# 监控日志路径
+_QA_LOG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "logs", "qa"
+)
+os.makedirs(_QA_LOG_DIR, exist_ok=True)
 
 
 async def process_question(
@@ -192,6 +201,17 @@ async def process_question(
         f"LLM成功={llm_success})"
     )
 
+    # 写入结构化监控日志
+    _write_qa_log(
+        session_id=actual_session_id,
+        question=question[:200],
+        complexity=complexity,
+        evidence=evidence,
+        total_time=total_time,
+        llm_success=llm_success,
+        answer_length=len(full_answer) if full_answer else 0,
+    )
+
 
 # ── 辅助函数 ──────────────────────────────────────
 
@@ -289,3 +309,41 @@ def save_answer_to_session(session_id: str, question: str, answer: str):
     if session:
         session.add_message("user", question)
         session.add_message("assistant", answer)
+
+
+def _write_qa_log(
+    session_id: str,
+    question: str,
+    complexity: ComplexityResult,
+    evidence: EvidencePackage,
+    total_time: float,
+    llm_success: bool,
+    answer_length: int,
+):
+    """写入结构化QA监控日志"""
+    try:
+        now = datetime.now()
+        log_entry = {
+            "timestamp": now.isoformat(),
+            "session_id": session_id,
+            "question": question,
+            "complexity_level": complexity.level,
+            "complexity_score": complexity.score,
+            "triggers": complexity.triggers,
+            "model": complexity.recommended_model,
+            "thinking": complexity.recommended_thinking,
+            "react": complexity.recommended_react,
+            "template": complexity.recommended_template,
+            "tool_summary": evidence.tool_call_summary,
+            "tools_missing": evidence.missing,
+            "evidence_elapsed": round(evidence.elapsed_seconds, 1),
+            "total_elapsed": round(total_time, 1),
+            "llm_success": llm_success,
+            "answer_length": answer_length,
+        }
+        log_file = os.path.join(_QA_LOG_DIR, f"{now.strftime('%Y%m%d')}.jsonl")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"写入QA监控日志失败: {e}")
+

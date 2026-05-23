@@ -86,11 +86,26 @@ class TestSessionManager:
         mgr = SessionManager()
         sid = mgr.create_session()
         sess = mgr.get_session(sid)
-        for i in range(5):
+        for i in range(3):
             sess.add_message("user", f"问题{i}")
             sess.add_message("assistant", f"回答{i}")
-        llm_history = sess.get_history_for_llm(max_turns=3)
-        assert len(llm_history) == 6  # 3 turns * 2
+        llm_history = sess.get_history_for_llm(max_turns=12)
+        assert len(llm_history) == 6  # 3 turns * 2, no compression needed
+
+    def test_history_compression(self):
+        """超过12轮时触发压缩"""
+        mgr = SessionManager()
+        sid = mgr.create_session()
+        for i in range(15):
+            sess = mgr.get_session(sid)
+            sess.add_message("user", f"问题{i}")
+            sess.add_message("assistant", f"回答{i}")
+        sess = mgr.get_session(sid)
+        llm_history = sess.get_history_for_llm(max_turns=12)
+        # 应该有system摘要 + 最近12轮的24条消息
+        assert llm_history[0]["role"] == "system"
+        assert "历史对话摘要" in llm_history[0]["content"]
+        assert len(llm_history) == 25  # 1 system + 24 recent
 
     def test_create_session_with_name(self):
         mgr = SessionManager()

@@ -124,9 +124,21 @@ def _complexity_label(level: str) -> str:
 def _render_messages():
     for msg in st.session_state.get("qa_messages", []):
         with st.chat_message(msg["role"]):
-            # AI消息显示复杂度标签
             if msg["role"] == "assistant" and msg.get("meta"):
-                st.caption(msg["meta"])
+                meta = msg["meta"]
+                # 根据复杂度等级着色
+                color = "#888"
+                if "L0" in meta: color = "#999"
+                elif "L1" in meta: color = "#4caf50"
+                elif "L2" in meta: color = "#2196f3"
+                elif "L3" in meta: color = "#ff9800"
+                elif "L4" in meta: color = "#f44336"
+                st.markdown(
+                    f'<span style="font-size:0.75rem;color:{color};background:{color}15;'
+                    f'padding:2px 8px;border-radius:10px;border:1px solid {color}30;">'
+                    f'{meta}</span>',
+                    unsafe_allow_html=True,
+                )
             st.markdown(msg["content"])
 
 
@@ -174,11 +186,11 @@ def _process_pending():
     full_answer = ""
     meta_info = ""
 
-    # AI 对话框立刻出现，显示"思考中"
+    # AI 对话框立刻出现
     with st.chat_message("assistant"):
         status_el = st.empty()
         answer_el = st.empty()
-        status_el.caption("⏳ 思考中...")
+        status_el.caption("⏳ 分析中...")
 
     # 同步 SSE 流式读取（避免 asyncio 阻塞问题）
     import requests
@@ -221,9 +233,12 @@ def _process_pending():
                     meta_info = f"{level_label}"
                     if stock:
                         meta_info += f" · {stock}"
+                    # 立刻更新状态行显示复杂度
+                    status_el.caption(f"⏳ {meta_info} · 分析中...")
 
                 elif current_event == "status":
-                    status_el.caption(f"⏳ {data_str}")
+                    prefix = f"{meta_info} · " if meta_info else ""
+                    status_el.caption(f"⏳ {prefix}{data_str}")
 
                 elif current_event == "answer_start":
                     # 元数据事件，不显示，重置事件类型让后续文本正常流入

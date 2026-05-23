@@ -23,12 +23,12 @@ st.set_page_config(page_title="AI 智能问答", page_icon="💬", layout="wide"
 # ──────────────────────────────────────────────
 st.markdown("""
 <style>
-/* 让主内容区填满高度 */
-.main .block-container { padding-top: 1rem; padding-bottom: 0; }
-/* 输入框固定在底部 */
-.stChatInput { position: fixed; bottom: 0; background: white; padding: 1rem 0; z-index: 100; }
-/* 给消息区留出输入框空间 */
+/* 输入框区域加高 */
+.stChatInput textarea { min-height: 60px !important; font-size: 1rem !important; }
+.stChatInput { padding: 0.5rem 0 1rem 0 !important; }
+/* 消息区底部留白 */
 .stChatMessage { margin-bottom: 0.5rem; }
+.stChatMessage:last-child { margin-bottom: 2rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -240,56 +240,76 @@ else:
             updated = sess.get("updated_at", 0)
             time_str = datetime.fromtimestamp(updated).strftime("%m/%d %H:%M") if updated else ""
 
-            # 重命名中
-            if st.session_state.qa_pending_rename == sid:
-                new_name = st.text_input("新名称", value=name, key=f"rn_{sid}",
-                                         label_visibility="collapsed")
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("✓", key=f"ok_{sid}"):
-                        nn = new_name.strip()
-                        if nn:
-                            _sync_call(qa_rename_session(sid, nn))
+            # 每一行：名称按钮 + 删除按钮
+            row_l, row_r = st.columns([5, 1])
+
+            with row_l:
+                # 重命名模式：点击标题触发
+                if st.session_state.qa_pending_rename == sid:
+                    new_name = st.text_input("", value=name, key=f"rn_{sid}",
+                                             label_visibility="collapsed")
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        if st.button("✓", key=f"ok_{sid}"):
+                            nn = new_name.strip()
+                            if nn:
+                                _sync_call(qa_rename_session(sid, nn))
                             st.session_state.qa_pending_rename = None
                             _refresh_sessions()
                             st.rerun()
-                with c2:
-                    if st.button("✗", key=f"cx_{sid}"):
-                        st.session_state.qa_pending_rename = None
-                        st.rerun()
-            else:
-                # 会话条目按钮
-                label = f"{'🔵 ' if is_active else '  '}{name[:18]}"
-                if st.button(label, key=f"sess_{sid}", use_container_width=True,
-                             help=f"{msg_count}条 · {time_str}"):
-                    st.session_state["qa_active_session"] = sid
-                    _load_history(sid)
-                    st.rerun()
+                    with rc2:
+                        if st.button("✗", key=f"cx_{sid}"):
+                            st.session_state.qa_pending_rename = None
+                            st.rerun()
+                else:
+                    label = f"{'🔵 ' if is_active else '  '}{name[:20]}"
+                    if st.button(label, key=f"sess_{sid}", use_container_width=True,
+                                 help=f"{msg_count}条 · {time_str} · 点击标题可重命名"):
+                        # 如果是活跃会话 → 触发重命名；否则 → 切换
+                        if is_active:
+                            st.session_state.qa_pending_rename = sid
+                            st.rerun()
+                        else:
+                            st.session_state["qa_active_session"] = sid
+                            _load_history(sid)
+                            st.rerun()
 
-                # 元信息
-                st.caption(f"  {msg_count}条 · {time_str}")
+            with row_r:
+                # 删除按钮 + 确认
+                if f"qa_confirm_del_{sid}" not in st.session_state:
+                    st.session_state[f"qa_confirm_del_{sid}"] = False
 
-                # 操作菜单
-                with st.expander("⚙", expanded=False):
-                    if st.button("✏️ 重命名", key=f"ed_{sid}"):
-                        st.session_state.qa_pending_rename = sid
-                        st.rerun()
-                    if st.button("🗑️ 删除", key=f"dl_{sid}"):
+                if st.session_state[f"qa_confirm_del_{sid}"]:
+                    if st.button("✅", key=f"cfm_{sid}", help="确认删除"):
                         _sync_call(qa_delete_session(sid))
+                        st.session_state[f"qa_confirm_del_{sid}"] = False
                         if active_id == sid:
-                            st.session_state["qa_active_session"] = None
-                            st.session_state["qa_messages"] = []
-                        _refresh_sessions()
+                            _refresh_sessions()
+                            remaining = [s for s in st.session_state["qa_sessions"] if s["session_id"] != sid]
+                            nxt = remaining[0]["session_id"] if remaining else None
+                            st.session_state["qa_active_session"] = nxt
+                            if nxt:
+                                _load_history(nxt)
+                            else:
+                                st.session_state["qa_messages"] = []
+                        else:
+                            _refresh_sessions()
                         st.rerun()
+                    if st.button("❌", key=f"ccl_{sid}", help="取消"):
+                        st.session_state[f"qa_confirm_del_{sid}"] = False
+                        st.rerun()
+                else:
+                    if st.button("🗑", key=f"dl_{sid}", help="删除此会话"):
+                        st.session_state[f"qa_confirm_del_{sid}"] = True
+                        st.rerun()
+
+            st.caption(f"  {msg_count}条 · {time_str}")
 
         st.divider()
 
         # 新建
-        new_name = st.text_input("新窗口名", key="new_name", label_visibility="collapsed",
-                                 placeholder="留空则自动命名")
         if st.button("＋ 新建窗口", use_container_width=True):
-            name = new_name.strip() or "新对话"
-            result = _sync_call(qa_create_session(name))
+            result = _sync_call(qa_create_session("新对话"))
             sid = result.get("session_id", "")
             st.session_state["qa_active_session"] = sid
             st.session_state["qa_messages"] = []

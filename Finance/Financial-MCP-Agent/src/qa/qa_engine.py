@@ -120,7 +120,7 @@ async def process_question(
     # Step 3: 任务规划
     history_text = _build_history_text(session)
     task_plan = plan_task(question, complexity.level, history_text,
-                          matched_topic_name=matched_topic_name)
+                          topic_name=matched_topic_name)
 
     logger.info(
         f"QA Engine: 任务规划 — 数据域={task_plan.domains}, "
@@ -249,6 +249,7 @@ async def process_question(
         llm_success=llm_success,
         answer_length=len(full_answer) if full_answer else 0,
     )
+
 
 
 # ── 辅助函数 ──────────────────────────────────────

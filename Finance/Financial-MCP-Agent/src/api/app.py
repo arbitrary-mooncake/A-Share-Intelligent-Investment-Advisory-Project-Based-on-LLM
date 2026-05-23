@@ -1877,13 +1877,22 @@ async def qa_ask(req: QARequest):
     current_time = now.strftime("%H:%M:%S")
     current_time_info = f"{current_date_cn} ({current_date}) {current_weekday_cn} {current_time}"
 
+    async def safe_stream():
+        try:
+            async for chunk in process_question(
+                question=question,
+                session_id=req.session_id,
+                current_date=current_date,
+                current_time_info=current_time_info,
+            ):
+                yield chunk
+        except Exception as e:
+            logger.error(f"{ERROR_ICON} QA SSE流异常: {e}", exc_info=True)
+            yield f"event: error\ndata: {{\"message\": \"系统内部错误，请重试\"}}\n\n"
+            yield "data: [DONE]\n\n"
+
     return StreamingResponse(
-        process_question(
-            question=question,
-            session_id=req.session_id,
-            current_date=current_date,
-            current_time_info=current_time_info,
-        ),
+        safe_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

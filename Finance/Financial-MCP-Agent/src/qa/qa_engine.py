@@ -84,22 +84,23 @@ async def process_question(
 
     # 无股票代码时尝试主题匹配
     topic_context = ""
+    matched_topic_name = ""
     if not stock_code and not company_name:
         topic_info = match_topic(question)
         if topic_info:
-            topic_name, topic_data = topic_info
+            matched_topic_name, topic_data = topic_info
             etf = topic_data["etfs"][0]
             stock_code = etf[0]
-            company_name = f"{topic_name}主题({etf[1]})"
+            company_name = f"{matched_topic_name}主题({etf[1]})"
             # 构建主题上下文供LLM参考
             related = [f"{c}({n})" for c, n in topic_data["stocks"][:3]]
             topic_context = (
-                f"[主题匹配] 用户询问{topic_name}相关话题。使用代表性ETF {stock_code} "
+                f"[主题匹配] 用户询问{matched_topic_name}相关话题。使用代表性ETF {stock_code} "
                 f"作为主要数据源。相关A股标的: {', '.join(related)}。"
-                f"请基于A股{topic_name}相关标的数据进行分析，注意区分A股黄金相关标的"
+                f"请基于A股{matched_topic_name}相关标的数据进行分析，注意区分A股黄金相关标的"
                 f"与国际金价的差异。"
             )
-            logger.info(f"QA Engine: 主题匹配 → {topic_name}, 使用ETF {stock_code}")
+            logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")
 
     if stock_code:
         session_mgr.update_context(
@@ -119,7 +120,7 @@ async def process_question(
     # Step 3: 任务规划
     history_text = _build_history_text(session)
     task_plan = plan_task(question, complexity.level, history_text,
-                          topic_matched=bool(topic_info))
+                          matched_topic_name=matched_topic_name)
 
     logger.info(
         f"QA Engine: 任务规划 — 数据域={task_plan.domains}, "

@@ -139,6 +139,15 @@ DATA_DOMAINS = {
         "tools": ["crawl_news", "get_st_risk_data", "tushare_st_status"],
         "description": "新闻公告、ST风险、重大事件等舆情数据",
     },
+    "宏观": {
+        "keywords": ["利率", "汇率", "CPI", "PPI", "GDP", "PMI", "通胀", "货币",
+                     "美联储", "央行", "加息", "降息", "经济形势", "宏观",
+                     "人民币", "美元", "外汇", "准备金", "LPR", "社融"],
+        "tools": ["tushare_shibor", "tushare_cn_cpi", "tushare_cn_ppi",
+                  "tushare_cn_gdp", "tushare_cn_pmi", "tushare_fx_daily",
+                  "tushare_cn_m", "tushare_eco_cal"],
+        "description": "利率、汇率、通胀、GDP、PMI等宏观经济指标",
+    },
 }
 
 
@@ -153,7 +162,7 @@ class TaskPlan:
 
 
 def plan_task(question: str, complexity_level: str, history_text: str = "",
-              topic_matched: bool = False) -> TaskPlan:
+              topic_name: str = "") -> TaskPlan:
     """
     根据问题内容和复杂度等级规划数据获取任务。
 
@@ -179,9 +188,13 @@ def plan_task(question: str, complexity_level: str, history_text: str = "",
 
     domains = _identify_domains(augmented_question)
 
-    # 主题/宏观问题自动追加新闻域
-    if topic_matched and "新闻" not in domains:
-        domains.append("新闻")
+    # 主题/宏观问题自动追加新闻域和宏观域
+    if topic_name:
+        if "新闻" not in domains:
+            domains.append("新闻")
+        macro_topics = {"黄金", "白银", "原油", "煤炭", "房地产"}
+        if topic_name in macro_topics and "宏观" not in domains:
+            domains.append("宏观")
 
     tools = _get_tools_for_domains(domains)
 

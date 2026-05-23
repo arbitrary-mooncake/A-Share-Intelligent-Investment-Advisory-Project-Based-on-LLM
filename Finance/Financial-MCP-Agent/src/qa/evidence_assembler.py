@@ -104,15 +104,32 @@ async def assemble_evidence_fast(
         evidence.missing.append("未指定A股标的")
         return evidence
 
-    # 获取 MCP 工具
-    try:
-        all_mcp_tools = await get_mcp_tools(tool_filter=tools)
-    except Exception as e:
-        logger.error(f"{ERROR_ICON} QA Evidence: 获取MCP工具失败: {e}")
-        evidence.missing.append(f"MCP工具不可用: {e}")
-        return evidence
+    # 获取 MCP 工具（含重试）
+    all_mcp_tools = None
+    for attempt in range(3):
+        try:
+            all_mcp_tools = await get_mcp_tools(tool_filter=tools)
+            break
+        except Exception as e:
+            logger.warning(f"QA Evidence: MCP连接尝试 {attempt+1}/3 失败: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+            else:
+                logger.error(f"{ERROR_ICON} QA Evidence: MCP连接3次均失败")
+                evidence.raw_text = (
+                    "数据服务暂时不可用（MCP连接失败）。请稍后重试，"
+                    "或基于现有知识和行业理解作答，明确标注数据来源限制。"
+                )
+                evidence.tool_call_summary = "MCP连接失败（3次重试）"
+                evidence.missing.append("MCP数据服务不可用")
+                return evidence
 
     if not all_mcp_tools:
+        evidence.raw_text = (
+            "当前数据工具未返回有效结果。请基于现有知识和行业理解作答，"
+            "明确标注数据来源限制。"
+        )
+        evidence.tool_call_summary = "无可用工具"
         evidence.missing.append("无可用MCP工具")
         return evidence
 

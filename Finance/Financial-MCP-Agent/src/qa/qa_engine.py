@@ -1,14 +1,17 @@
 """
 QA引擎 — 智能问答总编排器
 
-协调复杂度分析 → 任务规划 → 证据装配 → 回答生成的完整流程。
+协调复杂度分析 → 任务规划 → 证据装配 → 运行时升级 → 回答生成的完整流程。
+Phase 2: 增加运行时升级器(Layer 3)和优雅降级。
 """
 import time
 import json
 from typing import AsyncGenerator, Optional
 
 from src.qa.session_manager import get_session_manager, QASession
-from src.qa.complexity_analyzer import analyze_complexity, ComplexityResult
+from src.qa.complexity_analyzer import (
+    analyze_complexity, try_runtime_upgrade, ComplexityResult,
+)
 from src.qa.task_planner import plan_task, extract_stock_from_question
 from src.qa.evidence_assembler import (
     assemble_evidence_fast,
@@ -28,7 +31,7 @@ async def process_question(
     current_time_info: str = "",
 ) -> AsyncGenerator[str, None]:
     """
-    处理用户问题的主流程。
+    处理用户问题的主流程（Phase 2：含运行时升级和降级）。
 
     Args:
         question: 用户问题
@@ -37,7 +40,7 @@ async def process_question(
         current_time_info: 完整时间信息
 
     Yields:
-        SSE格式字符串: "event: {type}\\ndata: {json}\\n\\n" 或 "data: {chunk}\\n\\n"
+        SSE格式字符串
     """
     start_time = time.time()
     session_mgr = get_session_manager()
@@ -93,23 +96,52 @@ async def process_question(
         f"工具数={len(task_plan.tools)}, ReAct={task_plan.need_react}"
     )
 
-    # Step 4: 证据装配
+    # Step 4: 证据装配（含降级保护）
     yield _sse_event("status", {
         "message": f"正在获取数据（涉及{len(task_plan.domains)}个数据域）..."
     })
 
-    if task_plan.need_react and complexity.level == "L4":
-        logger.info(f"{WAIT_ICON} QA Engine: 使用 ReAct 路径...")
-        evidence = await assemble_evidence_react(
-            stock_code or "", company_name or "",
-            question, current_date, current_time_info
+    evidence = await _assemble_with_fallback(
+        task_plan, complexity, stock_code or "", company_name or "",
+        question, current_date, current_time_info, actual_session_id,
+    )
+
+    # ── 运行时升级（Layer 3） ──
+    tool_labels = task_plan.tools
+    total_tools = max(len(tool_labels), 1)
+    success_count = total_tools - len(evidence.missing)
+    tool_success_rate = success_count / total_tools
+    contradictory = _detect_contradictions(evidence)
+    actual_domains = max(len(task_plan.domains), 1)
+
+    complexity = try_runtime_upgrade(
+        complexity,
+        tool_success_rate=tool_success_rate,
+        evidence_missing_count=len(evidence.missing),
+        contradictory_signals=contradictory,
+        actual_domain_count=actual_domains,
+    )
+
+    if complexity.triggers and any("运行时" in t for t in complexity.triggers):
+        logger.info(
+            f"QA Engine: 运行时升级 → {complexity.level}, "
+            f"model={complexity.recommended_model}, "
+            f"thinking={complexity.recommended_thinking}"
         )
-    else:
-        logger.info(f"{WAIT_ICON} QA Engine: 使用快路径并行拉取数据...")
-        evidence = await assemble_evidence_fast(
-            stock_code or "", company_name or "",
-            task_plan.tools, question, current_date,
-            session_id=actual_session_id,
+        yield _sse_event("status", {
+            "message": f"检测到复杂问题，已升级分析策略（{complexity.level}/{complexity.recommended_model}）..."
+        })
+
+    # ── 降级：数据完全缺失 ──
+    if not evidence.raw_text or evidence.raw_text == "(无数据)":
+        yield _sse_event("status", {
+            "message": "数据获取受限，将基于可用信息和专业知识进行回答..."
+        })
+        evidence.raw_text = (
+            f"（系统说明：部分数据源当前不可用。以下回答将基于已有信息和行业知识进行分析，"
+            f"所有推断会明确标注。）\n"
+            f"可用信息：股票={company_name or '未指定'}，代码={stock_code or '未指定'}，"
+            f"日期={current_date}"
         )
 
     yield _sse_event("status", {
@@ -119,21 +151,33 @@ async def process_question(
         )
     })
 
-    # Step 5: 流式回答生成
+    # Step 5: 流式回答生成（含LLM降级）
     yield _sse_event("answer_start", {"template": complexity.recommended_template})
 
     full_answer = ""
-    async for chunk in generate_answer_stream(
-        question=question,
-        evidence=evidence,
-        complexity=complexity,
-        history_text=history_text,
-        current_date=current_date,
-    ):
-        yield chunk
-        # 收集完整回答用于保存到会话历史（仅收集data块）
-        if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]") and not chunk.startswith("data: [ERROR]"):
-            full_answer += chunk[6:].rstrip("\n")
+    llm_success = False
+
+    try:
+        async for chunk in generate_answer_stream(
+            question=question,
+            evidence=evidence,
+            complexity=complexity,
+            history_text=history_text,
+            current_date=current_date,
+        ):
+            yield chunk
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]") and not chunk.startswith("data: [ERROR]"):
+                full_answer += chunk[6:].rstrip("\n")
+        llm_success = True
+    except Exception as llm_err:
+        logger.error(f"{ERROR_ICON} QA Engine: LLM流式生成异常: {llm_err}")
+
+    # ── 降级：LLM 失败时返回证据数据 ──
+    if not llm_success or not full_answer.strip():
+        fallback = _build_fallback_answer(evidence, company_name, stock_code, current_date)
+        yield f"data: {fallback}\n\n"
+        yield "data: [DONE]\n\n"
+        full_answer = fallback
 
     # Step 6: 保存到会话历史并持久化
     if full_answer.strip():
@@ -144,8 +188,81 @@ async def process_question(
     total_time = time.time() - start_time
     logger.info(
         f"{SUCCESS_ICON} QA Engine: 回答完成 "
-        f"({total_time:.1f}s, 复杂度={complexity.level})"
+        f"({total_time:.1f}s, 复杂度={complexity.level}, "
+        f"LLM成功={llm_success})"
     )
+
+
+# ── 辅助函数 ──────────────────────────────────────
+
+async def _assemble_with_fallback(
+    task_plan, complexity, stock_code, company_name,
+    question, current_date, current_time_info, session_id,
+) -> EvidencePackage:
+    """证据装配 + 降级保护"""
+    try:
+        if task_plan.need_react and complexity.level == "L4":
+            logger.info(f"{WAIT_ICON} QA Engine: 使用 ReAct 路径...")
+            evidence = await assemble_evidence_react(
+                stock_code, company_name,
+                question, current_date, current_time_info,
+            )
+        else:
+            logger.info(f"{WAIT_ICON} QA Engine: 使用快路径并行拉取数据...")
+            evidence = await assemble_evidence_fast(
+                stock_code, company_name,
+                task_plan.tools, question, current_date,
+                session_id=session_id,
+            )
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} QA Engine: 证据装配失败: {e}")
+        # 降级：返回空证据包
+        evidence = EvidencePackage(
+            subject=company_name or stock_code or question,
+            stock_code=stock_code,
+            company_name=company_name,
+            missing=["证据装配异常: " + str(e)],
+            tool_call_summary="装配失败",
+        )
+    return evidence
+
+
+def _detect_contradictions(evidence: EvidencePackage) -> bool:
+    """简单检测证据中是否存在矛盾信号"""
+    text = evidence.raw_text.lower()
+    # 常见矛盾模式
+    patterns = [
+        ("上涨" in text or "增长" in text or "上升" in text) and
+        ("下跌" in text or "下降" in text or "下滑" in text),
+        ("盈利" in text or "利润.*正" in text) and
+        ("亏损" in text or "利润.*负" in text),
+    ]
+    return any(patterns)
+
+
+def _build_fallback_answer(
+    evidence: EvidencePackage,
+    company_name: str,
+    stock_code: str,
+    current_date: str,
+) -> str:
+    """LLM失败时的降级回答：直接返回已获取的数据事实"""
+    parts = [
+        f"## 数据查询结果\n",
+        f"**查询对象**: {company_name or stock_code or '未指定'}",
+        f"**数据截至**: {current_date}",
+        f"**数据获取状态**: {evidence.tool_call_summary}",
+        f"",
+        f"⚠️ LLM分析服务暂时不可用，以下为已获取的原始数据：",
+        f"",
+        evidence.raw_text if evidence.raw_text else "（无可用数据）",
+        f"",
+        f"---",
+        f"*数据缺失: {', '.join(evidence.missing) if evidence.missing else '无'}*",
+        f"",
+        f"*请稍后重试以获取完整分析，或简化问题重新提问。*",
+    ]
+    return "\n".join(parts)
 
 
 def _sse_event(event_type: str, data: dict) -> str:
@@ -157,7 +274,7 @@ def _build_history_text(session: QASession) -> str:
     """构建历史对话文本（用于上下文注入）"""
     if not session.history:
         return ""
-    recent = session.history[-6:]  # 最近3轮
+    recent = session.history[-6:]
     lines = []
     for msg in recent:
         role = "用户" if msg.role == "user" else "分析师"

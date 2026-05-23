@@ -9,7 +9,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest
 import src.qa.session_manager as sm
 from src.qa.session_manager import SessionManager, QASession, QAMessage
-from src.qa.complexity_analyzer import analyze_complexity, ComplexityResult
+from src.qa.complexity_analyzer import (
+    analyze_complexity, try_runtime_upgrade, ComplexityResult,
+)
 from src.qa.task_planner import plan_task, extract_stock_from_question
 
 
@@ -233,3 +235,54 @@ class TestTaskPlanner:
         assert isinstance(plan.need_react, bool)
         assert plan.reason
         assert plan.expected_data_volume in ("small", "medium", "large")
+
+
+# ── Runtime Upgrader 测试 ────────────────────────
+
+class TestRuntimeUpgrader:
+    def test_low_success_rate_upgrades(self):
+        result = analyze_complexity("茅台PE多少")
+        upgraded = try_runtime_upgrade(
+            result, tool_success_rate=0.3, evidence_missing_count=5,
+            contradictory_signals=False, actual_domain_count=1,
+        )
+        assert upgraded.recommended_model == "mimo-v2.5-pro"
+
+    def test_contradiction_triggers_pro_and_thinking(self):
+        result = analyze_complexity("茅台PE多少")
+        upgraded = try_runtime_upgrade(
+            result, tool_success_rate=1.0, evidence_missing_count=0,
+            contradictory_signals=True, actual_domain_count=2,
+        )
+        assert upgraded.recommended_model == "mimo-v2.5-pro"
+        assert upgraded.recommended_thinking is True
+
+    def test_multi_domain_upgrades_l3(self):
+        result = analyze_complexity("茅台PE多少")  # L1
+        upgraded = try_runtime_upgrade(
+            result, tool_success_rate=1.0, evidence_missing_count=0,
+            contradictory_signals=False, actual_domain_count=4,
+        )
+        assert upgraded.level in ("L3", "L4")
+
+    def test_l4_forces_thinking(self):
+        result = ComplexityResult(
+            level="L4", score=80, triggers=[], score_detail={},
+            need_clarify=False, recommended_model="mimo-v2.5-pro",
+            recommended_thinking=False, recommended_react=True,
+            recommended_template="deep",
+        )
+        upgraded = try_runtime_upgrade(
+            result, tool_success_rate=1.0, evidence_missing_count=0,
+            contradictory_signals=False, actual_domain_count=3,
+        )
+        assert upgraded.recommended_thinking is True
+
+    def test_no_upgrade_when_all_ok(self):
+        result = analyze_complexity("茅台PE多少")  # L1
+        upgraded = try_runtime_upgrade(
+            result, tool_success_rate=1.0, evidence_missing_count=0,
+            contradictory_signals=False, actual_domain_count=1,
+        )
+        assert upgraded.level == result.level
+        assert upgraded.recommended_model == result.recommended_model

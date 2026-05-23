@@ -236,3 +236,108 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
             result.triggers.append("用户显式要求深度分析 -> L3")
 
     return result
+
+
+# ── Layer 3: 运行时升级器 ───────────────────────
+
+RUNTIME_UPGRADE_TRIGGERS = {
+    "data_missing_critical": {
+        "description": "关键数据域缺失（超过40%的工具调用失败）",
+        "upgrade_action": "upgrade_model",
+    },
+    "evidence_conflict": {
+        "description": "证据之间出现显著矛盾",
+        "upgrade_action": "upgrade_to_pro",
+    },
+    "multi_domain_required": {
+        "description": "实际需要超过4个数据域",
+        "upgrade_action": "upgrade_to_pro_with_thinking",
+    },
+    "tool_calls_excessive": {
+        "description": "工具调用次数超过预期2倍",
+        "upgrade_action": "upgrade_model",
+    },
+    "answer_low_confidence": {
+        "description": "首轮回答置信度不足",
+        "upgrade_action": "retry_with_thinking",
+    },
+}
+
+
+def try_runtime_upgrade(
+    current: ComplexityResult,
+    tool_success_rate: float,
+    evidence_missing_count: int,
+    contradictory_signals: bool,
+    actual_domain_count: int,
+) -> ComplexityResult:
+    """
+    Layer 3: 运行时升级器。
+
+    在数据获取后发现实际情况比预判更复杂时，升级模型和策略。
+
+    Args:
+        current: 初始复杂度结果
+        tool_success_rate: 工具调用成功率 (0.0~1.0)
+        evidence_missing_count: 缺失数据数
+        contradictory_signals: 是否有矛盾证据
+        actual_domain_count: 实际涉及的数据域数
+
+    Returns:
+        可能升级后的 ComplexityResult
+    """
+    result = ComplexityResult(
+        level=current.level,
+        score=current.score,
+        triggers=list(current.triggers),
+        score_detail=dict(current.score_detail),
+        need_clarify=current.need_clarify,
+        recommended_model=current.recommended_model,
+        recommended_thinking=current.recommended_thinking,
+        recommended_react=current.recommended_react,
+        recommended_template=current.recommended_template,
+    )
+
+    level_idx = {"L1": 0, "L2": 1, "L3": 2, "L4": 3}
+    current_idx = level_idx.get(result.level, 0)
+
+    # 触发1: 工具成功率过低 → 升级模型
+    if tool_success_rate < 0.6 and evidence_missing_count > 3:
+        if current_idx < 2:
+            result.level = "L3"
+            result.triggers.append("运行时升级: 工具成功率过低 → L3")
+        result.recommended_model = "mimo-v2.5-pro"
+
+    # 触发2: 证据矛盾 → 升级到 Pro + reasoning
+    if contradictory_signals:
+        result.recommended_model = "mimo-v2.5-pro"
+        result.recommended_thinking = True
+        if current_idx < 2:
+            result.level = "L3"
+        result.triggers.append("运行时升级: 证据矛盾 → Pro + thinking")
+
+    # 触发3: 实际数据域超出预期 → 升级
+    if actual_domain_count >= 4 and current_idx < 2:
+        new_level = "L3" if actual_domain_count < 5 else "L4"
+        result.level = new_level
+        result.recommended_model = "mimo-v2.5-pro"
+        result.recommended_thinking = (new_level == "L4")
+        result.triggers.append(f"运行时升级: 实际{actual_domain_count}个数据域 → {new_level}")
+
+    # 触发4: L2+但关键数据缺失 → 开启 thinking 弥补
+    if evidence_missing_count >= 3 and current_idx >= 1:
+        result.recommended_thinking = True
+        result.triggers.append("运行时升级: 数据缺失较多 → 开启thinking")
+
+    # 触发5: L4但thinking未开 → 修正
+    if result.level == "L4" and not result.recommended_thinking:
+        result.recommended_thinking = True
+        result.triggers.append("运行时修正: L4必须开启thinking")
+
+    # 触发6: Pro被推荐但model未升级 → 修正
+    if result.recommended_model == "mimo-v2.5-pro" and current_idx >= 2:
+        if not result.recommended_thinking and result.level == "L4":
+            result.recommended_thinking = True
+
+    return result
+

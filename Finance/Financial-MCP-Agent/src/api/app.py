@@ -30,6 +30,7 @@ from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -55,6 +56,10 @@ from src.stock_pool.stock_pool_manager import StockPoolManager
 from src.stock_pool.scoring_engine import ScoringEngine
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.industry_knowledge import identify_industry, get_industry_info, get_industry_scoring_guidance
+
+# QA 引擎
+from src.qa.qa_engine import process_question
+from src.qa.session_manager import get_session_manager
 
 # ──────────────────────────────────────────────
 # 日志配置
@@ -1822,3 +1827,73 @@ async def batch_score_results(batch_id: str):
         "created_at": job.get("created_at", ""),
         "error": job.get("error"),
     }
+
+
+# ══════════════════════════════════════════════════════════════
+# 智能问答端点 (Phase 1)
+# ══════════════════════════════════════════════════════════════
+
+class QARequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+
+
+@app.post("/api/qa/ask")
+async def qa_ask(req: QARequest):
+    """
+    智能问答 — SSE流式端点
+
+    接收自然语言问题，返回流式SSE事件：
+    - event: meta       → 会话ID、复杂度、股票信息
+    - event: status     → 数据获取状态
+    - event: answer_start → 回答开始
+    - data: {chunk}     → 回答内容流
+    - event: clarify    → 需要澄清（歧义高时）
+    - data: [DONE]      → 结束
+    """
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="问题不能为空")
+
+    question = req.question.strip()
+
+    now = datetime.now()
+    current_date = now.strftime("%Y-%m-%d")
+    current_date_cn = now.strftime("%Y年%m月%d日")
+    current_weekday_cn = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][now.weekday()]
+    current_time = now.strftime("%H:%M:%S")
+    current_time_info = f"{current_date_cn} ({current_date}) {current_weekday_cn} {current_time}"
+
+    return StreamingResponse(
+        process_question(
+            question=question,
+            session_id=req.session_id,
+            current_date=current_date,
+            current_time_info=current_time_info,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/qa/sessions/{session_id}")
+async def qa_get_session(session_id: str):
+    """获取会话历史和上下文"""
+    session_mgr = get_session_manager()
+    session = session_mgr.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+    return session.to_dict()
+
+
+@app.delete("/api/qa/sessions/{session_id}")
+async def qa_delete_session(session_id: str):
+    """删除会话"""
+    session_mgr = get_session_manager()
+    deleted = session_mgr.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+    return {"status": "deleted", "session_id": session_id}

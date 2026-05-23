@@ -77,6 +77,81 @@ collapsed = st.session_state.get("qa_sidebar_collapsed", False)
 sessions = st.session_state.get("qa_sessions", [])
 
 # ──────────────────────────────────────────────
+# 对话输入处理函数（必须在主渲染代码之前定义）
+# ──────────────────────────────────────────────
+
+def _handle_chat_input(prompt: str, session_id: str):
+    """处理用户输入并流式展示回答"""
+    st.session_state.qa_messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    async def _process():
+        full_answer = ""
+        meta_info = ""
+
+        answer_container = st.chat_message("assistant")
+        with answer_container:
+            status_placeholder = st.empty()
+            meta_placeholder = st.empty()
+            answer_placeholder = st.empty()
+
+        try:
+            async for event in qa_ask_stream(question=prompt, session_id=session_id):
+                event_type = event.get("type")
+                event_data = event.get("data")
+
+                if event_type == "meta":
+                    sid = event_data.get("session_id", "")
+                    complexity = event_data.get("complexity", "")
+                    stock = event_data.get("company_name", "")
+                    if sid and sid != session_id:
+                        st.session_state["qa_active_session"] = sid
+                    parts = [f"复杂度: {complexity}"]
+                    if stock:
+                        parts.append(f"股票: {stock}")
+                    meta_info = " | ".join(parts)
+                    meta_placeholder.caption(meta_info)
+
+                elif event_type == "status":
+                    status_placeholder.caption(f"⏳ {event_data.get('message', '处理中...')}")
+
+                elif event_type == "answer":
+                    status_placeholder.empty()
+                    full_answer += str(event_data)
+                    answer_placeholder.markdown(full_answer + "▌")
+
+                elif event_type == "clarify":
+                    status_placeholder.empty()
+                    answer_placeholder.warning(event_data.get("message", "需要更多信息"))
+                    full_answer = f"(_需澄清: {event_data.get('message', '')}_)"
+
+                elif event_type == "error":
+                    status_placeholder.empty()
+                    answer_placeholder.error(event_data)
+                    full_answer = f"(_请求失败: {event_data}_)"
+
+                elif event_type == "done":
+                    pass
+
+        except Exception as e:
+            answer_placeholder.error(f"请求失败: {e}")
+            full_answer = f"(_请求失败: {e}_)"
+
+        status_placeholder.empty()
+        if full_answer:
+            answer_placeholder.markdown(full_answer)
+            st.session_state.qa_messages.append({
+                "role": "assistant",
+                "content": full_answer,
+                "meta": meta_info,
+            })
+            _refresh_sessions()
+
+    asyncio.run(_process())
+
+
+# ──────────────────────────────────────────────
 # 自定义样式
 # ──────────────────────────────────────────────
 st.markdown("""
@@ -267,77 +342,4 @@ else:
             st.info("👈 在左侧选择一个会话窗口，或创建新窗口开始对话")
 
 
-# ──────────────────────────────────────────────
-# 对话输入处理函数
-# ──────────────────────────────────────────────
-
-def _handle_chat_input(prompt: str, session_id: str):
-    """处理用户输入并流式展示回答"""
-    st.session_state.qa_messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    async def _process():
-        full_answer = ""
-        meta_info = ""
-
-        answer_container = st.chat_message("assistant")
-        with answer_container:
-            status_placeholder = st.empty()
-            meta_placeholder = st.empty()
-            answer_placeholder = st.empty()
-
-        try:
-            async for event in qa_ask_stream(question=prompt, session_id=session_id):
-                event_type = event.get("type")
-                event_data = event.get("data")
-
-                if event_type == "meta":
-                    sid = event_data.get("session_id", "")
-                    complexity = event_data.get("complexity", "")
-                    stock = event_data.get("company_name", "")
-                    if sid and sid != session_id:
-                        st.session_state["qa_active_session"] = sid
-                    parts = [f"复杂度: {complexity}"]
-                    if stock:
-                        parts.append(f"股票: {stock}")
-                    meta_info = " | ".join(parts)
-                    meta_placeholder.caption(meta_info)
-
-                elif event_type == "status":
-                    status_placeholder.caption(f"⏳ {event_data.get('message', '处理中...')}")
-
-                elif event_type == "answer":
-                    status_placeholder.empty()
-                    full_answer += str(event_data)
-                    answer_placeholder.markdown(full_answer + "▌")
-
-                elif event_type == "clarify":
-                    status_placeholder.empty()
-                    answer_placeholder.warning(event_data.get("message", "需要更多信息"))
-                    full_answer = f"(_需澄清: {event_data.get('message', '')}_)"
-
-                elif event_type == "error":
-                    status_placeholder.empty()
-                    answer_placeholder.error(event_data)
-                    full_answer = f"(_请求失败: {event_data}_)"
-
-                elif event_type == "done":
-                    pass
-
-        except Exception as e:
-            answer_placeholder.error(f"请求失败: {e}")
-            full_answer = f"(_请求失败: {e}_)"
-
-        status_placeholder.empty()
-        if full_answer:
-            answer_placeholder.markdown(full_answer)
-            st.session_state.qa_messages.append({
-                "role": "assistant",
-                "content": full_answer,
-                "meta": meta_info,
-            })
-            _refresh_sessions()
-
-    asyncio.run(_process())
     st.rerun()

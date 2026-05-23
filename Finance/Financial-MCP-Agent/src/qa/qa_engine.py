@@ -14,7 +14,7 @@ from src.qa.session_manager import get_session_manager, QASession
 from src.qa.complexity_analyzer import (
     analyze_complexity, try_runtime_upgrade, ComplexityResult,
 )
-from src.qa.task_planner import plan_task, extract_stock_from_question
+from src.qa.task_planner import plan_task, extract_stock_from_question, match_topic
 from src.qa.evidence_assembler import (
     assemble_evidence_fast,
     assemble_evidence_react,
@@ -81,6 +81,25 @@ async def process_question(
         session_stock_code=session.last_stock_code or "",
         session_company_name=session.last_company_name or "",
     )
+
+    # 无股票代码时尝试主题匹配
+    topic_context = ""
+    if not stock_code and not company_name:
+        topic_info = match_topic(question)
+        if topic_info:
+            topic_name, topic_data = topic_info
+            etf = topic_data["etfs"][0]
+            stock_code = etf[0]
+            company_name = f"{topic_name}主题({etf[1]})"
+            # 构建主题上下文供LLM参考
+            related = [f"{c}({n})" for c, n in topic_data["stocks"][:3]]
+            topic_context = (
+                f"[主题匹配] 用户询问{topic_name}相关话题。使用代表性ETF {stock_code} "
+                f"作为主要数据源。相关A股标的: {', '.join(related)}。"
+                f"请基于A股{topic_name}相关标的数据进行分析，注意区分A股黄金相关标的"
+                f"与国际金价的差异。"
+            )
+            logger.info(f"QA Engine: 主题匹配 → {topic_name}, 使用ETF {stock_code}")
 
     if stock_code:
         session_mgr.update_context(
@@ -165,6 +184,10 @@ async def process_question(
             f"可用信息：股票={company_name or '未指定'}，代码={stock_code or '未指定'}，"
             f"日期={current_date}"
         )
+
+    # 注入主题上下文
+    if topic_context:
+        evidence.raw_text = topic_context + "\n\n" + evidence.raw_text
 
     yield _sse_event("status", {
         "message": (

@@ -105,6 +105,12 @@ def _auto_name(question: str) -> str:
     return q[:20] + ("..." if len(q) > 20 else "")
 
 
+def _complexity_label(level: str) -> str:
+    labels = {"L0": "L0 快速应答", "L1": "L1 快问快答",
+              "L2": "L2 标准分析", "L3": "L3 深度分析", "L4": "L4 专业研报"}
+    return labels.get(level, f"{level} 分析")
+
+
 # ──────────────────────────────────────────────
 # 渲染函数（必须在主流程之前定义）
 # ──────────────────────────────────────────────
@@ -112,6 +118,9 @@ def _auto_name(question: str) -> str:
 def _render_messages():
     for msg in st.session_state.get("qa_messages", []):
         with st.chat_message(msg["role"]):
+            # AI消息显示复杂度标签
+            if msg["role"] == "assistant" and msg.get("meta"):
+                st.caption(msg["meta"])
             st.markdown(msg["content"])
 
 
@@ -192,10 +201,12 @@ def _process_pending():
                         edata = json.loads(data_str)
                     except Exception:
                         edata = {}
-                    parts = [f"复杂度:{edata.get('complexity', '')}"]
-                    if edata.get("company_name"):
-                        parts.append(f"股票:{edata['company_name']}")
-                    meta_info = " | ".join(parts)
+                    level = edata.get("complexity", "")
+                    stock = edata.get("company_name", "")
+                    level_label = _complexity_label(level)
+                    meta_info = f"{level_label}"
+                    if stock:
+                        meta_info += f" · {stock}"
 
                 elif current_event == "status":
                     status_el.caption(f"⏳ {data_str}")

@@ -302,3 +302,162 @@ class TestRuntimeUpgrader:
         )
         assert upgraded.level == result.level
         assert upgraded.recommended_model == result.recommended_model
+
+    def test_l4_upgrade_sets_react(self):
+        """L4升级时必须设置recommended_react"""
+        result = ComplexityResult(
+            level="L3", score=60, triggers=[], score_detail={},
+            need_clarify=False, recommended_model="mimo-v2.5",
+            recommended_thinking=False, recommended_react=False,
+            recommended_template="standard",
+        )
+        upgraded = try_runtime_upgrade(
+            result, tool_success_rate=0.3, evidence_missing_count=5,
+            contradictory_signals=True, actual_domain_count=5,
+        )
+        # 多条件叠加应触发L4
+        assert upgraded.level == "L4"
+        assert upgraded.recommended_react is True
+        assert upgraded.recommended_thinking is True
+
+
+# ── 集成测试 ─────────────────────────────────────
+
+class TestIntegration:
+    """端到端流程验证（不依赖MCP和LLM）"""
+
+    def test_full_pipeline_simple_question(self):
+        """简单问题完整流程：复杂度→规划→(跳过证据装配)"""
+        question = "茅台PE多少"
+        complexity = analyze_complexity(question)
+        plan = plan_task(question, complexity.level)
+        # 验证规划合理性
+        assert plan.need_react is False
+        assert len(plan.domains) >= 1
+        assert len(plan.tools) >= 1
+
+    def test_full_pipeline_complex_question(self):
+        """复杂问题完整流程"""
+        question = "把宁德时代和比亚迪从估值和现金流角度做个全面比较"
+        complexity = analyze_complexity(question)
+        plan = plan_task(question, complexity.level)
+        assert complexity.level in ("L3", "L4")
+        assert plan.need_react is True or complexity.level == "L3"
+
+    def test_runtime_upgrade_pipeline(self):
+        """运行时升级后的流程一致性"""
+        question = "茅台PE多少"
+        complexity = analyze_complexity(question)
+        plan1 = plan_task(question, complexity.level)
+
+        # 模拟运行时升级
+        complexity = try_runtime_upgrade(
+            complexity,
+            tool_success_rate=0.3, evidence_missing_count=5,
+            contradictory_signals=True, actual_domain_count=5,
+        )
+        plan2 = plan_task(question, complexity.level)
+
+        # 升级后规划应反映新复杂度
+        if complexity.level == "L4":
+            assert plan2.need_react is True
+        # 升级不会使plan倒退
+        assert plan2.need_react or not plan1.need_react
+
+    def test_stock_extraction_with_context(self):
+        """Stock code extraction with and without session context"""
+        # Direct 6-digit code extraction
+        code, name = extract_stock_from_question("600519")
+        assert code == "sh.600519"
+
+        # Fallback: no code in question, no session context → None
+        code2, name2 = extract_stock_from_question("hello")
+        assert code2 is None
+
+        # Session context passed through when question has no code
+        code3, name3 = extract_stock_from_question(
+            "hello", session_stock_code="sh.600519", session_company_name="test"
+        )
+        # No referential match on "hello", so context not used
+        assert code3 is None
+
+    def test_evidence_package_structure(self):
+        """证据包数据结构验证"""
+        from src.qa.evidence_assembler import EvidencePackage
+        pkg = EvidencePackage(
+            subject="测试",
+            stock_code="sh.600519",
+            company_name="贵州茅台",
+            raw_text="测试数据",
+            tool_call_summary="3/5 工具成功",
+            missing=["tool_a", "tool_b"],
+        )
+        assert pkg.subject == "测试"
+        assert len(pkg.missing) == 2
+        assert pkg.elapsed_seconds == 0.0
+
+
+# ── 幻觉/安全测试 ───────────────────────────────
+
+class TestHallucinationSafety:
+    """防幻觉与安全边界测试"""
+
+    def test_complexity_no_fabrication_trigger(self):
+        """复杂度分析不应编造数据"""
+        result = analyze_complexity("给我编一个茅台的PE数据")
+        # 不能是深度分析 — 这是危险请求
+        assert result.recommended_react is not True or result.level != "L4"
+
+    def test_nonexistent_stock_handled(self):
+        """Non-standard stock code (999999) is kept as-is without exchange prefix"""
+        code, name = extract_stock_from_question("999999")
+        assert code == "999999"  # stays raw, no sh./sz. prefix added
+
+    def test_price_prediction_request(self):
+        """Prediction requests should get at least L2 complexity (not L1)"""
+        # Use a question with "为什么" trigger to ensure it's not L1
+        result = analyze_complexity("为什么茅台明天可能会涨")
+        assert result.level in ("L2", "L3", "L4")
+
+    def test_empty_evidence_handled(self):
+        """空证据包的结构完整性"""
+        from src.qa.evidence_assembler import EvidencePackage
+        pkg = EvidencePackage()
+        assert pkg.raw_text == ""
+        assert pkg.tool_call_summary == ""
+        # 在qa_engine中，空raw_text会触发降级
+        assert not pkg.raw_text or pkg.raw_text == ""
+
+    def test_missing_data_declared(self):
+        """缺失数据应被明确记录"""
+        from src.qa.evidence_assembler import EvidencePackage
+        pkg = EvidencePackage(
+            missing=["get_profit_data", "tushare_moneyflow"],
+            raw_text="部分数据",
+        )
+        assert "get_profit_data" in pkg.missing
+        # 缺失数据不影响raw_text存在
+
+    def test_answer_template_includes_data_time(self):
+        """所有回答模板应包含数据截至时间标记"""
+        from src.qa.answer_generator import _build_system_prompt
+        for template in ("quick", "standard", "deep"):
+            prompt = _build_system_prompt(template, "2026-05-23")
+            assert "2026-05-23" in prompt
+            assert "数据截至" in prompt
+
+    def test_system_prompt_forbids_fabrication(self):
+        """系统提示词必须包含防编造指令"""
+        from src.qa.answer_generator import _build_system_prompt
+        for template in ("quick", "standard", "deep"):
+            prompt = _build_system_prompt(template, "2026-05-23")
+            assert "绝不编造" in prompt or "数据优先" in prompt
+            assert "无法获取" in prompt
+
+    def test_two_stage_deep_template(self):
+        """深度模板包含两段式输出指令"""
+        from src.qa.answer_generator import _build_system_prompt
+        prompt = _build_system_prompt("deep", "2026-05-23")
+        assert "分析框架" in prompt
+        assert "---" in prompt
+

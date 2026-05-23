@@ -135,11 +135,14 @@ async def process_question(
         logger.info(
             f"QA Engine: 运行时升级 → {complexity.level}, "
             f"model={complexity.recommended_model}, "
-            f"thinking={complexity.recommended_thinking}"
+            f"thinking={complexity.recommended_thinking}, "
+            f"react={complexity.recommended_react}"
         )
-        yield _sse_event("status", {
-            "message": f"检测到复杂问题，已升级分析策略（{complexity.level}/{complexity.recommended_model}）..."
-        })
+        upgrade_msg = (
+            f"检测到复杂问题，已自动升级分析策略（{complexity.level}级/"
+            f"{'深度推理' if complexity.recommended_thinking else '标准'}模式）"
+        )
+        yield _sse_event("status", {"message": upgrade_msg})
 
     # ── 降级：数据完全缺失 ──
     if not evidence.raw_text or evidence.raw_text == "(无数据)":

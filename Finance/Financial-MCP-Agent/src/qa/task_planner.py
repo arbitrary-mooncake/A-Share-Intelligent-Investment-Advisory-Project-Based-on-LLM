@@ -168,12 +168,13 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
         code = session_stock_code
         name = session_company_name
 
-    # 标准化代码格式
+    # 标准化代码格式（仅限合法A股前缀: 6=沪市, 0/3=深市, 688=科创板, 8=北交所）
     if code:
         if not code.startswith(("sh.", "sz.")):
-            if code.startswith("6"):
+            if code.startswith(("6", "688", "5", "8")):
                 code = f"sh.{code}"
-            else:
+            elif code.startswith(("0", "3", "1", "4")):
                 code = f"sz.{code}"
+            # 其他前缀（如999）不添加交易所前缀，保持原样
 
     return code, name

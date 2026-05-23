@@ -101,7 +101,7 @@ def _score_question(question: str) -> ComplexityResult:
     # 2. 时间跨度 (0-10)
     time_keywords_long = ["年", "长期", "三年", "五年", "历史", "历年", "跨周期"]
     time_keywords_mid = ["季度", "月", "中期", "半年", "今年以来"]
-    time_keywords_short = ["周", "最近", "近期", "今天", "昨天", "本周", "本月"]
+    time_keywords_short = ["周", "最近", "近期", "今天", "昨天", "明天", "本周", "本月"]
     if any(kw in question for kw in time_keywords_long):
         detail["时间跨度"] = 10
     elif any(kw in question for kw in time_keywords_mid):
@@ -320,12 +320,13 @@ def try_runtime_upgrade(
         result.triggers.append("运行时升级: 证据矛盾 → Pro + thinking")
 
     # 触发3: 实际数据域超出预期 → 升级
-    if actual_domain_count >= 4 and current_idx < 2:
-        new_level = "L3" if actual_domain_count < 5 else "L4"
-        result.level = new_level
+    warranted = "L4" if actual_domain_count >= 5 else ("L3" if actual_domain_count >= 4 else None)
+    if warranted and level_idx.get(warranted, 0) > current_idx:
+        result.level = warranted
         result.recommended_model = "mimo-v2.5-pro"
-        result.recommended_thinking = (new_level == "L4")
-        result.triggers.append(f"运行时升级: 实际{actual_domain_count}个数据域 → {new_level}")
+        result.recommended_thinking = (warranted == "L4")
+        result.recommended_react = (warranted == "L4")
+        result.triggers.append(f"运行时升级: 实际{actual_domain_count}个数据域 → {warranted}")
 
     # 触发4: L2+但关键数据缺失 → 开启 thinking 弥补
     if evidence_missing_count >= 3 and current_idx >= 1:
@@ -337,7 +338,12 @@ def try_runtime_upgrade(
         result.recommended_thinking = True
         result.triggers.append("运行时修正: L4必须开启thinking")
 
-    # 触发6: Pro被推荐但model未升级 → 修正
+    # 触发6: L4但ReAct未开 → 修正
+    if result.level == "L4" and not result.recommended_react:
+        result.recommended_react = True
+        result.triggers.append("运行时修正: L4必须启用ReAct")
+
+    # 触发7: Pro被推荐但model未升级 → 修正
     if result.recommended_model == "mimo-v2.5-pro" and current_idx >= 2:
         if not result.recommended_thinking and result.level == "L4":
             result.recommended_thinking = True

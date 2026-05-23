@@ -212,10 +212,20 @@ async def process_question(
             history_text=history_text,
             current_date=current_date,
         ):
+            # 拦截 [DONE]：先保存再发送，确保前端拉取时数据已落地
+            if chunk.strip() == "data: [DONE]":
+                if full_answer.strip():
+                    session.add_message("user", question)
+                    session.add_message("assistant", full_answer.strip())
+                    session_mgr.save_session(actual_session_id)
+                yield chunk
+                llm_success = True
+                break
             yield chunk
-            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]") and not chunk.startswith("data: [ERROR]"):
+            if chunk.startswith("data: ") and not chunk.startswith("data: [ERROR]"):
                 full_answer += chunk[6:].rstrip("\n")
-        llm_success = True
+        else:
+            llm_success = True
     except Exception as llm_err:
         logger.error(f"{ERROR_ICON} QA Engine: LLM流式生成异常: {llm_err}")
 
@@ -225,12 +235,10 @@ async def process_question(
         yield f"data: {fallback}\n\n"
         yield "data: [DONE]\n\n"
         full_answer = fallback
-
-    # Step 6: 保存到会话历史并持久化
-    if full_answer.strip():
-        session.add_message("user", question)
-        session.add_message("assistant", full_answer.strip())
-        session_mgr.save_session(actual_session_id)
+        if full_answer.strip():
+            session.add_message("user", question)
+            session.add_message("assistant", full_answer.strip())
+            session_mgr.save_session(actual_session_id)
 
     total_time = time.time() - start_time
     logger.info(

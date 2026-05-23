@@ -106,12 +106,21 @@ async def process_question(
         f"工具数={len(task_plan.tools)}, ReAct={task_plan.need_react}"
     )
 
-    # Step 4: 证据装配（含降级保护）
-    yield _sse_event("status", {
-        "message": f"正在获取数据（涉及{len(task_plan.domains)}个数据域）..."
-    })
+    # Step 4: 证据装配（L0跳过）
+    if complexity.level == "L0":
+        evidence = EvidencePackage(
+            subject=company_name or question,
+            stock_code=stock_code or "",
+            company_name=company_name or "",
+            raw_text="（无需数据查询）",
+            tool_call_summary="L0: 跳过数据获取",
+        )
+    else:
+        yield _sse_event("status", {
+            "message": f"正在获取数据（涉及{len(task_plan.domains)}个数据域）..."
+        })
 
-    evidence = await _assemble_with_fallback(
+        evidence = await _assemble_with_fallback(
         task_plan, complexity, stock_code or "", company_name or "",
         question, current_date, current_time_info, actual_session_id,
     )

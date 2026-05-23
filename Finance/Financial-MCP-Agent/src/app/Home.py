@@ -4,13 +4,13 @@ Streamlit 入口页 — 四大功能导航中心
 import streamlit as st
 
 st.set_page_config(
-    page_title="股票投资顾问 Agent",
+    page_title="AI 投资研究助手",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("📈 股票投资顾问 Agent")
-st.caption("A股智能分析平台 — 选择您需要的功能")
+st.title("📈 AI 投资研究助手")
+st.caption("A股智能分析平台 — AI驱动，数据支撑，仅供参考")
 
 st.markdown("---")
 

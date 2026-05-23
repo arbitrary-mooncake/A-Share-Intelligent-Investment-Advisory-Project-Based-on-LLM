@@ -75,6 +75,14 @@ def plan_task(question: str, complexity_level: str, history_text: str = "") -> T
     L3: 先并行拉取，不足时运行时升级为ReAct
     L4: 直接使用ReAct
     """
+    # L0: 无需数据，直接回答
+    if complexity_level == "L0":
+        return TaskPlan(
+            domains=[], tools=[], need_react=False,
+            reason="L0: 无需数据，直接回答",
+            expected_data_volume="small",
+        )
+
     # 结合历史对话提取额外关键词
     augmented_question = question
     if history_text:

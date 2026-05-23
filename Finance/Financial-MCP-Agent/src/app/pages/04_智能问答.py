@@ -17,7 +17,7 @@ from api_client import (
 )
 
 st.set_page_config(
-    page_title="智能问答",
+    page_title="AI 智能问答",
     page_icon="💬",
     layout="wide",
 )
@@ -193,7 +193,7 @@ if collapsed:
                 st.session_state.qa_sidebar_collapsed = False
                 st.rerun()
 
-        st.title("💬 智能问答")
+        st.title("💬 AI 投资研究助手")
         if active_id:
             current_name = "对话"
             for s in sessions:
@@ -338,7 +338,7 @@ else:
                 _handle_chat_input(prompt, active_id)
 
         else:
-            st.markdown("### 💬 智能问答")
+            st.markdown("### 💬 AI 投资研究助手")
             st.info("👈 在左侧选择一个会话窗口，或创建新窗口开始对话")
 
 

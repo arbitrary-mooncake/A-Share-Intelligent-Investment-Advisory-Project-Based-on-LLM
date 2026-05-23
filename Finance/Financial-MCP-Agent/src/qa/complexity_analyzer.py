@@ -75,6 +75,49 @@ def _check_hard_triggers(question: str) -> tuple:
     return (None, [])
 
 
+# ── L0 检测：无需数据的常识性问题 ─────────────────
+
+NON_FINANCIAL_PATTERNS = [
+    r"^你是谁", r"^你好", r"^嗨", r"^hello", r"^hi\b",
+    r"^\d+[\+\-\*\/]\d+", r"^\d+\s*[＋－×÷]\s*\d+",  # 数学计算
+    r"地球.*形状|太阳.*(大|温度|距离)|月亮.*(大|距离)",
+    r"什么.*动物|什么.*植物|什么.*颜色",
+    r"天气.*怎么|今天.*天气",
+    r"翻译|翻译.*英文|英文.*怎么说",
+    r"讲.*笑话|说.*笑话|笑话",
+    r"几点了|现在.*时间|今天.*几号|今天.*星期",
+]
+
+NO_DATA_NEEDED_PATTERNS = [
+    r"^你是谁", r"你能.*什么", r"你.*功能", r"你.*能力",
+    r"怎么.*用|如何.*使用", r"帮助|help",
+    r"谢谢|感谢|多谢|再见|拜拜|bye",
+    r"什么是(?:股票|PE|PB|ROE|估值|K线|均线)",  # 概念解释可用自有知识
+]
+
+
+def _is_l0_question(question: str) -> bool:
+    """检测是否为L0问题（无需调用数据工具）"""
+    q = question.strip().lower()
+    # 非财经类常识问题
+    for pat in NON_FINANCIAL_PATTERNS:
+        if re.search(pat, q):
+            return True
+    # 无数据需求的问题
+    for pat in NO_DATA_NEEDED_PATTERNS:
+        if re.search(pat, q):
+            return True
+    # 极短问题（≤5字且无股票代码/行业关键词）
+    if len(q) <= 5:
+        has_finance_kw = any(
+            kw in q for kw in ["股", "涨", "跌", "PE", "PB", "估值", "财报",
+                               "利润", "营收", "行业", "板块", "基金", "ETF"]
+        )
+        if not has_finance_kw:
+            return True
+    return False
+
+
 # ── Layer 2: 加权打分模型 ──────────────────────────
 
 def _score_question(question: str) -> ComplexityResult:
@@ -201,6 +244,19 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
     Returns:
         ComplexityResult
     """
+    # L0 检测：无需数据的常识/闲聊问题
+    if _is_l0_question(question):
+        return ComplexityResult(
+            level="L0", score=0,
+            triggers=["L0: 无需数据"],
+            score_detail={"L0检测": "常识/闲聊问题"},
+            need_clarify=False,
+            recommended_model="mimo-v2.5",
+            recommended_thinking=False,
+            recommended_react=False,
+            recommended_template="quick",
+        )
+
     # Layer 1: 硬触发规则
     hard_level, triggers = _check_hard_triggers(question)
 

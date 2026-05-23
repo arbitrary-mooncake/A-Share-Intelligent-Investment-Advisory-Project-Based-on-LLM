@@ -248,19 +248,17 @@ else:
                 if st.session_state.qa_pending_rename == sid:
                     new_name = st.text_input("", value=name, key=f"rn_{sid}",
                                              label_visibility="collapsed")
-                    rc1, rc2 = st.columns(2)
-                    with rc1:
-                        if st.button("✓", key=f"ok_{sid}"):
-                            nn = new_name.strip()
-                            if nn:
-                                _sync_call(qa_rename_session(sid, nn))
-                            st.session_state.qa_pending_rename = None
-                            _refresh_sessions()
-                            st.rerun()
-                    with rc2:
-                        if st.button("✗", key=f"cx_{sid}"):
-                            st.session_state.qa_pending_rename = None
-                            st.rerun()
+                    # 不用嵌套列，并排按钮
+                    if st.button("✓ 确认", key=f"ok_{sid}"):
+                        nn = new_name.strip()
+                        if nn:
+                            _sync_call(qa_rename_session(sid, nn))
+                        st.session_state.qa_pending_rename = None
+                        _refresh_sessions()
+                        st.rerun()
+                    if st.button("✗ 取消", key=f"cx_{sid}"):
+                        st.session_state.qa_pending_rename = None
+                        st.rerun()
                 else:
                     label = f"{'🔵 ' if is_active else '  '}{name[:20]}"
                     if st.button(label, key=f"sess_{sid}", use_container_width=True,
@@ -280,7 +278,7 @@ else:
                     st.session_state[f"qa_confirm_del_{sid}"] = False
 
                 if st.session_state[f"qa_confirm_del_{sid}"]:
-                    if st.button("✅", key=f"cfm_{sid}", help="确认删除"):
+                    if st.button("✅确认", key=f"cfm_{sid}", help="确认删除"):
                         _sync_call(qa_delete_session(sid))
                         st.session_state[f"qa_confirm_del_{sid}"] = False
                         if active_id == sid:
@@ -295,7 +293,7 @@ else:
                         else:
                             _refresh_sessions()
                         st.rerun()
-                    if st.button("❌", key=f"ccl_{sid}", help="取消"):
+                    if st.button("❌取消", key=f"ccl_{sid}", help="取消删除"):
                         st.session_state[f"qa_confirm_del_{sid}"] = False
                         st.rerun()
                 else:

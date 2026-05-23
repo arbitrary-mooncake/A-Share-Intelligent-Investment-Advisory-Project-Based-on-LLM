@@ -408,7 +408,7 @@ else:
                             remaining = [s for s in st.session_state["qa_sessions"] if s["session_id"] != sid]
                             nxt = remaining[0]["session_id"] if remaining else None
                             st.session_state["qa_active_session"] = nxt
-                        st.session_state["_qa_loaded_for"] = nxt
+                            st.session_state["_qa_loaded_for"] = nxt
                             if nxt:
                                 _load_history(nxt)
                             else:

@@ -1,0 +1,238 @@
+"""
+高灵敏复杂度分析器 — 三层识别架构
+
+Layer 1: 规则触发器（硬判断，速度快）
+Layer 2: 加权打分模型（未命中硬触发时使用）
+Layer 3: 运行时升级器（Phase 2 实现，此处保留接口）
+"""
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+
+@dataclass
+class ComplexityResult:
+    """复杂度分析结果"""
+    level: str            # "L1" | "L2" | "L3" | "L4"
+    score: int            # 0-100
+    triggers: List[str]   # 触发的规则列表
+    score_detail: dict    # 各维度得分明细
+    need_clarify: bool    # 是否需要澄清
+    recommended_model: str  # "mimo-v2.5" | "mimo-v2.5-pro"
+    recommended_thinking: bool
+    recommended_react: bool
+    recommended_template: str    # "quick" | "standard" | "deep"
+
+
+# ── Layer 1: 规则触发器 ──────────────────────────
+
+HARD_TRIGGERS_L4 = [
+    # 跨标的比较
+    r"比较", r"对比", r"\bvs\b", r"\bVS\b", r"\bversus\b", r"优劣", r"差异", r"区别",
+    r"和.*比", r"与.*比", r"跟.*比",
+    # 因果归因
+    r"为什么", r"原因", r"驱动", r"归因", r"本质", r"背后.*逻辑",
+    # 情景推演
+    r"如果", r"假设", r"情景", r"预期.*会", r"明年", r"下季度", r"下一季度",
+    r"展望", r"前景",
+    # 深度判断
+    r"还能不能", r"值不值得", r"是不是机会", r"是不是陷阱", r"还能拿",
+    r"要不要", r"该不该",
+    # 综合报告
+    r"全面分析", r"深度分析", r"展开讲讲", r"写.*报告",
+    r"详细.*分析", r"系统.*分析",
+    # 筛选排序
+    r"筛选", r"排序", r"打分", r"优选", r"推荐.*股",
+    # 策略判断
+    r"交易策略", r"操作策略", r"配置.*建议", r"仓位",
+]
+
+HARD_TRIGGERS_L3 = [
+    r"估值.*合理", r"贵不贵", r"便不便宜", r"高不高",
+    r"走势.*强", r"走势.*弱", r"趋势.*判断",
+    r"板块.*轮动", r"行业.*景气", r"行业.*前景",
+    r"资金.*流向", r"主力.*动向", r"北向.*资金",
+]
+
+
+def _check_hard_triggers(question: str) -> tuple:
+    """Layer 1: 规则触发器，返回 (level, triggers)"""
+    triggers = []
+
+    for pattern in HARD_TRIGGERS_L4:
+        if re.search(pattern, question):
+            triggers.append(f"L4硬触发: {pattern}")
+
+    for pattern in HARD_TRIGGERS_L3:
+        if re.search(pattern, question):
+            triggers.append(f"L3硬触发: {pattern}")
+
+    if triggers:
+        has_l4 = any("L4硬触发" in t for t in triggers)
+        return ("L4" if has_l4 else "L3", triggers)
+    return (None, [])
+
+
+# ── Layer 2: 加权打分模型 ──────────────────────────
+
+def _score_question(question: str) -> ComplexityResult:
+    """Layer 2: 对未命中硬触发的问题做加权打分"""
+    score = 0
+    detail = {}
+
+    # 1. 主体数量 (0-15)
+    codes = re.findall(r'\b\d{5,6}\b', question)
+    stock_count = len(codes)
+    names = re.findall(r'[一-鿿]{2,4}(?:股票|股份|集团|银行|证券|保险|科技|医药|汽车|能源)', question)
+    entity_count = max(stock_count, len(names) if names else 1)
+    if entity_count >= 3:
+        detail["主体数量"] = 15
+    elif entity_count == 2:
+        detail["主体数量"] = 10
+    elif entity_count == 1:
+        detail["主体数量"] = 3
+    else:
+        detail["主体数量"] = 0
+    score += detail["主体数量"]
+
+    # 2. 时间跨度 (0-10)
+    time_keywords_long = ["年", "长期", "三年", "五年", "历史", "历年", "跨周期"]
+    time_keywords_mid = ["季度", "月", "中期", "半年", "今年以来"]
+    time_keywords_short = ["周", "最近", "近期", "今天", "昨天", "本周", "本月"]
+    if any(kw in question for kw in time_keywords_long):
+        detail["时间跨度"] = 10
+    elif any(kw in question for kw in time_keywords_mid):
+        detail["时间跨度"] = 6
+    elif any(kw in question for kw in time_keywords_short):
+        detail["时间跨度"] = 3
+    else:
+        detail["时间跨度"] = 1
+    score += detail["时间跨度"]
+
+    # 3. 分析维度数量 (0-20)
+    dimension_keywords = {
+        "行情": ["价格", "涨", "跌", "走势", "行情", "趋势", "K线", "均线"],
+        "估值": ["PE", "PB", "市盈", "市净", "估值", "贵", "便宜", "分位"],
+        "财务": ["ROE", "利润", "收入", "毛利", "现金", "负债", "财报", "业绩", "盈利"],
+        "资金": ["资金", "主力", "北向", "融资", "融券", "流入", "流出", "成交"],
+        "行业": ["行业", "板块", "赛道", "同行", "竞品", "龙头"],
+        "事件": ["新闻", "公告", "分红", "回购", "减持", "增持", "业绩预告"],
+    }
+    dims_found = 0
+    for dim, kws in dimension_keywords.items():
+        if any(kw in question for kw in kws):
+            dims_found += 1
+    detail["分析维度"] = min(dims_found * 5, 20)
+    score += detail["分析维度"]
+
+    # 4. 推理深度 (0-20)
+    deep_patterns = [r"为什么", r"怎么.*变化", r"影响", r"判断", r"预测", r"推测"]
+    compare_patterns = [r"对比", r"比较", r"区别", r"vs", r"优劣"]
+    desc_patterns = [r"是多少", r"什么.*是", r"查询", r"看看", r"了解"]
+    if any(re.search(p, question) for p in deep_patterns):
+        detail["推理深度"] = 18
+    elif any(re.search(p, question) for p in compare_patterns):
+        detail["推理深度"] = 12
+    elif any(re.search(p, question) for p in desc_patterns):
+        detail["推理深度"] = 5
+    else:
+        detail["推理深度"] = 3
+    score += detail["推理深度"]
+
+    # 5. 计算复杂度 (0-15)
+    calc_keywords = ["分位", "同比", "环比", "TTM", "相对强弱", "超额", "回撤", "波动"]
+    calc_count = sum(1 for kw in calc_keywords if kw in question)
+    detail["计算复杂度"] = min(calc_count * 5, 15)
+    score += detail["计算复杂度"]
+
+    # 6. 歧义程度 (0-10)
+    ambiguity = 0
+    if re.search(r'(?:它|这个|那个|这只|刚才|上次).*(?:股票|公司|股)', question) and not codes:
+        ambiguity = 8
+    elif not codes and not names and len(question) < 10:
+        ambiguity = 5
+    detail["歧义程度"] = ambiguity
+    score += ambiguity
+
+    # 7. 输出要求 (0-10)
+    output_keywords = ["报告", "详细", "全面", "深度", "展开", "分析一下"]
+    if any(kw in question for kw in output_keywords):
+        detail["输出要求"] = 8
+    else:
+        detail["输出要求"] = 2
+    score += detail["输出要求"]
+
+    # 分级
+    if score <= 24:
+        level = "L1"
+    elif score <= 49:
+        level = "L2"
+    elif score <= 69:
+        level = "L3"
+    else:
+        level = "L4"
+
+    return ComplexityResult(
+        level=level,
+        score=score,
+        triggers=[f"评分={score}"],
+        score_detail=detail,
+        need_clarify=(detail.get("歧义程度", 0) >= 8),
+        recommended_model="mimo-v2.5-pro" if level in ("L3", "L4") else "mimo-v2.5",
+        recommended_thinking=(level == "L4"),
+        recommended_react=(level in ("L3", "L4")),
+        recommended_template="quick" if level == "L1" else ("standard" if level == "L2" else "deep"),
+    )
+
+
+# ── 公共接口 ──────────────────────────────────────
+
+def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResult:
+    """
+    分析问题的复杂度。
+
+    Args:
+        question: 用户问题
+        history_depth: 多轮对话深度（追问链中自动提升复杂度）
+
+    Returns:
+        ComplexityResult
+    """
+    # Layer 1: 硬触发规则
+    hard_level, triggers = _check_hard_triggers(question)
+
+    if hard_level:
+        score = 75 if hard_level == "L4" else 55
+        return ComplexityResult(
+            level=hard_level,
+            score=score,
+            triggers=triggers,
+            score_detail={"硬触发": hard_level},
+            need_clarify=False,
+            recommended_model="mimo-v2.5-pro" if hard_level in ("L3", "L4") else "mimo-v2.5",
+            recommended_thinking=(hard_level == "L4"),
+            recommended_react=(hard_level in ("L3", "L4")),
+            recommended_template="deep" if hard_level == "L4" else "standard",
+        )
+
+    # Layer 2: 加权打分
+    result = _score_question(question)
+
+    # 追问链自动提升
+    if history_depth >= 3:
+        bump = min(history_depth, 3)
+        current_idx = {"L1": 0, "L2": 1, "L3": 2, "L4": 3}
+        levels = ["L1", "L2", "L3", "L4"]
+        new_idx = min(current_idx.get(result.level, 0) + bump, 3)
+        if new_idx > current_idx.get(result.level, 0):
+            result.level = levels[new_idx]
+            result.triggers.append(f"追问链提升: depth={history_depth} -> {result.level}")
+
+    # 用户显式要求深度分析
+    if any(kw in question for kw in ["详细", "深度", "全面", "展开"]):
+        current_idx = {"L1": 0, "L2": 1, "L3": 2, "L4": 3}
+        if current_idx.get(result.level, 0) < 2:
+            result.level = "L3"
+            result.triggers.append("用户显式要求深度分析 -> L3")
+
+    return result

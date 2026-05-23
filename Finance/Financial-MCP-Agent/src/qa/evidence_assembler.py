@@ -277,7 +277,11 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         # 行业类
         "get_stock_industry": {"code": code},
         # 新闻/风险类
-        "crawl_news": {"query": company_name or clean_code or question, "top_k": 10},
+        # 主题类问题直接用问题原文搜新闻（含关键词），股票类用公司名
+        "crawl_news": {
+            "query": question if ("主题" in (company_name or "")) else (company_name or clean_code or question),
+            "top_k": 10,
+        },
         "get_st_risk_data": {"code": code},
         "tushare_st_status": {"ts_code": code},
     }

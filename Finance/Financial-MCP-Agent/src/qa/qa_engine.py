@@ -118,7 +118,8 @@ async def process_question(
 
     # Step 3: 任务规划
     history_text = _build_history_text(session)
-    task_plan = plan_task(question, complexity.level, history_text)
+    task_plan = plan_task(question, complexity.level, history_text,
+                          topic_matched=bool(topic_info))
 
     logger.info(
         f"QA Engine: 任务规划 — 数据域={task_plan.domains}, "

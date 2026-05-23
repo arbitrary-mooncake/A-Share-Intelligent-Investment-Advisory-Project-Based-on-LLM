@@ -152,7 +152,8 @@ class TaskPlan:
     expected_data_volume: str         # "small" | "medium" | "large"
 
 
-def plan_task(question: str, complexity_level: str, history_text: str = "") -> TaskPlan:
+def plan_task(question: str, complexity_level: str, history_text: str = "",
+              topic_matched: bool = False) -> TaskPlan:
     """
     根据问题内容和复杂度等级规划数据获取任务。
 
@@ -177,6 +178,11 @@ def plan_task(question: str, complexity_level: str, history_text: str = "") -> T
             augmented_question = question + " " + " ".join(recent_kw)
 
     domains = _identify_domains(augmented_question)
+
+    # 主题/宏观问题自动追加新闻域
+    if topic_matched and "新闻" not in domains:
+        domains.append("新闻")
+
     tools = _get_tools_for_domains(domains)
 
     # 确定是否需要 ReAct

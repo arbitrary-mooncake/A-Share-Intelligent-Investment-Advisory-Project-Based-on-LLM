@@ -376,7 +376,7 @@ def set_global_cached_evidence(tool_name: str, kwargs: dict, content: str):
 
 def _is_realtime_tool(tool_name: str) -> bool:
     """判断是否为实时行情类工具（缓存TTL更短）"""
-    realtime = ["kline", "daily", "moneyflow", "rt_", "mins", "tick", "crawl_news"]
+    realtime = ["kline", "k_data", "daily", "moneyflow", "rt_", "mins", "tick", "crawl_news"]
     return any(kw in tool_name.lower() for kw in realtime)
 
 

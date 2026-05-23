@@ -212,13 +212,13 @@ class TestTaskPlanner:
         plan = plan_task("茅台最近走势怎么样，估值贵不贵，资金在流入还是流出", "L2")
         assert len(plan.domains) >= 2
 
-    def test_l1_no_react(self):
-        plan = plan_task("茅台PE多少", "L1")
-        assert plan.need_react is False
+    def test_l1_l2_no_react(self):
+        assert plan_task("茅台PE多少", "L1").need_react is False
+        assert plan_task("茅台走势怎么样", "L2").need_react is False
 
-    def test_l4_needs_react(self):
-        plan = plan_task("深度分析茅台", "L4")
-        assert plan.need_react is True
+    def test_l3_l4_needs_react(self):
+        assert plan_task("分析茅台估值", "L3").need_react is True
+        assert plan_task("深度分析茅台", "L4").need_react is True
 
     def test_extract_stock_code(self):
         code, name = extract_stock_from_question("600519")

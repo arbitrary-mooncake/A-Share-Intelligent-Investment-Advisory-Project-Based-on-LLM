@@ -88,9 +88,8 @@ def plan_task(question: str, complexity_level: str, history_text: str = "") -> T
 
     # 确定是否需要 ReAct
     # L1/L2: 永不用ReAct
-    # L3: 标注为按需（先用快路径，不足时升级）
-    # L4: 直接用ReAct
-    need_react = (complexity_level == "L4")
+    # L3/L4: 使用ReAct进行深度迭代分析
+    need_react = (complexity_level in ("L3", "L4"))
 
     data_volume = "small"
     if len(domains) >= 4:

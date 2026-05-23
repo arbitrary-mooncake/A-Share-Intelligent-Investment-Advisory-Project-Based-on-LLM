@@ -206,6 +206,16 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
 
     if hard_level:
         score = 75 if hard_level == "L4" else 55
+        # 追问链提升（硬触发也适用）
+        current_idx = {"L1": 0, "L2": 1, "L3": 2, "L4": 3}
+        if history_depth >= 3:
+            bump = min(history_depth, 3)
+            new_idx = min(current_idx.get(hard_level, 2) + bump, 3)
+            levels = ["L1", "L2", "L3", "L4"]
+            if new_idx > current_idx.get(hard_level, 2):
+                hard_level = levels[new_idx]
+                triggers.append(f"追问链提升: depth={history_depth} -> {hard_level}")
+
         return ComplexityResult(
             level=hard_level,
             score=score,

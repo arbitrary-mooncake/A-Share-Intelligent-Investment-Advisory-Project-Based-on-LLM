@@ -87,6 +87,7 @@ async def process_question(
             actual_session_id,
             last_stock_code=stock_code,
             last_company_name=company_name,
+            last_complexity_level=complexity.level,
         )
 
     yield _sse_event("meta", {
@@ -224,7 +225,7 @@ async def _assemble_with_fallback(
 ) -> EvidencePackage:
     """证据装配 + 降级保护"""
     try:
-        if task_plan.need_react and complexity.level == "L4":
+        if task_plan.need_react:
             logger.info(f"{WAIT_ICON} QA Engine: 使用 ReAct 路径...")
             evidence = await assemble_evidence_react(
                 stock_code, company_name,

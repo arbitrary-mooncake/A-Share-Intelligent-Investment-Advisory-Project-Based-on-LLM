@@ -116,18 +116,16 @@ def _render_messages():
 
 
 def _render_chat_input(session_id, session_name):
+    """Phase 1: 仅提交用户消息，设置 pending 标记后立刻 rerun"""
     if not session_id:
         st.chat_input("请先在左侧选择或创建会话窗口", disabled=True)
         return
 
     prompt = st.chat_input("输入您的投资分析问题...", key="main_input")
-
-    if not prompt:
+    if not prompt or not prompt.strip():
         return
 
     prompt = prompt.strip()
-    if not prompt:
-        return
 
     # 自动命名
     msg_count = len(st.session_state.get("qa_messages", []))
@@ -136,59 +134,105 @@ def _render_chat_input(session_id, session_name):
         _sync_call(qa_rename_session(session_id, auto_name))
         _refresh_sessions()
 
+    # 立即写入用户消息 + 设置 pending 标记
     st.session_state["qa_messages"].append({"role": "user", "content": prompt})
+    st.session_state["_qa_process"] = {"prompt": prompt, "session_id": session_id}
+    st.rerun()
 
+
+def _process_pending():
+    """Phase 2: 有 pending 消息时，流式获取 AI 回复并实时更新"""
+    pending = st.session_state.pop("_qa_process", None)
+    if not pending:
+        return
+
+    prompt = pending["prompt"]
+    session_id = pending["session_id"]
     full_answer = ""
     meta_info = ""
 
-    answer_placeholder = st.chat_message("assistant")
-    with answer_placeholder:
+    # AI 对话框立刻出现，显示"思考中"
+    with st.chat_message("assistant"):
         status_el = st.empty()
         answer_el = st.empty()
+        status_el.caption("⏳ 思考中...")
+
+    # 同步 SSE 流式读取（避免 asyncio 阻塞问题）
+    import requests
+    from src.app.config import API_BASE_URL
 
     try:
-        async def _stream():
-            nonlocal full_answer, meta_info
-            async for event in qa_ask_stream(question=prompt, session_id=session_id):
-                etype = event.get("type")
-                edata = event.get("data")
+        resp = requests.post(
+            f"{API_BASE_URL}/api/qa/ask",
+            json={"question": prompt, "session_id": session_id},
+            stream=True,
+            timeout=180,
+        )
+        resp.raise_for_status()
 
-                if etype == "meta":
+        current_event = None
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("event: "):
+                current_event = line[7:].strip()
+            elif line.startswith("data: "):
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                if data_str.startswith("[ERROR]"):
+                    status_el.empty()
+                    answer_el.error(data_str[8:])
+                    full_answer = f"(_请求失败: {data_str[8:]}_)"
+                    break
+
+                if current_event == "meta":
+                    try:
+                        import json
+                        edata = json.loads(data_str)
+                    except Exception:
+                        edata = {}
                     parts = [f"复杂度:{edata.get('complexity', '')}"]
                     if edata.get("company_name"):
                         parts.append(f"股票:{edata['company_name']}")
                     meta_info = " | ".join(parts)
 
-                elif etype == "status":
-                    status_el.caption(f"⏳ {edata.get('message', '')}")
+                elif current_event == "status":
+                    status_el.caption(f"⏳ {data_str}")
 
-                elif etype == "answer":
+                elif current_event in (None, "answer_start", ""):
+                    # 普通文本块
                     status_el.empty()
-                    full_answer += str(edata)
+                    full_answer += data_str
                     answer_el.markdown(full_answer + "▌")
 
-                elif etype == "clarify":
+                elif current_event == "clarify":
                     status_el.empty()
-                    answer_el.warning(edata.get("message", ""))
-                    full_answer = f"(_需澄清: {edata.get('message', '')}_)"
+                    try:
+                        edata = json.loads(data_str)
+                        msg = edata.get("message", data_str)
+                    except Exception:
+                        msg = data_str
+                    answer_el.warning(msg)
+                    full_answer = f"(_需澄清: {msg}_)"
 
-                elif etype == "error":
-                    status_el.empty()
-                    answer_el.error(str(edata))
-                    full_answer = f"(_请求失败: {edata}_)"
-
-                elif etype == "done":
-                    pass
-
-        _sync_call(_stream())
-
+    except requests.exceptions.Timeout:
+        status_el.empty()
+        answer_el.error("请求超时，请重试")
+        full_answer = f"(_请求超时_)"
+    except requests.exceptions.ConnectionError:
+        status_el.empty()
+        answer_el.error("无法连接后端服务，请确认服务已启动")
+        full_answer = f"(_连接失败_)"
     except Exception as e:
+        status_el.empty()
         answer_el.error(f"请求失败: {e}")
         full_answer = f"(_请求失败: {e}_)"
 
     status_el.empty()
-    if full_answer:
-        answer_el.markdown(full_answer)
+    answer_el.markdown(full_answer)
+
+    if full_answer and not full_answer.startswith("(_"):
         st.session_state["qa_messages"].append({
             "role": "assistant", "content": full_answer, "meta": meta_info,
         })
@@ -238,6 +282,7 @@ if collapsed:
     st.caption(f"AI 投资研究助手 · ID: `{active_id or '未选择'}`")
 
     _render_messages()
+    _process_pending()
     _render_chat_input(active_id, current_name)
 
 else:

@@ -201,8 +201,8 @@ def _process_pending():
                     status_el.caption(f"⏳ {data_str}")
 
                 elif current_event == "answer_start":
-                    # 元数据事件，不显示
-                    pass
+                    # 元数据事件，不显示，重置事件类型让后续文本正常流入
+                    current_event = None
 
                 elif current_event in (None, ""):
                     # 普通文本块

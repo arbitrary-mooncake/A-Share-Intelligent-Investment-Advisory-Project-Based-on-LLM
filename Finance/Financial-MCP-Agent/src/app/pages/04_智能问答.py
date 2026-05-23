@@ -1,7 +1,6 @@
 """
 AI 智能问答 — ChatGPT 风格：左侧会话列表 + 底部输入框 + 自动命名
 """
-import asyncio
 import os
 import sys
 from datetime import datetime
@@ -11,10 +10,6 @@ if _app_dir not in sys.path:
     sys.path.insert(0, _app_dir)
 
 import streamlit as st
-from api_client import (
-    qa_ask_stream, qa_list_sessions, qa_create_session,
-    qa_delete_session, qa_rename_session, qa_get_session, APIError,
-)
 
 st.set_page_config(page_title="AI 智能问答", page_icon="💬", layout="wide")
 
@@ -52,46 +47,57 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────
-# 辅助函数
+# 辅助函数（全部同步 HTTP，零 async 开销）
 # ──────────────────────────────────────────────
 
-def _sync_call(coro):
-    """Streamlit 安全的同步调用异步函数"""
+import requests as _requests
+_API = "http://127.0.0.1:8000"
+
+def _api_get(path):
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, coro)
-                return future.result(timeout=30)
-        return asyncio.run(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+        return _requests.get(f"{_API}{path}", timeout=5).json()
+    except Exception:
+        return None
+
+def _api_post(path, json_data):
+    try:
+        return _requests.post(f"{_API}{path}", json=json_data, timeout=5).json()
+    except Exception:
+        return None
+
+def _api_delete(path):
+    try:
+        return _requests.delete(f"{_API}{path}", timeout=5).json()
+    except Exception:
+        return None
+
+def _api_patch(path, json_data):
+    try:
+        return _requests.patch(f"{_API}{path}", json=json_data, timeout=5).json()
+    except Exception:
+        return None
 
 
 def _refresh_sessions():
-    try:
-        st.session_state["qa_sessions"] = _sync_call(qa_list_sessions())
-    except Exception:
-        if "qa_sessions" not in st.session_state:
-            st.session_state["qa_sessions"] = []
+    data = _api_get("/api/qa/sessions")
+    if data is not None:
+        st.session_state["qa_sessions"] = data
+    elif "qa_sessions" not in st.session_state:
+        st.session_state["qa_sessions"] = []
 
 
 def _load_history(session_id: str):
-    """加载会话历史到 qa_messages"""
     if not session_id:
         st.session_state["qa_messages"] = []
         return
-    try:
-        data = _sync_call(qa_get_session(session_id))
-        history = data.get("history", [])
+    data = _api_get(f"/api/qa/sessions/{session_id}")
+    if data:
         st.session_state["qa_messages"] = [
             {"role": m["role"], "content": m["content"]}
-            for m in history
+            for m in data.get("history", [])
         ]
-    except Exception:
-        if "qa_messages" not in st.session_state:
-            st.session_state["qa_messages"] = []
+    elif "qa_messages" not in st.session_state:
+        st.session_state["qa_messages"] = []
 
 
 def _auto_name(question: str) -> str:
@@ -140,7 +146,7 @@ def _render_chat_input(session_id, session_name):
     msg_count = len(st.session_state.get("qa_messages", []))
     if msg_count == 0 and session_name in ("新对话", "对话"):
         auto_name = _auto_name(prompt)
-        _sync_call(qa_rename_session(session_id, auto_name))
+        _api_patch(f"/api/qa/sessions/{session_id}", {"name": auto_name})
         _refresh_sessions()
 
     # 立即写入用户消息 + 设置 pending 标记
@@ -349,7 +355,7 @@ else:
                     if st.button("✓ 确认", key=f"ok_{sid}"):
                         nn = new_name.strip()
                         if nn:
-                            _sync_call(qa_rename_session(sid, nn))
+                            _api_patch(f"/api/qa/sessions/{sid}", {"name": nn})
                         st.session_state.qa_pending_rename = None
                         _refresh_sessions()
                         st.rerun()
@@ -376,7 +382,7 @@ else:
 
                 if st.session_state[f"qa_confirm_del_{sid}"]:
                     if st.button("✅确认", key=f"cfm_{sid}", help="确认删除"):
-                        _sync_call(qa_delete_session(sid))
+                        _api_delete(f"/api/qa/sessions/{sid}")
                         st.session_state[f"qa_confirm_del_{sid}"] = False
                         if active_id == sid:
                             _refresh_sessions()
@@ -404,7 +410,7 @@ else:
 
         # 新建
         if st.button("＋ 新建窗口", use_container_width=True):
-            result = _sync_call(qa_create_session("新对话"))
+            result = _api_post("/api/qa/sessions", {"name": "新对话"})
             sid = result.get("session_id", "")
             st.session_state["qa_active_session"] = sid
             st.session_state["qa_messages"] = []

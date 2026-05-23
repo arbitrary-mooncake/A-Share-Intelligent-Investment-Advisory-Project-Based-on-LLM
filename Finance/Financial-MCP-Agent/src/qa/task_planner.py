@@ -239,9 +239,7 @@ def _identify_domains(question: str) -> List[str]:
             if kw in question:
                 matched.append(domain_name)
                 break
-    # 至少包含行情域（大多数问题都需要）
-    if not matched:
-        matched = ["行情"]
+    # 无匹配时返回空列表，由上游决定如何处理（L0/主题匹配/无数据）
     return matched
 
 

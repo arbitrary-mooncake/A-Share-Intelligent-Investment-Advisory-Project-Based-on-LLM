@@ -37,6 +37,8 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
 
     # ── Model 5: MiMo-V2.5 (智能问答主模型) ──
     "qa_engine": "_5",
+    # 复杂问题升级模型 → Model 1 (MiMo-V2.5-Pro)
+    "qa_engine_pro": "",
 }
 
 

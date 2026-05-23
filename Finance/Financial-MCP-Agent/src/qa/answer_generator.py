@@ -114,11 +114,9 @@ async def generate_answer_stream(
     base_url = model_cfg["base_url"]
     model_name = model_cfg["model_name"]
 
-    # 复杂问题升级模型
+    # 复杂问题升级模型 → Model 1 (MiMo-V2.5-Pro)
     if complexity.recommended_model == "mimo-v2.5-pro":
-        from src.utils.model_config import get_model_config_for_agent
-        # 使用 Model 1 (mimo-v2.5-pro)
-        pro_cfg = get_model_config_for_agent("summary_agent")
+        pro_cfg = get_model_config_for_agent("qa_engine_pro")
         if all([pro_cfg["api_key"], pro_cfg["base_url"], pro_cfg["model_name"]]):
             api_key = pro_cfg["api_key"]
             base_url = pro_cfg["base_url"]

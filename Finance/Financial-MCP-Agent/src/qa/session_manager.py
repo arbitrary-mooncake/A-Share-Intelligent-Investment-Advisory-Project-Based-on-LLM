@@ -222,16 +222,17 @@ class SessionManager:
         return True
 
     def update_context(self, session_id: str, **kwargs):
-        """更新会话上下文并持久化"""
+        """更新会话上下文并持久化（线程安全）"""
         with self._lock:
             sess = self._sessions.get(session_id)
-        if sess:
-            for key, value in kwargs.items():
-                if hasattr(sess, key):
-                    setattr(sess, key, value)
-            # 只在股票代码变化时保存
-            if any(k in kwargs for k in ("last_stock_code", "last_company_name")):
-                self._save()
+            if sess:
+                for key, value in kwargs.items():
+                    if hasattr(sess, key):
+                        setattr(sess, key, value)
+                sess.updated_at = time.time()
+                # 只在关键字段变化时保存
+                if any(k in kwargs for k in ("last_stock_code", "last_company_name")):
+                    self._save()
 
     def save_session(self, session_id: str):
         """手动触发单个会话的持久化"""

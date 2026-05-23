@@ -111,7 +111,7 @@ async def assemble_evidence_fast(
     tasks = []
     labels = []
     for tool in all_mcp_tools:
-        kwargs = _build_tool_kwargs(tool.name, stock_code, company_name, question)
+        kwargs = _build_tool_kwargs(tool.name, stock_code, company_name, question, current_date)
         tasks.append(_call_tool_safe(tool, kwargs, TOOL_TIMEOUT, tool.name, session_id))
         labels.append(tool.name)
 
@@ -161,8 +161,20 @@ async def assemble_evidence_react(
     )
     start_time = time.time()
 
+    # ReAct路径只加载核心分析工具（避免全量工具导致prompt过大）
+    _REACT_TOOL_FILTER = [
+        "get_stock_basic_info", "get_stock_industry",
+        "get_historical_k_data", "tushare_kline",
+        "tushare_daily_basic", "tushare_pe_percentile",
+        "tushare_fina_indicator", "tushare_moneyflow",
+        "tushare_dividend", "tushare_ev_ebitda",
+        "get_profit_data", "get_balance_data", "get_cash_flow_data",
+        "get_growth_data", "get_dupont_data",
+        "crawl_news", "tushare_st_status", "get_st_risk_data",
+        "get_latest_trading_date", "get_market_analysis_timeframe",
+    ]
     try:
-        all_mcp_tools = await get_mcp_tools()
+        all_mcp_tools = await get_mcp_tools(tool_filter=_REACT_TOOL_FILTER)
     except Exception as e:
         evidence.missing.append(f"ReAct MCP工具不可用: {e}")
         return evidence
@@ -211,39 +223,55 @@ async def assemble_evidence_react(
 
 
 def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
-                        question: str) -> dict:
-    """根据工具名构建合适的参数"""
+                        question: str, current_date: str = "") -> dict:
+    """根据工具名构建合适的参数（含日期计算）"""
     clean_code = stock_code.replace("sh.", "").replace("sz.", "") if stock_code else ""
     code = stock_code or ""
 
+    # 计算常用日期
+    from datetime import datetime, timedelta
+    try:
+        base_date = datetime.strptime(current_date, "%Y-%m-%d") if current_date else datetime.now()
+    except ValueError:
+        base_date = datetime.now()
+    this_year = str(base_date.year)
+    this_quarter = str((base_date.month - 1) // 3 + 1)
+    start_date = (base_date - timedelta(days=180)).strftime("%Y-%m-%d")
+    end_date = base_date.strftime("%Y-%m-%d")
+
     tool_kwargs_map = {
+        # 行情类
         "get_stock_basic_info": {"code": code},
-        "tushare_stock_info": {"code": code},
-        "get_stock_industry": {"code": code},
-        "get_historical_k_data": {"code": code, "days": 120},
-        "tushare_kline": {"code": code, "days": 120},
-        "tushare_daily_basic": {"code": code},
-        "tushare_pe_percentile": {"code": code},
-        "get_profit_data": {"code": code},
-        "get_balance_data": {"code": code},
-        "get_cash_flow_data": {"code": code},
-        "get_growth_data": {"code": code},
-        "get_operation_data": {"code": code},
-        "get_dupont_data": {"code": code},
-        "tushare_fina_indicator": {"code": code},
-        "tushare_moneyflow": {"code": code},
-        "tushare_dividend": {"code": code},
-        "get_dividend_data": {"code": code},
-        "tushare_ev_ebitda": {"code": code},
-        "get_st_risk_data": {"code": code},
-        "tushare_st_status": {"code": code},
+        "get_historical_k_data": {"code": code, "start_date": start_date, "end_date": end_date},
+        "tushare_kline": {"code": code, "start_date": start_date, "end_date": end_date},
+        "tushare_daily_basic": {"code": code, "trade_date": end_date},
         "get_latest_trading_date": {},
         "get_market_analysis_timeframe": {},
+        # 估值类
+        "tushare_pe_percentile": {"ts_code": code},
+        "tushare_ev_ebitda": {"ts_code": code},
+        "tushare_dividend": {"ts_code": code},
+        "get_dividend_data": {"code": code, "year": this_year, "year_type": "report"},
+        # 财务类 — 需要 year + quarter
+        "get_profit_data": {"code": code, "year": this_year, "quarter": this_quarter},
+        "get_balance_data": {"code": code, "year": this_year, "quarter": this_quarter},
+        "get_cash_flow_data": {"code": code, "year": this_year, "quarter": this_quarter},
+        "get_growth_data": {"code": code, "year": this_year, "quarter": this_quarter},
+        "get_operation_data": {"code": code, "year": this_year, "quarter": this_quarter},
+        "get_dupont_data": {"code": code, "year": this_year, "quarter": this_quarter},
+        "tushare_fina_indicator": {"ts_code": code, "start_date": start_date, "end_date": end_date},
+        "tushare_stock_info": {"ts_code": code},
+        # 资金类
+        "tushare_moneyflow": {"ts_code": code, "start_date": start_date, "end_date": end_date},
+        # 行业类
+        "get_stock_industry": {"code": code},
+        # 新闻/风险类
+        "crawl_news": {"query": company_name or clean_code or question, "top_k": 10},
+        "get_st_risk_data": {"code": code},
+        "tushare_st_status": {"ts_code": code},
     }
 
     if tool_name in tool_kwargs_map:
         return tool_kwargs_map[tool_name]
-    elif tool_name == "crawl_news":
-        return {"query": company_name or clean_code or question, "top_k": 10}
-    else:
-        return {"query": question}
+    # 未知工具：尝试传 code（多数工具都接受）
+    return {"code": code} if code else {}

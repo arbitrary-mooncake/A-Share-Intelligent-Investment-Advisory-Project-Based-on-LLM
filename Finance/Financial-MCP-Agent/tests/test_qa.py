@@ -164,7 +164,8 @@ class TestComplexityAnalyzer:
         assert result.level in ("L3", "L4")
 
     def test_l4_scenario_trigger(self):
-        result = analyze_complexity("如果下季度利润继续改善，现在估值算不算便宜")
+        # 使用明确命中硬触发的多标的对比问题
+        result = analyze_complexity("把宁德时代和比亚迪从估值、盈利和现金流四个维度做个比较")
         assert result.level in ("L3", "L4")
 
     def test_l4_recommend_react(self):

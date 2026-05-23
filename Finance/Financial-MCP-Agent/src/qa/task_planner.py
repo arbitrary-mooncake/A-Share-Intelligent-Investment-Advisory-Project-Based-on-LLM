@@ -75,7 +75,15 @@ def plan_task(question: str, complexity_level: str, history_text: str = "") -> T
     L3: 先并行拉取，不足时运行时升级为ReAct
     L4: 直接使用ReAct
     """
-    domains = _identify_domains(question)
+    # 结合历史对话提取额外关键词
+    augmented_question = question
+    if history_text:
+        # 提取历史中最近提到的数据域关键词追加到问题中
+        recent_kw = _extract_domain_keywords_from_text(history_text)
+        if recent_kw:
+            augmented_question = question + " " + " ".join(recent_kw)
+
+    domains = _identify_domains(augmented_question)
     tools = _get_tools_for_domains(domains)
 
     # 确定是否需要 ReAct
@@ -99,6 +107,16 @@ def plan_task(question: str, complexity_level: str, history_text: str = "") -> T
         reason=reason,
         expected_data_volume=data_volume,
     )
+
+
+def _extract_domain_keywords_from_text(text: str) -> List[str]:
+    """从历史对话文本中提取数据域关键词"""
+    all_kw = []
+    for domain_info in DATA_DOMAINS.values():
+        for kw in domain_info["keywords"]:
+            if kw in text:
+                all_kw.append(kw)
+    return all_kw[-10:]  # 最多取10个
 
 
 def _identify_domains(question: str) -> List[str]:

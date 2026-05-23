@@ -121,6 +121,11 @@ async def generate_answer_stream(
             api_key = pro_cfg["api_key"]
             base_url = pro_cfg["base_url"]
             model_name = pro_cfg["model_name"]
+        else:
+            logger.warning(
+                f"QA Answer: L4问题需要Pro模型但Model 1未配置，"
+                f"降级使用{model_name}（回答可能不够深入）"
+            )
 
     if not all([api_key, base_url, model_name]):
         yield _sse_error("模型配置缺失，请检查 .env 文件")

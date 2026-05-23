@@ -13,7 +13,7 @@ if _app_dir not in sys.path:
 import streamlit as st
 from api_client import (
     qa_ask_stream, qa_list_sessions, qa_create_session,
-    qa_delete_session, qa_rename_session, APIError,
+    qa_delete_session, qa_rename_session, qa_get_session, APIError,
 )
 
 st.set_page_config(
@@ -44,14 +44,35 @@ if "qa_rename_session_id" not in st.session_state:
 def _refresh_sessions():
     try:
         st.session_state["qa_sessions"] = asyncio.run(qa_list_sessions())
+    except Exception as e:
+        if st.session_state.get("qa_sessions") is None:
+            st.session_state["qa_sessions"] = []
+
+
+def _load_session_history(session_id: str):
+    """从后端加载指定会话的完整历史"""
+    if not session_id:
+        return
+    try:
+        data = asyncio.run(qa_get_session(session_id))
+        history = data.get("history", [])
+        st.session_state.qa_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history
+        ]
     except Exception:
-        pass
+        st.session_state.qa_messages = []
 
 
 if not st.session_state.qa_sessions:
     _refresh_sessions()
 
 active_id = st.session_state.get("qa_active_session")
+
+# 页面首次加载时，自动恢复活跃会话的历史消息
+if active_id and not st.session_state.get("qa_messages"):
+    _load_session_history(active_id)
+
 collapsed = st.session_state.get("qa_sidebar_collapsed", False)
 sessions = st.session_state.get("qa_sessions", [])
 
@@ -171,7 +192,7 @@ else:
                     if st.button(label, key=f"sel_{sid}", use_container_width=True,
                                  help=f"{msg_count}条消息 · {time_str}"):
                         st.session_state["qa_active_session"] = sid
-                        st.session_state.qa_messages = []
+                        _load_session_history(sid)
                         st.rerun()
                 with row_c2:
                     if st.button("⋯", key=f"mu_{sid}", help="操作菜单"):

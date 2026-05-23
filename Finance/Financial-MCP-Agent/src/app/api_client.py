@@ -550,3 +550,62 @@ async def qa_delete_session(session_id: str) -> dict:
         raise APIError(f"删除会话失败: {e.response.text}", e.response.status_code)
     except httpx.RequestError as e:
         raise APIError(f"连接后端失败: {e}")
+
+
+async def qa_list_sessions() -> list:
+    """列出所有会话窗口"""
+    if MOCK_MODE:
+        return [
+            {"session_id": "mock-1", "name": "茅台分析", "message_count": 3,
+             "updated_at": 1700000000, "last_message": "根据当前数据..."},
+            {"session_id": "mock-2", "name": "半导体行业", "message_count": 5,
+             "updated_at": 1700000100, "last_message": "行业整体来看..."},
+        ]
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{API_BASE_URL}/api/qa/sessions")
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise APIError(f"获取会话列表失败: {e.response.text}", e.response.status_code)
+    except httpx.RequestError as e:
+        raise APIError(f"连接后端失败: {e}")
+
+
+async def qa_create_session(name: str = "新对话") -> dict:
+    """创建新会话窗口"""
+    if MOCK_MODE:
+        return {"session_id": f"mock-{hash(name) % 1000:03d}", "name": name}
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{API_BASE_URL}/api/qa/sessions",
+                json={"name": name}
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise APIError(f"创建会话失败: {e.response.text}", e.response.status_code)
+    except httpx.RequestError as e:
+        raise APIError(f"连接后端失败: {e}")
+
+
+async def qa_rename_session(session_id: str, name: str) -> dict:
+    """重命名会话窗口"""
+    if MOCK_MODE:
+        return {"status": "renamed", "session_id": session_id, "name": name}
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.patch(
+                f"{API_BASE_URL}/api/qa/sessions/{session_id}",
+                json={"name": name}
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise APIError(f"重命名失败: {e.response.text}", e.response.status_code)
+    except httpx.RequestError as e:
+        raise APIError(f"连接后端失败: {e}")

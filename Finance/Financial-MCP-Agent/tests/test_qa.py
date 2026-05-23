@@ -3,12 +3,31 @@ QA 模块单元测试 — 复杂度分析、任务规划、会话管理
 """
 import sys
 import os
+import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
+import src.qa.session_manager as sm
 from src.qa.session_manager import SessionManager, QASession, QAMessage
 from src.qa.complexity_analyzer import analyze_complexity, ComplexityResult
 from src.qa.task_planner import plan_task, extract_stock_from_question
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_storage(monkeypatch):
+    """将会话持久化路径重定向到临时目录，避免测试间污染"""
+    tmpdir = tempfile.mkdtemp(prefix="qa_test_")
+    monkeypatch.setattr(sm, "_QA_DATA_DIR", tmpdir)
+    monkeypatch.setattr(sm, "_SESSIONS_FILE", os.path.join(tmpdir, "sessions.json"))
+    # 重置全局单例
+    monkeypatch.setattr(sm, "_global_session_manager", None)
+    yield
+    # 清理临时目录
+    import shutil
+    try:
+        shutil.rmtree(tmpdir)
+    except Exception:
+        pass
 
 
 # ── SessionManager 测试 ─────────────────────────
@@ -70,6 +89,46 @@ class TestSessionManager:
             sess.add_message("assistant", f"回答{i}")
         llm_history = sess.get_history_for_llm(max_turns=3)
         assert len(llm_history) == 6  # 3 turns * 2
+
+    def test_create_session_with_name(self):
+        mgr = SessionManager()
+        sid = mgr.create_session(name="茅台分析")
+        sess = mgr.get_session(sid)
+        assert sess.name == "茅台分析"
+
+    def test_rename_session(self):
+        mgr = SessionManager()
+        sid = mgr.create_session(name="旧名称")
+        assert mgr.rename_session(sid, "新名称") is True
+        sess = mgr.get_session(sid)
+        assert sess.name == "新名称"
+
+    def test_rename_empty_name(self):
+        mgr = SessionManager()
+        sid = mgr.create_session()
+        assert mgr.rename_session(sid, "  ") is False
+
+    def test_list_sessions(self):
+        mgr = SessionManager()
+        mgr.create_session(name="A")
+        mgr.create_session(name="B")
+        items = mgr.list_sessions()
+        assert len(items) == 2
+        assert all("name" in it for it in items)
+        assert all("message_count" in it for it in items)
+
+    def test_session_persistence(self):
+        """验证会话数据可以序列化和反序列化"""
+        mgr = SessionManager()
+        sid = mgr.create_session(name="持久化测试")
+        sess = mgr.get_session(sid)
+        sess.add_message("user", "测试")
+        d = sess.to_dict()
+        restored = QASession.from_dict(d)
+        assert restored.name == "持久化测试"
+        assert restored.session_id == sid
+        assert len(restored.history) == 1
+        assert restored.history[0].role == "user"
 
 
 # ── ComplexityAnalyzer 测试 ─────────────────────

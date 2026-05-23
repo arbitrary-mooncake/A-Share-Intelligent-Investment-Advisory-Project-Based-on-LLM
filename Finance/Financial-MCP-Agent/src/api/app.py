@@ -926,6 +926,12 @@ async def lifespan(app: FastAPI):
     _pool_manager = StockPoolManager()
     _scoring_engine = ScoringEngine(pool_manager=_pool_manager)
     clean_old_cache()
+    # 清理过期QA数据缓存
+    try:
+        from src.qa.session_manager import clean_expired_cache
+        clean_expired_cache()
+    except Exception:
+        pass
     # 后台预加载名称缓存
     asyncio.get_running_loop().run_in_executor(_thread_pool, _ensure_name_cache)
     yield
@@ -1838,6 +1844,14 @@ class QARequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class QASessionCreate(BaseModel):
+    name: str = "新对话"
+
+
+class QASessionRename(BaseModel):
+    name: str
+
+
 @app.post("/api/qa/ask")
 async def qa_ask(req: QARequest):
     """
@@ -1889,9 +1903,35 @@ async def qa_get_session(session_id: str):
     return session.to_dict()
 
 
+@app.get("/api/qa/sessions")
+async def qa_list_sessions():
+    """列出所有会话窗口（按更新时间倒序）"""
+    session_mgr = get_session_manager()
+    return session_mgr.list_sessions()
+
+
+@app.post("/api/qa/sessions")
+async def qa_create_session(req: QASessionCreate):
+    """创建新会话窗口"""
+    session_mgr = get_session_manager()
+    session_id = session_mgr.create_session(name=req.name)
+    sess = session_mgr.get_session(session_id)
+    return sess.to_dict() if sess else {"session_id": session_id}
+
+
+@app.patch("/api/qa/sessions/{session_id}")
+async def qa_rename_session(session_id: str, req: QASessionRename):
+    """重命名会话窗口"""
+    session_mgr = get_session_manager()
+    ok = session_mgr.rename_session(session_id, req.name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="会话不存在或名称为空")
+    return {"status": "renamed", "session_id": session_id, "name": req.name}
+
+
 @app.delete("/api/qa/sessions/{session_id}")
 async def qa_delete_session(session_id: str):
-    """删除会话"""
+    """删除会话窗口及其数据缓存"""
     session_mgr = get_session_manager()
     deleted = session_mgr.delete_session(session_id)
     if not deleted:

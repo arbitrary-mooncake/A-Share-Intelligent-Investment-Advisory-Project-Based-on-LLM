@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
+from src.qa.session_manager import get_cached_evidence, set_cached_evidence
 
 logger = setup_logger(__name__)
 
@@ -32,13 +33,23 @@ class EvidencePackage:
     elapsed_seconds: float = 0.0
 
 
-async def _call_tool_safe(tool, kwargs: dict, timeout: float, label: str) -> str:
-    """安全调用单个MCP工具，带超时和异常保护"""
+async def _call_tool_safe(tool, kwargs: dict, timeout: float, label: str,
+                         session_id: str = "") -> str:
+    """安全调用单个MCP工具，带超时、缓存和异常保护"""
+    # 先查缓存
+    if session_id:
+        cached = get_cached_evidence(session_id, label, kwargs)
+        if cached:
+            logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 命中缓存 ({len(cached)} 字符)")
+            return cached
+
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=timeout)
         text = str(result).strip()
         if len(text) > 25:
             logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 成功 ({len(text)} 字符)")
+            if session_id:
+                set_cached_evidence(session_id, label, kwargs, text)
             return text
         else:
             logger.warning(f"QA Evidence: {label} 返回过短 ({len(text)} 字符)")
@@ -57,6 +68,7 @@ async def assemble_evidence_fast(
     tools: List[str],
     question: str,
     current_date: str,
+    session_id: str = "",
 ) -> EvidencePackage:
     """
     快路径：并行拉取所有所需工具的数据，组装为证据包。
@@ -90,7 +102,7 @@ async def assemble_evidence_fast(
     labels = []
     for tool in all_mcp_tools:
         kwargs = _build_tool_kwargs(tool.name, stock_code, company_name, question)
-        tasks.append(_call_tool_safe(tool, kwargs, TOOL_TIMEOUT, tool.name))
+        tasks.append(_call_tool_safe(tool, kwargs, TOOL_TIMEOUT, tool.name, session_id))
         labels.append(tool.name)
 
     results = await asyncio.gather(*tasks)

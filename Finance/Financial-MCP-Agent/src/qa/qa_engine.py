@@ -108,7 +108,8 @@ async def process_question(
         logger.info(f"{WAIT_ICON} QA Engine: 使用快路径并行拉取数据...")
         evidence = await assemble_evidence_fast(
             stock_code or "", company_name or "",
-            task_plan.tools, question, current_date
+            task_plan.tools, question, current_date,
+            session_id=actual_session_id,
         )
 
     yield _sse_event("status", {
@@ -134,10 +135,11 @@ async def process_question(
         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]") and not chunk.startswith("data: [ERROR]"):
             full_answer += chunk[6:].rstrip("\n")
 
-    # Step 6: 保存到会话历史
+    # Step 6: 保存到会话历史并持久化
     if full_answer.strip():
         session.add_message("user", question)
         session.add_message("assistant", full_answer.strip())
+        session_mgr.save_session(actual_session_id)
 
     total_time = time.time() - start_time
     logger.info(

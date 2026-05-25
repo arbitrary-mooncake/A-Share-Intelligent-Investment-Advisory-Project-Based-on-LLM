@@ -305,7 +305,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             logger.error(f"{ERROR_ICON} FundamentalAgent: Phase 1 并行调用异常: {gather_err}")
             results = [f"并行调用异常: {gather_err}"] * len(tasks)
 
-        # 空数据重试（最多额外2轮，覆盖率100%则提前跳出）
+        # 空数据重试（最多额外3轮（并发递减8→4→2），覆盖率100%则提前跳出）
         results = await retry_failed_fetches(
             results, tool_infos, labels, _call_tool_safe,
             agent_label="FundamentalAgent",

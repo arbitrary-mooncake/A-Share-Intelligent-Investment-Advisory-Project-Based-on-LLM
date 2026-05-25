@@ -1,9 +1,12 @@
 """
-数据获取重试工具 — Phase 1 并行取数后，对返回空数据的工具自动重试（最多3轮）。
+数据获取重试工具 — Phase 1 并行取数后，对返回空数据的工具自动重试（最多4轮），
+重试并发逐轮递减以避免压垮已不稳定的上游数据源。
 """
 import asyncio
-import time
 from typing import List, Callable, Any, Coroutine
+
+# 重试并发数递减表：第1→2→3轮重试的并发上限
+_RETRY_SEMAPHORE_SCHEDULE = (8, 4, 2)
 
 
 def is_empty_result(text: str) -> bool:
@@ -23,11 +26,11 @@ async def retry_failed_fetches(
     labels: list,
     call_fn,
     agent_label: str = "",
-    max_extra_rounds: int = 2,
+    max_extra_rounds: int = 3,
 ) -> list:
     """
     对 Phase 1 结果中空数据的工具进行最多 max_extra_rounds 轮重试。
-    如果覆盖率已达 100%，提前跳出。
+    如果覆盖率已达 100%，提前跳出。重试并发逐轮递减（8→4→2）。
 
     Args:
         results: 初始 asyncio.gather 的结果列表
@@ -57,6 +60,13 @@ async def retry_failed_fetches(
         if not retry_indices:
             break  # 100% 覆盖率
 
+        # 本轮并发上限（从递减表中取，超出表长则用最小值 2）
+        if retry_round < len(_RETRY_SEMAPHORE_SCHEDULE):
+            sem_limit = _RETRY_SEMAPHORE_SCHEDULE[retry_round]
+        else:
+            sem_limit = 2
+        sem = asyncio.Semaphore(sem_limit)
+
         # 计算当前覆盖率
         success_count = sum(
             1 for i, r in enumerate(results)
@@ -64,15 +74,19 @@ async def retry_failed_fetches(
         )
         prefix = f"{agent_label}: " if agent_label else ""
         print(f"{prefix}第{retry_round + 1}轮重试 {len(retry_indices)} 个空数据工具 "
-              f"(当前覆盖率 {success_count}/{total})...")
+              f"(当前覆盖率 {success_count}/{total}, 并发={sem_limit})...")
 
-        # 重建失败工具的任务
+        # 重建失败工具的任务（带并发限制）
+        async def _limited_call(tool, kwargs, label):
+            async with sem:
+                return await call_fn(tool, kwargs, label)
+
         retry_tasks = []
         for i in retry_indices:
             tool, kwargs = tool_infos[i]
-            retry_tasks.append(call_fn(tool, kwargs, labels[i]))
+            retry_tasks.append(_limited_call(tool, kwargs, labels[i]))
 
-        # 并行重试
+        # 并行重试（受 semaphore 限制）
         try:
             retry_new = await asyncio.gather(*retry_tasks, return_exceptions=True)
         except Exception:

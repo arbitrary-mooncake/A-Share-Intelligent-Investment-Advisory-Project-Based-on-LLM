@@ -149,7 +149,7 @@ async def news_agent(state: AgentState) -> AgentState:
     phase1_start = time.time()
 
     try:
-        news_tools = await get_mcp_tools(tool_filter=["crawl_news", "get_st_risk_data"])
+        news_tools = await get_mcp_tools(tool_filter=["crawl_news", "get_st_risk_data", "tushare_news", "tushare_st_status"])
     except Exception as e:
         logger.error(f"{ERROR_ICON} NewsAgent: 获取MCP工具失败: {e}")
         news_tools = []
@@ -190,7 +190,7 @@ async def news_agent(state: AgentState) -> AgentState:
 
         elif tool.name == "get_st_risk_data":
             if clean_code:
-                sh_code = f"sh.{clean_code}" if (clean_code.startswith("6") or clean_code.startswith("688")) else f"sz.{clean_code}"
+                sh_code = f"sh.{clean_code}" if clean_code.startswith(("6", "688", "5", "8")) else f"sz.{clean_code}"
                 tasks.append(_call_tool_with_timeout(
                     tool, {"code": sh_code}, 5.0,
                     f"st_risk(code={sh_code})"
@@ -295,7 +295,7 @@ async def news_agent(state: AgentState) -> AgentState:
                 messages=_messages,
                 temperature=1.0,
                 max_tokens=32000,
-                extra_body={"enable_thinking": True},  # DashScope 格式（非 OpenAI thinking 格式）
+                extra_body={"thinking": {"type": "enabled"}},  # Kimi K2.6 OpenAI 兼容 thinking 格式
             ),
             timeout=float(LLM_TIMEOUT + 10)  # 130s：略大于HTTP read超时(120s)
         )
@@ -322,7 +322,7 @@ async def news_agent(state: AgentState) -> AgentState:
         "model": model_name,
         "temperature": 1.0,
         "max_tokens": 32000,
-        "thinking": "enabled (enable_thinking)",
+        "thinking": "enabled (thinking.type=enabled)",
         "api_base": base_url
     }
     try:

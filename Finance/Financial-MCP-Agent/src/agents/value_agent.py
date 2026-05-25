@@ -1,139 +1,302 @@
 """
-ValueAnalysis Agent: Performs valuation analysis of a stock using ReAct Agent framework.
-估值分析 Agent：使用ReAct Agent框架对股票进行估值分析
+ValueAnalysis Agent: 两阶段架构 — 并行数据预取 + 单次 LLM 深度分析。
+Phase 1: asyncio.gather 并行获取白名单全部 16 个工具的数据
+Phase 2: 将所有原始数据喂给 LLM 一次性完成估值分析（thinking 开启）
 """
+import asyncio
 import os
-import json
-from typing import Dict, Any, List, Optional
-from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI  # 恢复OpenAI接口调用
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.outputs import ChatResult, ChatGeneration
-from langgraph.prebuilt import create_react_agent
 import time
+from datetime import datetime
+from typing import Dict, Any, List
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from dotenv import load_dotenv
 
 from src.utils.state_definition import AgentState
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
-from dotenv import load_dotenv
+from src.utils.cache_utils import read_cache, write_cache
+from src.utils.model_config import get_model_config_for_agent
 
-# 从.env文件加载环境变量
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
 
+TOOL_TIMEOUT = 30
+LLM_TIMEOUT = 300
+
+# 估值分析白名单（与旧 ReAct 白名单完全一致，16 个工具）
+VALUE_TOOL_NAMES = [
+    "get_stock_basic_info", "get_stock_industry",
+    "get_profit_data", "get_balance_data", "get_cash_flow_data",
+    "get_growth_data", "get_operation_data", "get_dividend_data",
+    "tushare_stock_info", "tushare_fina_indicator",
+    "tushare_dividend", "tushare_ev_ebitda",
+    "tushare_daily_basic", "tushare_pe_percentile",
+    "tushare_top10_holders", "tushare_holder_num",
+]
+
+
+def _extract_code(stock_code: str) -> str:
+    return stock_code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+
+
+def _get_recent_quarters(date_str: str, count: int = 2) -> List[Dict[str, Any]]:
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        dt = datetime.now()
+    quarters = []
+    current_q = (dt.month - 1) // 3 + 1
+    current_year = dt.year
+    q = current_q - 1
+    y = current_year
+    if q <= 0:
+        q = 4
+        y -= 1
+    for _ in range(count):
+        quarters.append({"year": str(y), "quarter": q})
+        q -= 1
+        if q <= 0:
+            q = 4
+            y -= 1
+    return quarters
+
+
+async def _noop_result(text: str) -> str:
+    """返回固定文本的占位协程"""
+    return text
+
+
+async def _call_tool_safe(tool, kwargs: dict, label: str) -> str:
+    try:
+        result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=TOOL_TIMEOUT)
+        text = str(result).strip()
+        if len(text) > 20:
+            logger.info(f"{SUCCESS_ICON} ValueAgent: {label} 获取成功 ({len(text)} 字符)")
+            return text
+        logger.warning(f"ValueAgent: {label} 返回过短 ({len(text)} 字符)")
+        return f"[{label}] 数据不可用（返回过短）"
+    except asyncio.TimeoutError:
+        logger.warning(f"ValueAgent: {label} 超时({TOOL_TIMEOUT}s)")
+        return f"[{label}] 数据不可用（超时）"
+    except Exception as e:
+        logger.warning(f"ValueAgent: {label} 调用失败: {e}")
+        return f"[{label}] 数据不可用（调用失败: {str(e)[:80]}）"
+
 
 async def value_agent(state: AgentState) -> AgentState:
     """
-    使用ReAct框架进行估值分析，直接集成MCP工具
-    
-    Args:
-        state: 包含用户查询的当前 Agent状态
-
-    Returns:
-        更新后的AgentState，包含估值分析结果
+    两阶段估值分析：
+    Phase 1: 并行获取全部 16 个工具的数据
+    Phase 2: 单次 LLM 深度分析（Kimi K2.6, thinking=enabled）
     """
-    logger.info(
-        f"{WAIT_ICON} ValueAgent: Starting valuation analysis using ReAct framework.")
+    logger.info(f"{WAIT_ICON} ValueAgent: Starting two-phase valuation analysis.")
 
-    # 获取执行日志记录器，用于记录 Agent的执行过程
     execution_logger = get_execution_logger()
     agent_name = "value_agent"
 
-    # 从状态中提取当前数据、消息和元数据
     current_data = state.get("data", {})
     current_messages = state.get("messages", [])
     current_metadata = state.get("metadata", {})
     user_query = current_data.get("query")
 
-    # 记录 Agent开始执行，包含关键信息
+    skip_cache = current_data.get("skip_cache", False)
+    cache_date = current_data.get("current_date", "")
+    cache_code = current_data.get("stock_code", "")
+
+    # 缓存检查（TTL=7天）
+    if not skip_cache and cache_date and cache_code:
+        cached = read_cache("value_analysis", cache_code, cache_date)
+        if cached:
+            logger.info(f"{SUCCESS_ICON} ValueAgent: 命中缓存，跳过分析 ({cache_code})")
+            current_data["value_analysis"] = cached
+            current_metadata["value_agent_executed"] = True
+            current_metadata["value_agent_cached"] = True
+            return {"data": current_data,
+                    "messages": current_messages + [{"role": "assistant", "content": "估值分析已完成（缓存）"}],
+                    "metadata": current_metadata}
+
+    if current_data.get("is_etf", False):
+        logger.info(f"{SUCCESS_ICON} ValueAgent: ETF标的，跳过估值分析")
+        current_data["value_analysis"] = "该标的为ETF产品，估值分析参考基金净值和折溢价率，不适用个股估值框架。"
+        current_metadata["value_agent_executed"] = True
+        return {"data": current_data,
+                "messages": current_messages + [{"role": "assistant", "content": "ETF标的，已跳过估值分析"}],
+                "metadata": current_metadata}
+
     execution_logger.log_agent_start(agent_name, {
         "user_query": user_query,
-        "stock_code": current_data.get("stock_code"),
+        "stock_code": cache_code,
         "company_name": current_data.get("company_name"),
-        "input_data_keys": list(current_data.keys())
+        "input_data_keys": list(current_data.keys()),
+        "architecture": "two-phase",
     })
 
-    # 验证用户查询是否存在
     if not user_query:
-        logger.error(
-            f"{ERROR_ICON} ValueAgent: User query is missing in state data.")
+        logger.error(f"{ERROR_ICON} ValueAgent: User query is missing.")
         current_data["value_analysis_error"] = "User query is missing."
-
-        # 记录 Agent执行失败
-        execution_logger.log_agent_complete(
-            agent_name, current_data, 0, False, "User query is missing")
-
+        execution_logger.log_agent_complete(agent_name, current_data, 0, False, "User query is missing")
         return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
-    # 记录 Agent开始时间，用于计算执行时长
     agent_start_time = time.time()
 
     try:
-        # 使用API调用
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+        model_cfg = get_model_config_for_agent("value_agent", current_data)
+        api_key = model_cfg["api_key"]
+        base_url = model_cfg["base_url"]
+        model_name = model_cfg["model_name"]
 
-        # 验证必要的环境变量是否存在
         if not all([api_key, base_url, model_name]):
             logger.error(f"{ERROR_ICON} ValueAgent: Missing OpenAI environment variables.")
             current_data["value_analysis_error"] = "Missing OpenAI environment variables."
-            execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, "Missing OpenAI environment variables")
+            execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, "Missing env vars")
             return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
-        logger.info(f"{WAIT_ICON} ValueAgent: Creating ChatOpenAI with model {model_name}")
-        # 创建LLM实例，设置合适的参数
+        stock_code = current_data.get("stock_code", "Unknown")
+        company_name = current_data.get("company_name", "Unknown")
+        current_time_info = current_data.get("current_time_info", "未知时间")
+        current_date = current_data.get("current_date", "未知日期")
+        clean_code = _extract_code(stock_code) if stock_code else ""
+
+        # ── Phase 1: 并行数据预取 ──────────────────────────────
+        logger.info(f"{WAIT_ICON} ValueAgent: Phase 1 — 并行获取 {len(VALUE_TOOL_NAMES)} 个工具数据...")
+        phase1_start = time.time()
+
+        try:
+            all_tools = await get_mcp_tools(tool_filter=VALUE_TOOL_NAMES)
+        except Exception as e:
+            logger.error(f"{ERROR_ICON} ValueAgent: 获取 MCP 工具失败: {e}")
+            all_tools = []
+
+        if not all_tools:
+            logger.error(f"{ERROR_ICON} ValueAgent: No MCP tools available.")
+            current_data["value_analysis_error"] = "No MCP tools available."
+            execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, "No tools")
+            return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
+
+        tool_map = {t.name: t for t in all_tools}
+        logger.info(f"{SUCCESS_ICON} ValueAgent: 已加载 {len(all_tools)}/{len(VALUE_TOOL_NAMES)} 个工具")
+
+        quarters = _get_recent_quarters(current_date, count=2)
+        q_latest = quarters[0]
+        q_prior = quarters[1] if len(quarters) > 1 else q_latest
+
+        tasks = []
+        labels = []
+
+        def _add(task, label):
+            tasks.append(task)
+            labels.append(label)
+
+        # --- 纯代码类工具 ---
+        code_tools = [
+            ("get_stock_basic_info", "基本信息"),
+            ("get_stock_industry", "行业分类"),
+            ("tushare_stock_info", "Tushare基本信息"),
+            ("tushare_fina_indicator", "Tushare财务指标"),
+            ("tushare_daily_basic", "Tushare日线基础"),
+            ("tushare_pe_percentile", "Tushare PE分位"),
+            ("tushare_top10_holders", "Tushare十大股东"),
+            ("tushare_holder_num", "Tushare股东人数"),
+            ("tushare_ev_ebitda", "Tushare EV/EBITDA"),
+            ("tushare_dividend", "Tushare分红"),
+        ]
+        for tname, label in code_tools:
+            if tname in tool_map:
+                kwargs = {"code": clean_code}
+                if tname == "get_stock_industry":
+                    kwargs["date"] = current_date
+                _add(_call_tool_safe(tool_map[tname], kwargs, label), label)
+            else:
+                labels.append(label)
+                tasks.append(_noop_result(f"[{tname}] 工具不可用"))
+
+        # --- 财务报表类工具 ---
+        fin_tools_params = [
+            ("get_profit_data", "利润表"),
+            ("get_balance_data", "资产负债表"),
+            ("get_cash_flow_data", "现金流量表"),
+            ("get_growth_data", "成长数据"),
+            ("get_operation_data", "运营数据"),
+        ]
+        for tool_name, label_base in fin_tools_params:
+            if tool_name in tool_map:
+                t = tool_map[tool_name]
+                _add(_call_tool_safe(t, {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]},
+                                     f"{label_base}({q_latest['year']}Q{q_latest['quarter']})"),
+                     f"{label_base}(最新)")
+                _add(_call_tool_safe(t, {"code": clean_code, "year": q_prior["year"], "quarter": q_prior["quarter"]},
+                                     f"{label_base}({q_prior['year']}Q{q_prior['quarter']})"),
+                     f"{label_base}(上期)")
+            else:
+                labels.append(f"{label_base}(最新)")
+                labels.append(f"{label_base}(上期)")
+                tasks.append(_noop_result(f"[{tool_name}] 工具不可用"))
+                tasks.append(_noop_result(f"[{tool_name}] 工具不可用"))
+
+        # --- 分红数据 ---
+        if "get_dividend_data" in tool_map:
+            _add(_call_tool_safe(tool_map["get_dividend_data"],
+                                 {"code": clean_code, "year": q_latest["year"], "year_type": "report"},
+                                 f"分红数据({q_latest['year']})"), "分红数据")
+        else:
+            labels.append("分红数据")
+            tasks.append(_noop_result("[get_dividend_data] 工具不可用"))
+
+        # 并行执行
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as gather_err:
+            logger.error(f"{ERROR_ICON} ValueAgent: Phase 1 并行调用异常: {gather_err}")
+            results = [f"并行调用异常: {gather_err}"] * len(tasks)
+
+        safe_results = []
+        for r in results:
+            if isinstance(r, Exception):
+                safe_results.append(f"[工具调用异常: {str(r)[:100]}]")
+            else:
+                safe_results.append(str(r) if r else "[空返回]")
+
+        phase1_elapsed = time.time() - phase1_start
+        success_count = sum(1 for r in safe_results if "数据不可用" not in str(r) and "工具不可用" not in str(r) and "工具调用异常" not in str(r) and "空返回" not in str(r))
+        logger.info(f"{SUCCESS_ICON} ValueAgent: Phase 1 完成 ({phase1_elapsed:.1f}s, {success_count}/{len(labels)} 个工具有效数据)")
+
+        data_sections = []
+        for label, result in zip(labels, safe_results):
+            data_sections.append(f"### [{label}]\n{result}")
+        raw_data_text = "\n\n".join(data_sections)
+
+        # ── Phase 2: LLM 深度分析 ──────────────────────────────
+        logger.info(f"{WAIT_ICON} ValueAgent: Phase 2 — LLM 深度分析 (model={model_name}, thinking=enabled)...")
+        phase2_start = time.time()
+
         llm = ChatOpenAI(
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            temperature=0.6,  # kimi-k2.5 instant 模式要求值
-            max_tokens=8000,  # 估值分析需要更多输出空间
-            extra_body={"thinking": {"type": "disabled"}}  # 工具调用时必须关闭思考模式
+            temperature=0.6,
+            request_timeout=LLM_TIMEOUT,
+            max_tokens=8000,
+            extra_body={"thinking": {"type": "enabled"}},
         )
 
-        # 2. 获取MCP工具集
-        logger.info(f"{WAIT_ICON} ValueAgent: Fetching MCP tools...")
-        try:
-            mcp_tools = await get_mcp_tools()
-            if not mcp_tools:
-                logger.error(
-                    f"{ERROR_ICON} ValueAgent: No MCP tools available.")
-                current_data["value_analysis_error"] = "No MCP tools available."
-
-                # 记录 Agent执行失败
-                execution_logger.log_agent_complete(agent_name, current_data, time.time(
-                ) - agent_start_time, False, "No MCP tools available")
-
-                return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
-
-            logger.info(
-                f"{SUCCESS_ICON} ValueAgent: Successfully loaded {len(mcp_tools)} tools.")
-
-            # 打印可用工具列表，便于调试
-            tool_names = [tool.name for tool in mcp_tools]
-            logger.info(f"Available tools: {tool_names}")
-
-            # 3. 创建ReAct Agent - 只传入LLM和工具
-            logger.info(f"{WAIT_ICON} ValueAgent: Creating ReAct agent...")
-            agent = create_react_agent(llm, mcp_tools)
-
-            # 4. 准备输入数据，构建详细的分析请求
-            stock_code = current_data.get('stock_code', 'Unknown')
-            company_name = current_data.get('company_name', 'Unknown')
-            current_time_info = current_data.get('current_time_info', '未知时间')
-            current_date = current_data.get('current_date', '未知日期')
-
-            # 构建详细的估值分析请求，包含多个分析维度
-            agent_input = f"""请以券商分析师的标准，对{company_name}（股票代码：{stock_code}）进行估值分析。
+        analysis_prompt = f"""请以券商分析师的标准，对{company_name}（股票代码：{stock_code}）进行估值分析。
 
 当前时间：{current_time_info}
 当前日期：{current_date}
 
-请进行以下估值分析（每个维度都需要基于实际数据，引用具体数字）：
+## 原始数据
+
+以下是通过工具获取的全部原始数据，请基于这些数据进行深度分析：
+
+{raw_data_text}
+
+## 分析要求
+
+请进行以下估值分析（每个维度都需要基于上述原始数据，引用具体数字）：
 
 1. 当前估值指标
    - 市盈率（PE TTM）：当前值，计算方式（股价/EPS）
@@ -168,154 +331,110 @@ async def value_agent(state: AgentState) -> AgentState:
    - 简要投资建议
 
 重要限制：
-- 请专注于估值指标和财务数据分析，不要使用crawl_news工具获取新闻信息
-- 分析必须有数据支撑，引用具体的估值数字，避免空洞的定性描述
+- 请专注于估值指标和财务数据分析，不要编造新闻信息
+- 分析必须有数据支撑，引用具体的估值数字
 - 如果某些数据无法获取，请说明原因并基于可用数据提供分析
-- 保持回答简洁精炼，避免冗长的描述性文字
 
-请使用可用的工具获取实际数据进行分析，而不是基于假设。"""
+⛔ 输出格式要求（防幻觉机制）：
+请将分析输出严格分为两个区域：
 
-            logger.info(f"Agent input: {agent_input}")
+## 📊 数据事实区
+列出上述原始数据中的关键客观数据，每条标注数据来源标签：
+- [标签] 具体数值（如：PE_TTM=15.2，PB_MRQ=1.8）
+- [标签] 具体数值
+- ...
+如果某项数据在上述原始数据中标注为「数据不可用」，必须在此如实声明，不得推测。
 
-            # 5. 调用ReAct Agent - 使用正确的messages格式
-            logger.info(f"{WAIT_ICON} ValueAgent: Calling ReAct agent...")
-            start_time = time.time()
+## 🔍 分析判断区
+基于上述数据事实进行分析和推断。每个判断必须：
+1. 引用数据事实区的具体数值
+2. 使用「【基于数据的推断】」或「【行业知识补充】」标注推断性质
+3. 如果某个结论无法从数据中直接得出，必须声明「此为分析师推断」
+4. 不得在任何地方编造数据事实区没有的数值"""
 
-            # LangGraph ReAct Agent需要messages格式的输入
-            input_data = {
-                "messages": [HumanMessage(content=agent_input)]
-            }
+        messages = [
+            {"role": "system", "content": "你是一位资深券商估值分析师，专注于A股公司的估值分析和投资价值判断。"},
+            {"role": "user", "content": analysis_prompt},
+        ]
 
-            # 调用 Agent执行分析
-            response = await agent.ainvoke(input_data)
-
-            end_time = time.time()
-            execution_time = end_time - start_time
-
-            logger.info(
-                f"ReAct agent execution completed in {execution_time:.2f} seconds")
-
-            # 6. 提取分析结果
-            final_output = "No analysis generated."
-
-            if "messages" in response and isinstance(response["messages"], list):
-                messages = response["messages"]
-                logger.info(f"Response messages count: {len(messages)}")
-                
-                # 查找最后一条AI消息，这通常包含最终的分析结果
-                ai_messages = [
-                    msg for msg in messages if isinstance(msg, AIMessage)]
-                logger.info(f"AI messages count: {len(ai_messages)}")
-                
-                if ai_messages:
-                    last_ai_message = ai_messages[-1]
-                    final_output = last_ai_message.content
-                    logger.info(
-                        f"Successfully extracted analysis from AI message.")
-                else:
-                    logger.warning("No AI messages found in response")
-                    # 如果没有AI消息，尝试获取所有消息的内容
-                    all_content = []
-                    for msg in messages:
-                        if hasattr(msg, 'content') and msg.content:
-                            all_content.append(str(msg.content))
-                    if all_content:
-                        final_output = "\n".join(all_content)
-            else:
-                logger.error(f"Unexpected response format: {type(response)}")
-                logger.error(
-                    f"Response keys: {response.keys() if isinstance(response, dict) else 'Not a dict'}")
-
-            logger.info(
-                f"Final extracted analysis length: {len(final_output)} characters")
-            print(f"VALUEAGENT: {final_output}")
-            # 7. 记录LLM交互，用于后续分析和优化
-            model_config = {
-                "model": model_name,
-                "temperature": 0.6,
-                "max_tokens": 8000,
-                "thinking": "disabled",
-                "api_base": base_url
-            }
-            
-            execution_logger.log_llm_interaction(
-                agent_name=agent_name,
-                interaction_type="react_agent",
-                input_messages=[{"role": "user", "content": agent_input}],
-                output_content=final_output,
-                model_config=model_config,
-                execution_time=execution_time
+        try:
+            response = await asyncio.wait_for(
+                llm.ainvoke(messages),
+                timeout=float(LLM_TIMEOUT)
             )
+            final_output = response.content.strip() if hasattr(response, 'content') else str(response)
+            phase2_elapsed = time.time() - phase2_start
+            logger.info(f"ValueAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
+            llm_success = True
+        except asyncio.TimeoutError:
+            phase2_elapsed = time.time() - phase2_start
+            logger.error(f"{ERROR_ICON} ValueAgent: LLM 超时 ({phase2_elapsed:.0f}s)")
+            final_output = f"## 📊 数据事实区\n\n{raw_data_text[:3000]}\n\n## 🔍 分析判断区\n\n⚠️ LLM分析超时，以上为原始数据，请人工分析。\n"
+            llm_success = False
+        except Exception as llm_err:
+            phase2_elapsed = time.time() - phase2_start
+            logger.error(f"{ERROR_ICON} ValueAgent: LLM 失败: {llm_err}")
+            final_output = f"## 📊 数据事实区\n\n{raw_data_text[:3000]}\n\n## 🔍 分析判断区\n\n⚠️ LLM分析失败({str(llm_err)[:100]})，以上为原始数据，请人工分析。\n"
+            llm_success = False
 
-            logger.info(
-                f"{SUCCESS_ICON} ValueAgent: Successfully completed valuation analysis.")
-            
-            # 8. 更新状态，保存分析结果和元数据
-            current_data["value_analysis"] = final_output
-            current_metadata["value_agent_executed"] = True
-            current_metadata["value_agent_timestamp"] = str(time.time())
-            current_metadata["value_agent_execution_time"] = f"{execution_time:.2f} seconds"
+        model_config_log = {
+            "model": model_name,
+            "temperature": 0.6,
+            "max_tokens": 8000,
+            "thinking": "enabled",
+            "api_base": base_url,
+            "architecture": "two-phase",
+        }
+        execution_logger.log_llm_interaction(
+            agent_name=agent_name,
+            interaction_type="two_phase_analysis",
+            input_messages=[{"role": "user", "content": analysis_prompt[:5000]}],
+            output_content=final_output,
+            model_config=model_config_log,
+            execution_time=phase2_elapsed,
+        )
 
-            # 9. 添加消息记录，保持对话历史
-            new_message = {"role": "assistant", "content": "估值分析已完成"}
-            updated_messages = current_messages + [new_message]
+        total_time = time.time() - agent_start_time
+        logger.info(f"{SUCCESS_ICON if llm_success else WAIT_ICON} ValueAgent: 分析完成 (总耗时 {total_time:.1f}s, Phase1={phase1_elapsed:.1f}s, Phase2={phase2_elapsed:.1f}s)")
 
-            # 记录 Agent执行成功
-            total_execution_time = time.time() - agent_start_time
-            execution_logger.log_agent_complete(agent_name, {
-                "value_analysis_length": len(final_output),
-                "analysis_preview": final_output[:500] if len(final_output) > 500 else final_output,
-                "llm_execution_time": execution_time,
-                "total_execution_time": total_execution_time
-            }, total_execution_time, True)
+        current_data["value_analysis"] = final_output
+        if not skip_cache and cache_date and cache_code:
+            write_cache("value_analysis", cache_code, cache_date, final_output)
+        current_metadata["value_agent_executed"] = True
+        current_metadata["value_agent_timestamp"] = str(time.time())
+        current_metadata["value_agent_execution_time"] = f"{total_time:.2f} seconds"
 
-            return {
-                "data": current_data,
-                "messages": updated_messages,
-                "metadata": current_metadata
-            }
-
-        except Exception as e:
-            logger.error(
-                f"{ERROR_ICON} ValueAgent: Error in MCP or agent execution: {e}", exc_info=True)
-            current_data["value_analysis_error"] = f"Error in MCP or agent execution: {e}"
-            current_data["value_analysis"] = f"估值分析过程中出现错误: {str(e)}"
-            current_metadata["value_agent_error"] = str(e)
-
-            # 记录 Agent执行失败
-            execution_logger.log_agent_complete(
-                agent_name, current_data, time.time() - agent_start_time, False, str(e))
-
-            return {
-                "data": current_data,
-                "messages": current_messages,
-                "metadata": current_metadata
-            }
-
-    except Exception as e:
-        logger.error(
-            f"{ERROR_ICON} ValueAgent: Error during execution: {e}", exc_info=True)
-        current_data["value_analysis_error"] = f"Error during execution: {e}"
-        current_metadata["value_agent_error"] = str(e)
-
-        # 记录 Agent执行失败
-        execution_logger.log_agent_complete(
-            agent_name, current_data, time.time() - agent_start_time, False, str(e))
+        execution_logger.log_agent_complete(agent_name, {
+            "value_analysis_length": len(final_output),
+            "analysis_preview": final_output[:500],
+            "phase1_time": phase1_elapsed,
+            "phase2_time": phase2_elapsed,
+            "total_time": total_time,
+            "tools_queried": len(labels),
+            "tools_with_data": success_count,
+            "llm_success": llm_success,
+        }, total_time, True)
 
         return {
             "data": current_data,
-            "messages": current_messages,
-            "metadata": current_metadata
+            "messages": current_messages + [{"role": "assistant", "content": "估值分析已完成"}],
+            "metadata": current_metadata,
         }
+
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} ValueAgent: Error: {e}", exc_info=True)
+        current_data["value_analysis_error"] = f"Error: {e}"
+        current_data["value_analysis"] = f"估值分析过程中出现错误: {str(e)}"
+        current_metadata["value_agent_error"] = str(e)
+        execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, str(e))
+        return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
 
 # 本地测试函数
 async def test_value_agent():
     """估值分析 Agent的测试函数"""
     from src.utils.state_definition import AgentState
-    from datetime import datetime
 
-    # 准备测试数据，包含当前时间信息
     current_datetime = datetime.now()
     current_date_cn = current_datetime.strftime("%Y年%m月%d日")
     current_date_en = current_datetime.strftime("%Y-%m-%d")
@@ -324,7 +443,6 @@ async def test_value_agent():
     current_time = current_datetime.strftime("%H:%M:%S")
     current_time_info = f"{current_date_cn} ({current_date_en}) {current_weekday_cn} {current_time}"
 
-    # 创建测试状态，模拟真实的用户查询
     test_state = AgentState(
         messages=[],
         data={
@@ -341,12 +459,11 @@ async def test_value_agent():
         metadata={}
     )
 
-    # 运行 Agent并输出结果
     result = await value_agent(test_state)
     print("Valuation Analysis Result:")
     print(result.get("data", {}).get("value_analysis", "No analysis found"))
-
     return result
+
 
 if __name__ == "__main__":
     import asyncio

@@ -17,6 +17,8 @@ from src.utils.state_definition import AgentState
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
+from src.utils.cache_utils import read_cache, write_cache
+from src.utils.model_config import get_model_config_for_agent
 from dotenv import load_dotenv
 
 # 从.env文件加载环境变量
@@ -48,6 +50,21 @@ async def technical_agent(state: AgentState) -> AgentState:
     user_query = current_data.get("query")
 
     # 记录 Agent开始执行，包含关键信息
+    # 检查中间产物缓存（快筛模式跳过）
+    skip_cache = current_data.get("skip_cache", False)
+    cache_date = current_data.get("current_date", "")
+    cache_code = current_data.get("stock_code", "")
+    if not skip_cache and cache_date and cache_code:
+        cached = read_cache("technical_analysis", cache_code, cache_date)
+        if cached:
+            logger.info(f"{SUCCESS_ICON} TechnicalAgent: 命中缓存，跳过分析 ({cache_code})")
+            current_data["technical_analysis"] = cached
+            current_metadata["technical_agent_executed"] = True
+            current_metadata["technical_agent_cached"] = True
+            return {"data": current_data,
+                    "messages": current_messages + [{"role": "assistant", "content": "技术分析已完成（缓存）"}],
+                    "metadata": current_metadata}
+
     execution_logger.log_agent_start(agent_name, {
         "user_query": user_query,
         "stock_code": current_data.get("stock_code"),
@@ -66,10 +83,11 @@ async def technical_agent(state: AgentState) -> AgentState:
     agent_start_time = time.time()
 
     try:
-        # 使用API调用
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+        # 模型配置：优先 state 覆盖（快筛），否则使用 agent 分配的模型 (Qwen3.6-Plus)
+        model_cfg = get_model_config_for_agent("technical_agent", current_data)
+        api_key = model_cfg["api_key"]
+        base_url = model_cfg["base_url"]
+        model_name = model_cfg["model_name"]
 
         # 验证必要的环境变量是否存在
         if not all([api_key, base_url, model_name]):
@@ -84,15 +102,23 @@ async def technical_agent(state: AgentState) -> AgentState:
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            temperature=0.6,  # kimi-k2.5 instant 模式要求值
+            temperature=0.6,
+            request_timeout=360,
             max_tokens=8000,  # 技术分析需要更多输出空间
-            extra_body={"thinking": {"type": "disabled"}}  # 工具调用时必须关闭思考模式
+            extra_body={"thinking": {"type": "disabled"}}  # ReAct工具调用模式，关闭思考以提速
         )
 
         # 2. 获取MCP工具集
         logger.info(f"{WAIT_ICON} TechnicalAgent: Fetching MCP tools...")
         try:
-            mcp_tools = await get_mcp_tools()
+            mcp_tools = await get_mcp_tools(tool_filter=[
+                "get_historical_k_data", "get_stock_basic_info",
+                "get_latest_trading_date", "get_market_analysis_timeframe",
+                "get_stock_analysis", "get_trade_dates",
+                "tushare_kline", "tushare_daily_basic",
+                "tushare_moneyflow", "tushare_pe_percentile",
+                "tushare_hsgt_flow",
+            ])
             if not mcp_tools:
                 logger.error(f"{ERROR_ICON} TechnicalAgent: No MCP tools available.")
                 current_data["technical_analysis_error"] = "No MCP tools available."
@@ -158,7 +184,24 @@ async def technical_agent(state: AgentState) -> AgentState:
 - 分析必须有数据支撑，引用具体的价格、指标数值，避免空洞的定性描述
 - 技术分析应基于实际获取的K线数据，不要使用假设数据
 
-请使用可用的工具获取实际数据进行分析，而不是基于假设。"""
+请使用可用的工具获取实际数据进行分析，而不是基于假设。
+
+⛔ 输出格式要求（防幻觉机制）：
+请将分析输出严格分为两个区域：
+
+## 📊 数据事实区
+列出通过工具调取到的所有客观数据，每条标注数据来源：
+- [K线数据] 具体价格/指标数值（如：最新收盘价=XXX元，MACD DIF=XX）
+- [工具名] 具体数值
+- ...
+如果某项数据工具无法获取，必须标注「数据不可用」而不是推测。
+
+## 🔍 分析判断区
+基于上述数据事实进行分析和推断。每个判断必须：
+1. 引用数据事实区的具体数值
+2. 使用「【基于数据的推断】」或「【行业知识补充】」标注推断性质
+3. 如果某个结论无法从数据中直接得出，必须声明「此为分析师推断」
+4. 不得在任何地方编造数据事实区没有的数值"""
 
             logger.info(f"Agent input: {agent_input}")
 
@@ -172,7 +215,7 @@ async def technical_agent(state: AgentState) -> AgentState:
             }
 
             # 调用 Agent执行分析
-            response = await agent.ainvoke(input_data)
+            response = await agent.ainvoke(input_data, config={"recursion_limit": 30})
 
             end_time = time.time()
             execution_time = end_time - start_time
@@ -227,6 +270,8 @@ async def technical_agent(state: AgentState) -> AgentState:
             
             # 8. 更新状态，保存分析结果和元数据
             current_data["technical_analysis"] = final_output
+            if not skip_cache and cache_date and cache_code:
+                write_cache("technical_analysis", cache_code, cache_date, final_output)
             current_metadata["technical_agent_executed"] = True
             current_metadata["technical_agent_timestamp"] = str(time.time())
             current_metadata["technical_agent_execution_time"] = f"{execution_time:.2f} seconds"

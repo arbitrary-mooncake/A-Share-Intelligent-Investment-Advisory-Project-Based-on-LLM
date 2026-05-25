@@ -1,71 +1,115 @@
 """
 CompositeDataSource: Primary-Fallback data source pattern.
 Tries Baostock first; on NoDataFoundError / DataSourceError, falls back to AKshare.
+Includes in-memory cache (5-min TTL) to avoid redundant calls within a single session.
 """
 import logging
+import time
 import pandas as pd
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .data_source_interface import FinancialDataSource, DataSourceError, NoDataFoundError, LoginError
 
 logger = logging.getLogger(__name__)
 
+# 内存缓存 TTL（秒）
+_MEMORY_CACHE_TTL = 300  # 5 分钟
+
 
 class CompositeDataSource(FinancialDataSource):
     """
-    Wraps a primary data source (Baostock) and a fallback (AKshare).
-    For every method, it tries the primary first.
-    If the primary raises NoDataFoundError, DataSourceError, or an unexpected exception,
-    it falls back to the secondary source.
+    Wraps an AKshare data source (primary) and a Baostock fallback.
+    AKshare is tried first for speed (no login needed, pure HTTP).
+    Baostock is used only when AKshare fails — and skipped entirely if
+    a connectivity pre-check shows it's unreachable.
 
-    crawl_news is a special case: AKshare does not support it,
-    so it only runs on the primary and does NOT fall back.
+    Maintains an in-memory cache keyed by (method_name, args, kwargs)
+    with a 5-min TTL to avoid redundant upstream calls within a session.
     """
 
     def __init__(self, primary: FinancialDataSource, fallback: FinancialDataSource):
-        self.primary = primary
-        self.fallback = fallback
+        # Note: in mcp_server.py, primary=Baostock, fallback=AKshare.
+        # We flip them here: try AKshare (fallback) first, then Baostock (primary).
+        self.primary = primary      # Baostock
+        self.fallback = fallback    # AKshare
+        self._baostock_available = True  # will be set to False if pre-check fails
+        self._memory_cache: dict = {}  # key → (timestamp, result)
+
+    def _check_baostock(self) -> bool:
+        """Quick connectivity check for Baostock. Caches result."""
+        if not self._baostock_available:
+            return False
+        try:
+            import baostock as bs
+            lg = bs.login()
+            ok = (lg.error_code == '0')
+            if ok:
+                bs.logout()
+            else:
+                logger.warning(f"[Composite] Baostock login failed: {lg.error_msg}, disabling Baostock")
+                self._baostock_available = False
+            return ok
+        except Exception as e:
+            logger.warning(f"[Composite] Baostock unreachable ({e}), disabling Baostock fallback")
+            self._baostock_available = False
+            return False
+
+    @staticmethod
+    def _make_cache_key(method_name: str, args: tuple, kwargs: dict) -> str:
+        """Generate a hashable cache key from method name and arguments."""
+        # Sort kwargs keys for deterministic key
+        kw_items = tuple(sorted(kwargs.items())) if kwargs else ()
+        return f"{method_name}:{args}:{kw_items}"
 
     def _try(self, method_name: str, *args, **kwargs):
         """
-        Generic fallback executor.
-        Tries primary, falls back to fallback on recoverable errors.
+        Try AKshare first, then Baostock as fallback.
+        This order is faster because AKshare doesn't require login.
+        Results are cached in-memory for 5 minutes to avoid redundant upstream calls.
         """
-        try:
-            method = getattr(self.primary, method_name)
-            return method(*args, **kwargs)
-        except LoginError:
-            # LoginError on primary: try fallback (which doesn't need login)
-            logger.warning(
-                f"[Composite] Primary {method_name} login failed, falling back to AKshare"
-            )
-        except NoDataFoundError as e:
-            logger.info(
-                f"[Composite] Primary {method_name} returned no data ({e}), falling back to AKshare"
-            )
-        except DataSourceError as e:
-            logger.warning(
-                f"[Composite] Primary {method_name} error ({e}), falling back to AKshare"
-            )
-        except Exception as e:
-            logger.warning(
-                f"[Composite] Primary {method_name} unexpected error ({e}), falling back to AKshare"
-            )
+        # 0. Check memory cache
+        cache_key = self._make_cache_key(method_name, args, kwargs)
+        if cache_key in self._memory_cache:
+            ts, result = self._memory_cache[cache_key]
+            if time.time() - ts < _MEMORY_CACHE_TTL:
+                logger.debug(f"[Composite] Cache hit: {method_name}")
+                return result
+            del self._memory_cache[cache_key]
 
-        # Fallback
+        # 1. Try AKshare first (fast, no login needed)
         try:
             fallback_method = getattr(self.fallback, method_name)
             result = fallback_method(*args, **kwargs)
-            logger.info(f"[Composite] Fallback {method_name} succeeded via AKshare")
+            logger.debug(f"[Composite] AKshare {method_name} succeeded")
+            self._memory_cache[cache_key] = (time.time(), result)
             return result
-        except Exception as fallback_err:
-            logger.error(
-                f"[Composite] Fallback {method_name} also failed: {fallback_err}"
-            )
+        except LoginError:
+            # AKshare should never raise LoginError, but handle it
+            logger.warning(f"[Composite] AKshare {method_name} login error (unexpected)")
+        except NoDataFoundError as e:
+            logger.info(f"[Composite] AKshare {method_name} returned no data ({e}), trying Baostock")
+        except DataSourceError as e:
+            logger.warning(f"[Composite] AKshare {method_name} error ({e}), trying Baostock")
+        except Exception as e:
+            logger.warning(f"[Composite] AKshare {method_name} unexpected error ({e}), trying Baostock")
+
+        # 2. Baostock fallback
+        if not self._check_baostock():
             raise DataSourceError(
-                f"Both primary and fallback data sources failed for {method_name}: "
-                f"fallback error={fallback_err}"
-            ) from fallback_err
+                f"Both data sources failed for {method_name}: AKshare returned no data, Baostock unavailable"
+            )
+
+        try:
+            method = getattr(self.primary, method_name)
+            result = method(*args, **kwargs)
+            logger.info(f"[Composite] Baostock fallback {method_name} succeeded")
+            self._memory_cache[cache_key] = (time.time(), result)
+            return result
+        except Exception as baostock_err:
+            logger.error(f"[Composite] Baostock {method_name} also failed: {baostock_err}")
+            raise DataSourceError(
+                f"Both data sources failed for {method_name}: " f"Baostock error={baostock_err}"
+            ) from baostock_err
 
     # --- Interface methods ---
     def get_historical_k_data(

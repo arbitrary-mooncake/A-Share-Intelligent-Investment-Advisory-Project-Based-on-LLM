@@ -21,6 +21,7 @@ from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAI
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
 from src.utils.model_config import get_model_config_for_agent
+from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -163,60 +164,73 @@ async def news_agent(state: AgentState) -> AgentState:
     # 构建并行任务
     tasks = []
     task_labels = []
+    news_tool_infos = []  # (tool, kwargs) 用于空数据重试
 
     for tool in news_tools:
         if tool.name == "crawl_news":
-            # 主查询：股票代码 → 必定命中（aks share已验证）
+            # 主查询：股票代码
             if clean_code:
-                tasks.append(_call_tool_with_timeout(
-                    tool, {"query": clean_code, "top_k": 10}, TOOL_TIMEOUT,
-                    f"crawl_news(code={clean_code})"
-                ))
+                kw1 = {"query": clean_code, "top_k": 10}
+                tasks.append(_call_tool_with_timeout(tool, kw1, TOOL_TIMEOUT, f"crawl_news(code={clean_code})"))
                 task_labels.append(f"crawl_news(code)")
+                news_tool_infos.append((tool, kw1))
             # 备选查询：公司名称
-            tasks.append(_call_tool_with_timeout(
-                tool, {"query": company_name, "top_k": 10}, TOOL_TIMEOUT,
-                f"crawl_news(name={company_name})"
-            ))
+            kw2 = {"query": company_name, "top_k": 10}
+            tasks.append(_call_tool_with_timeout(tool, kw2, TOOL_TIMEOUT, f"crawl_news(name={company_name})"))
             task_labels.append(f"crawl_news(name)")
+            news_tool_infos.append((tool, kw2))
 
         elif tool.name == "tushare_news":
             if clean_code:
-                tasks.append(_call_tool_with_timeout(
-                    tool, {"code": clean_code}, TOOL_TIMEOUT,
-                    f"tushare_news(code={clean_code})"
-                ))
+                kw = {"code": clean_code}
+                tasks.append(_call_tool_with_timeout(tool, kw, TOOL_TIMEOUT, f"tushare_news(code={clean_code})"))
                 task_labels.append(f"tushare_news")
+                news_tool_infos.append((tool, kw))
 
         elif tool.name == "get_st_risk_data":
             if clean_code:
                 sh_code = f"sh.{clean_code}" if clean_code.startswith(("6", "688", "5", "8")) else f"sz.{clean_code}"
-                tasks.append(_call_tool_with_timeout(
-                    tool, {"code": sh_code}, 5.0,
-                    f"st_risk(code={sh_code})"
-                ))
+                kw = {"code": sh_code}
+                tasks.append(_call_tool_with_timeout(tool, kw, 5.0, f"st_risk(code={sh_code})"))
                 task_labels.append(f"st_risk")
+                news_tool_infos.append((tool, kw))
 
-    # 并行执行（带整体保护，防止 gather 自身异常）
+    # 并行执行（第一轮）
     try:
         results = await asyncio.gather(*tasks) if tasks else []
     except Exception as gather_err:
         logger.error(f"{ERROR_ICON} NewsAgent: 并行工具调用异常: {gather_err}")
         results = []
+
+    # 空数据重试包装（news_agent 使用 _call_tool_with_timeout）
+    async def _news_retry_call(tool, kwargs, label):
+        return await _call_tool_with_timeout(tool, kwargs, TOOL_TIMEOUT, label)
+
+    results = await retry_failed_fetches(
+        results, news_tool_infos, task_labels, _news_retry_call,
+        agent_label="NewsAgent",
+    )
+
     phase1_elapsed = time.time() - phase1_start
 
     # 聚合结果
     news_parts = []
     success_count = 0
     for label, text in zip(task_labels, results):
-        if text:
-            # 只保留有实质内容的（过滤掉"未找到"等短回复）
-            is_empty = ("未找到" in text[:50] and len(text) < 100)
-            if not is_empty:
-                news_parts.append(f"### {label}\n{text}")
-                success_count += 1
-            else:
+        if text and not isinstance(text, Exception):
+            text_str = str(text)
+            # 过滤空结果和无效返回
+            if is_empty_result(text_str):
                 logger.info(f"NewsAgent: {label} 返回空结果")
+                continue
+            # 额外过滤"未找到"等短回复
+            if "未找到" in text_str[:50] and len(text_str) < 100:
+                logger.info(f"NewsAgent: {label} 未找到新闻")
+                continue
+            news_parts.append(f"### {label}\n{text_str}")
+            success_count += 1
+        else:
+            logger.info(f"NewsAgent: {label} 返回空结果")
 
     news_text = "\n\n".join(news_parts) if news_parts else ""
     logger.info(

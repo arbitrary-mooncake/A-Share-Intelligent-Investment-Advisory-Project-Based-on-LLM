@@ -19,6 +19,7 @@ from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAI
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
 from src.utils.model_config import get_model_config_for_agent
+from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 
 load_dotenv(override=True)
 
@@ -197,61 +198,67 @@ async def fundamental_agent(state: AgentState) -> AgentState:
         # 构建并行任务列表（覆盖白名单全部工具，不遗漏任何一个）
         tasks = []
         labels = []
+        tool_infos = []  # (tool, kwargs) 用于空数据重试，占位任务为 None
 
-        def _add(task, label):
+        def _add(task, label, ti=None):
             tasks.append(task)
             labels.append(label)
+            tool_infos.append(ti)
+
+        # Helper: 注册占位任务（工具不可用）
+        def _placeholder(label, msg):
+            labels.append(label); tasks.append(_noop_result(msg)); tool_infos.append(None)
 
         # --- 纯代码类工具 ---
         if "get_stock_basic_info" in tool_map:
-            _add(_call_tool_safe(tool_map["get_stock_basic_info"], {"code": clean_code}, "基本信息"), "基本信息")
-        else:
-            labels.append("基本信息"); tasks.append(_noop_result("[get_stock_basic_info] 工具不可用"))
+            _add(_call_tool_safe(tool_map["get_stock_basic_info"], {"code": clean_code}, "基本信息"), "基本信息",
+                 (tool_map["get_stock_basic_info"], {"code": clean_code}))
+        else: _placeholder("基本信息", "[get_stock_basic_info] 工具不可用")
 
         if "get_stock_industry" in tool_map:
-            _add(_call_tool_safe(tool_map["get_stock_industry"], {"code": clean_code, "date": current_date}, "行业分类"), "行业分类")
-        else:
-            labels.append("行业分类"); tasks.append(_noop_result("[get_stock_industry] 工具不可用"))
+            _add(_call_tool_safe(tool_map["get_stock_industry"], {"code": clean_code, "date": current_date}, "行业分类"), "行业分类",
+                 (tool_map["get_stock_industry"], {"code": clean_code, "date": current_date}))
+        else: _placeholder("行业分类", "[get_stock_industry] 工具不可用")
 
         if "tushare_stock_info" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_stock_info"], {"code": clean_code}, "Tushare基本信息"), "Tushare基本信息")
-        else:
-            labels.append("Tushare基本信息"); tasks.append(_noop_result("[tushare_stock_info] 工具不可用"))
+            _add(_call_tool_safe(tool_map["tushare_stock_info"], {"code": clean_code}, "Tushare基本信息"), "Tushare基本信息",
+                 (tool_map["tushare_stock_info"], {"code": clean_code}))
+        else: _placeholder("Tushare基本信息", "[tushare_stock_info] 工具不可用")
 
         if "tushare_fina_indicator" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_fina_indicator"], {"code": clean_code}, "Tushare财务指标"), "Tushare财务指标")
-        else:
-            labels.append("Tushare财务指标"); tasks.append(_noop_result("[tushare_fina_indicator] 工具不可用"))
+            _add(_call_tool_safe(tool_map["tushare_fina_indicator"], {"code": clean_code}, "Tushare财务指标"), "Tushare财务指标",
+                 (tool_map["tushare_fina_indicator"], {"code": clean_code}))
+        else: _placeholder("Tushare财务指标", "[tushare_fina_indicator] 工具不可用")
 
         if "tushare_daily_basic" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_daily_basic"], {"code": clean_code}, "Tushare日线基础"), "Tushare日线基础")
-        else:
-            labels.append("Tushare日线基础"); tasks.append(_noop_result("[tushare_daily_basic] 工具不可用"))
+            _add(_call_tool_safe(tool_map["tushare_daily_basic"], {"code": clean_code}, "Tushare日线基础"), "Tushare日线基础",
+                 (tool_map["tushare_daily_basic"], {"code": clean_code}))
+        else: _placeholder("Tushare日线基础", "[tushare_daily_basic] 工具不可用")
 
         if "tushare_top10_holders" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_top10_holders"], {"code": clean_code}, "Tushare十大股东"), "Tushare十大股东")
-        else:
-            labels.append("Tushare十大股东"); tasks.append(_noop_result("[tushare_top10_holders] 工具不可用"))
+            _add(_call_tool_safe(tool_map["tushare_top10_holders"], {"code": clean_code}, "Tushare十大股东"), "Tushare十大股东",
+                 (tool_map["tushare_top10_holders"], {"code": clean_code}))
+        else: _placeholder("Tushare十大股东", "[tushare_top10_holders] 工具不可用")
 
         if "tushare_ev_ebitda" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_ev_ebitda"], {"code": clean_code}, "Tushare EV/EBITDA"), "Tushare EV/EBITDA")
-        else:
-            labels.append("Tushare EV/EBITDA"); tasks.append(_noop_result("[tushare_ev_ebitda] 工具不可用"))
+            _add(_call_tool_safe(tool_map["tushare_ev_ebitda"], {"code": clean_code}, "Tushare EV/EBITDA"), "Tushare EV/EBITDA",
+                 (tool_map["tushare_ev_ebitda"], {"code": clean_code}))
+        else: _placeholder("Tushare EV/EBITDA", "[tushare_ev_ebitda] 工具不可用")
 
         if "tushare_st_status" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_st_status"], {"code": clean_code}, "Tushare ST状态"), "Tushare ST状态")
-        else:
-            labels.append("Tushare ST状态"); tasks.append(_noop_result("[tushare_st_status] 工具不可用"))
+            _add(_call_tool_safe(tool_map["tushare_st_status"], {"code": clean_code}, "Tushare ST状态"), "Tushare ST状态",
+                 (tool_map["tushare_st_status"], {"code": clean_code}))
+        else: _placeholder("Tushare ST状态", "[tushare_st_status] 工具不可用")
 
         if "tushare_dividend" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_dividend"], {"code": clean_code}, "Tushare分红"), "Tushare分红")
-        else:
-            labels.append("Tushare分红"); tasks.append(_noop_result("[tushare_dividend] 工具不可用"))
+            _add(_call_tool_safe(tool_map["tushare_dividend"], {"code": clean_code}, "Tushare分红"), "Tushare分红",
+                 (tool_map["tushare_dividend"], {"code": clean_code}))
+        else: _placeholder("Tushare分红", "[tushare_dividend] 工具不可用")
 
         if "get_st_risk_data" in tool_map:
-            _add(_call_tool_safe(tool_map["get_st_risk_data"], {"code": stock_code}, "ST风险数据"), "ST风险数据")
-        else:
-            labels.append("ST风险数据"); tasks.append(_noop_result("[get_st_risk_data] 工具不可用"))
+            _add(_call_tool_safe(tool_map["get_st_risk_data"], {"code": stock_code}, "ST风险数据"), "ST风险数据",
+                 (tool_map["get_st_risk_data"], {"code": stock_code}))
+        else: _placeholder("ST风险数据", "[get_st_risk_data] 工具不可用")
 
         # --- 财务报表类工具（需要 year + quarter） ---
         fin_tools_params = [
@@ -265,38 +272,44 @@ async def fundamental_agent(state: AgentState) -> AgentState:
         for tool_name, label_base in fin_tools_params:
             if tool_name in tool_map:
                 t = tool_map[tool_name]
-                _add(_call_tool_safe(t, {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]},
-                                     f"{label_base}({q_latest['year']}Q{q_latest['quarter']})"),
-                     f"{label_base}(最新)")
-                _add(_call_tool_safe(t, {"code": clean_code, "year": q_prior["year"], "quarter": q_prior["quarter"]},
-                                     f"{label_base}({q_prior['year']}Q{q_prior['quarter']})"),
-                     f"{label_base}(上期)")
+                kw_latest = {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]}
+                kw_prior = {"code": clean_code, "year": q_prior["year"], "quarter": q_prior["quarter"]}
+                _add(_call_tool_safe(t, kw_latest, f"{label_base}({q_latest['year']}Q{q_latest['quarter']})"),
+                     f"{label_base}(最新)", (t, kw_latest))
+                _add(_call_tool_safe(t, kw_prior, f"{label_base}({q_prior['year']}Q{q_prior['quarter']})"),
+                     f"{label_base}(上期)", (t, kw_prior))
             else:
-                labels.append(f"{label_base}(最新)"); tasks.append(_noop_result(f"[{tool_name}] 工具不可用"))
-                labels.append(f"{label_base}(上期)"); tasks.append(_noop_result(f"[{tool_name}] 工具不可用"))
+                _placeholder(f"{label_base}(最新)", f"[{tool_name}] 工具不可用")
+                _placeholder(f"{label_base}(上期)", f"[{tool_name}] 工具不可用")
 
         # --- 分红数据（需要 year + year_type） ---
         if "get_dividend_data" in tool_map:
-            _add(_call_tool_safe(tool_map["get_dividend_data"],
-                                 {"code": clean_code, "year": q_latest["year"], "year_type": "report"},
-                                 f"分红数据({q_latest['year']})"), "分红数据")
+            kw_div = {"code": clean_code, "year": q_latest["year"], "year_type": "report"}
+            _add(_call_tool_safe(tool_map["get_dividend_data"], kw_div, f"分红数据({q_latest['year']})"),
+                 "分红数据", (tool_map["get_dividend_data"], kw_div))
         else:
-            labels.append("分红数据"); tasks.append(_noop_result("[get_dividend_data] 工具不可用"))
+            _placeholder("分红数据", "[get_dividend_data] 工具不可用")
 
         # --- 复权因子（需要 start_date, end_date） ---
         if "get_adjust_factor_data" in tool_map:
-            _add(_call_tool_safe(tool_map["get_adjust_factor_data"],
-                                 {"code": clean_code, "start_date": "2023-01-01", "end_date": current_date},
-                                 "复权因子"), "复权因子")
+            kw_adj = {"code": clean_code, "start_date": "2023-01-01", "end_date": current_date}
+            _add(_call_tool_safe(tool_map["get_adjust_factor_data"], kw_adj, "复权因子"),
+                 "复权因子", (tool_map["get_adjust_factor_data"], kw_adj))
         else:
-            labels.append("复权因子"); tasks.append(_noop_result("[get_adjust_factor_data] 工具不可用"))
+            _placeholder("复权因子", "[get_adjust_factor_data] 工具不可用")
 
-        # 并行执行所有任务
+        # 并行执行所有任务（第一轮）
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as gather_err:
             logger.error(f"{ERROR_ICON} FundamentalAgent: Phase 1 并行调用异常: {gather_err}")
             results = [f"并行调用异常: {gather_err}"] * len(tasks)
+
+        # 空数据重试（最多额外2轮，覆盖率100%则提前跳出）
+        results = await retry_failed_fetches(
+            results, tool_infos, labels, _call_tool_safe,
+            agent_label="FundamentalAgent",
+        )
 
         # 处理异常结果
         safe_results = []
@@ -307,8 +320,9 @@ async def fundamental_agent(state: AgentState) -> AgentState:
                 safe_results.append(str(r) if r else "[空返回]")
 
         phase1_elapsed = time.time() - phase1_start
-        success_count = sum(1 for r in safe_results if "数据不可用" not in str(r) and "工具不可用" not in str(r) and "工具调用异常" not in str(r) and "空返回" not in str(r))
-        logger.info(f"{SUCCESS_ICON} FundamentalAgent: Phase 1 完成 ({phase1_elapsed:.1f}s, {success_count}/{len(labels)} 个工具有效数据)")
+        success_count = sum(1 for r in safe_results if not is_empty_result(str(r)))
+        total_real = len([ti for ti in tool_infos if ti is not None])
+        logger.info(f"{SUCCESS_ICON} FundamentalAgent: Phase 1 完成 ({phase1_elapsed:.1f}s, {success_count}/{total_real} 个工具有效数据)")
 
         # 聚合数据
         data_sections = []
@@ -380,6 +394,12 @@ async def fundamental_agent(state: AgentState) -> AgentState:
 7. 综合评估
    - 基本面优势总结
    - 基本面风险提示
+
+重要限制：
+- 请专注于财务数据和基本面指标分析，不要分析新闻信息
+- 分析必须有数据支撑，引用上述原始数据中的具体数字，避免空洞的定性描述
+- 如果某些数据无法获取，请说明原因并基于可用数据提供分析
+- 不要使用模型训练数据中的知识来补充数据事实
 
 ⛔ 输出格式要求（防幻觉机制）：
 请将分析输出严格分为两个区域：

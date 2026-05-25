@@ -19,6 +19,7 @@ from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAI
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
 from src.utils.model_config import get_model_config_for_agent
+from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 
 load_dotenv(override=True)
 
@@ -186,10 +187,15 @@ async def value_agent(state: AgentState) -> AgentState:
 
         tasks = []
         labels = []
+        tool_infos = []  # (tool, kwargs) 用于空数据重试
 
-        def _add(task, label):
+        def _add(task, label, ti=None):
             tasks.append(task)
             labels.append(label)
+            tool_infos.append(ti)
+
+        def _placeholder(label, msg):
+            labels.append(label); tasks.append(_noop_result(msg)); tool_infos.append(None)
 
         # --- 纯代码类工具 ---
         code_tools = [
@@ -209,10 +215,9 @@ async def value_agent(state: AgentState) -> AgentState:
                 kwargs = {"code": clean_code}
                 if tname == "get_stock_industry":
                     kwargs["date"] = current_date
-                _add(_call_tool_safe(tool_map[tname], kwargs, label), label)
+                _add(_call_tool_safe(tool_map[tname], kwargs, label), label, (tool_map[tname], kwargs))
             else:
-                labels.append(label)
-                tasks.append(_noop_result(f"[{tname}] 工具不可用"))
+                _placeholder(label, f"[{tname}] 工具不可用")
 
         # --- 财务报表类工具 ---
         fin_tools_params = [
@@ -225,33 +230,36 @@ async def value_agent(state: AgentState) -> AgentState:
         for tool_name, label_base in fin_tools_params:
             if tool_name in tool_map:
                 t = tool_map[tool_name]
-                _add(_call_tool_safe(t, {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]},
-                                     f"{label_base}({q_latest['year']}Q{q_latest['quarter']})"),
-                     f"{label_base}(最新)")
-                _add(_call_tool_safe(t, {"code": clean_code, "year": q_prior["year"], "quarter": q_prior["quarter"]},
-                                     f"{label_base}({q_prior['year']}Q{q_prior['quarter']})"),
-                     f"{label_base}(上期)")
+                kw_latest = {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]}
+                kw_prior = {"code": clean_code, "year": q_prior["year"], "quarter": q_prior["quarter"]}
+                _add(_call_tool_safe(t, kw_latest, f"{label_base}({q_latest['year']}Q{q_latest['quarter']})"),
+                     f"{label_base}(最新)", (t, kw_latest))
+                _add(_call_tool_safe(t, kw_prior, f"{label_base}({q_prior['year']}Q{q_prior['quarter']})"),
+                     f"{label_base}(上期)", (t, kw_prior))
             else:
-                labels.append(f"{label_base}(最新)")
-                labels.append(f"{label_base}(上期)")
-                tasks.append(_noop_result(f"[{tool_name}] 工具不可用"))
-                tasks.append(_noop_result(f"[{tool_name}] 工具不可用"))
+                _placeholder(f"{label_base}(最新)", f"[{tool_name}] 工具不可用")
+                _placeholder(f"{label_base}(上期)", f"[{tool_name}] 工具不可用")
 
         # --- 分红数据 ---
         if "get_dividend_data" in tool_map:
-            _add(_call_tool_safe(tool_map["get_dividend_data"],
-                                 {"code": clean_code, "year": q_latest["year"], "year_type": "report"},
-                                 f"分红数据({q_latest['year']})"), "分红数据")
+            kw_div = {"code": clean_code, "year": q_latest["year"], "year_type": "report"}
+            _add(_call_tool_safe(tool_map["get_dividend_data"], kw_div, f"分红数据({q_latest['year']})"),
+                 "分红数据", (tool_map["get_dividend_data"], kw_div))
         else:
-            labels.append("分红数据")
-            tasks.append(_noop_result("[get_dividend_data] 工具不可用"))
+            _placeholder("分红数据", "[get_dividend_data] 工具不可用")
 
-        # 并行执行
+        # 并行执行（第一轮）
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as gather_err:
             logger.error(f"{ERROR_ICON} ValueAgent: Phase 1 并行调用异常: {gather_err}")
             results = [f"并行调用异常: {gather_err}"] * len(tasks)
+
+        # 空数据重试（最多额外2轮，覆盖率100%则提前跳出）
+        results = await retry_failed_fetches(
+            results, tool_infos, labels, _call_tool_safe,
+            agent_label="ValueAgent",
+        )
 
         safe_results = []
         for r in results:
@@ -261,8 +269,9 @@ async def value_agent(state: AgentState) -> AgentState:
                 safe_results.append(str(r) if r else "[空返回]")
 
         phase1_elapsed = time.time() - phase1_start
-        success_count = sum(1 for r in safe_results if "数据不可用" not in str(r) and "工具不可用" not in str(r) and "工具调用异常" not in str(r) and "空返回" not in str(r))
-        logger.info(f"{SUCCESS_ICON} ValueAgent: Phase 1 完成 ({phase1_elapsed:.1f}s, {success_count}/{len(labels)} 个工具有效数据)")
+        success_count = sum(1 for r in safe_results if not is_empty_result(str(r)))
+        total_real = len([ti for ti in tool_infos if ti is not None])
+        logger.info(f"{SUCCESS_ICON} ValueAgent: Phase 1 完成 ({phase1_elapsed:.1f}s, {success_count}/{total_real} 个工具有效数据)")
 
         data_sections = []
         for label, result in zip(labels, safe_results):

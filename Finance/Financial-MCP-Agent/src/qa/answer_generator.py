@@ -325,6 +325,17 @@ def format_answer(text: str) -> str:
     """回答后处理：机械修复常见 Markdown 排版问题"""
     import re
 
+    # 预清理：LLM 偶尔输出被引号包裹的文本（模型误读系统提示中的 Markdown 代码块）
+    # 1) 去掉标题前的引号: "## X" → ## X
+    text = re.sub(r'"\s*(#{1,3}\s)', r'\1', text)
+    # 2) 去掉标题行尾的引号: ## X" → ## X
+    text = re.sub(r'(##[^#\n]+?)"+', r'\1', text)
+    # 3) 去掉文本中的连续空引号对: 从""当前"" → 从当前
+    text = re.sub(r'""', '', text)
+    # 4) 去掉行首行尾孤立引号
+    text = re.sub(r'^"', '', text, flags=re.MULTILINE)
+    text = re.sub(r'"$', '', text, flags=re.MULTILINE)
+
     lines = text.split('\n')
     result = []
     prev_empty = False

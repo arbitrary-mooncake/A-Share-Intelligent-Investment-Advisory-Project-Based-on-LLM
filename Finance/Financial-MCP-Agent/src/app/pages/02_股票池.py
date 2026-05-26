@@ -465,6 +465,7 @@ for key in list(st.session_state.keys()):
         finally:
             st.session_state.pop(key, None)
             _refresh_pool("fine")
+            st.rerun()
 
 # 快筛打分轮询
 for code_key in list(st.session_state.keys()):
@@ -516,6 +517,7 @@ for code_key in list(st.session_state.keys()):
         finally:
             st.session_state.pop(code_key, None)
             _refresh_pool(tk)
+            st.rerun()
 
 # ──────────────────────────────────────────────
 # 报告生成状态（Tab 外，避免切换丢失）

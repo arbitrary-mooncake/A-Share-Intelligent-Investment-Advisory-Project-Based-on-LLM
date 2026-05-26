@@ -20,11 +20,23 @@ from src.utils.industry_knowledge import (
     identify_industry,
     INDUSTRY_BENCHMARKS,
 )
+from src.utils.model_config import get_model_config_for_agent
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
+
+
+def _build_extra_body(base_url: str, thinking_enabled: bool) -> dict:
+    """根据 API 提供商返回正确的 thinking 参数格式"""
+    if not thinking_enabled:
+        return {}
+    if "dashscope" in base_url:
+        # DashScope / Qwen 使用 enable_thinking 参数
+        return {"enable_thinking": True}
+    # OpenAI 兼容格式（MiMo, Kimi 等）
+    return {"thinking": {"type": "enabled"}}
 
 
 async def short_term_scorer(
@@ -35,6 +47,10 @@ async def short_term_scorer(
     current_time_info: str = "",
     current_date: str = "",
     query: str = "",
+    model_name: str = "",
+    model_api_key: str = "",
+    model_base_url: str = "",
+    thinking_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     短线投资打分 (1-5个交易日持仓)
@@ -68,20 +84,23 @@ async def short_term_scorer(
     industry_short_guidance = _get_short_term_industry_guidance(detected_industry)
 
     try:
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+        # 模型配置：优先显式参数（快筛覆盖），否则使用 agent 分配的模型 (Qwen3.6-Plus)
+        model_cfg = get_model_config_for_agent("short_term_scorer")
+        api_key = model_api_key or model_cfg["api_key"]
+        base_url = model_base_url or model_cfg["base_url"]
+        resolved_model = model_name or model_cfg["model_name"]
 
-        if not all([api_key, base_url, model_name]):
+        if not all([api_key, base_url, resolved_model]):
             raise ValueError("缺少OpenAI环境变量")
 
         llm = ChatOpenAI(
-            model=model_name,
+            model=resolved_model,
             api_key=api_key,
             base_url=base_url,
             temperature=1.0,
+            request_timeout=360,
             max_tokens=16000,
-            extra_body={"thinking": {"type": "enabled"}}
+            extra_body=_build_extra_body(base_url, thinking_enabled)
         )
 
         system_prompt = f"""你是一位资深A股短线交易专家，专注于1-5个交易日的短线操作策略。
@@ -202,6 +221,13 @@ async def short_term_scorer(
     "recommendation": "短线建议（强烈买入/买入/谨慎买入/观望/谨慎卖出/卖出/强烈卖出）",
     "reasoning": "打分核心理由（2-3句话，指出最关键的1-2个因素）",
     "risk_warning": "短线风险提示（1句话，指出最大风险点）",
+    "data_basis": {{
+        "volume_price": "列出本维度评分依据的具体数据点",
+        "technical_signal": "列出本维度评分依据的具体数据点",
+        "trend_momentum": "列出本维度评分依据的具体数据点",
+        "sentiment_flow": "列出本维度评分依据的具体数据点"
+    }},
+    "data_reliability": "数据可靠性(高/中/低)，注明哪些基于直接数据，哪些基于推断",
     "suggested_action": "具体操作建议（1-2句话，含止损价位参考）"
 }}
 
@@ -209,8 +235,8 @@ async def short_term_scorer(
 
 1. 所有分数必须是**整数**，不能是小数
 2. 各子项分数之和必须等于总分
-3. 打分必须基于提供的分析数据，不能凭空臆断
-4. 如果某些数据缺失（如没有新闻分析），请说明并在其他维度中适当调整权重
+3. **评分前必须先列出每个维度的数据依据**（见data_basis字段），数据不充分时必须在data_reliability中标注"低"
+4. 打分必须基于提供的分析数据，不能凭空臆断；如果某项数据缺失，在data_basis中标注"无直接数据，基于已有信息推断"
 5. 短线打分应以**价格行为和量价关系**为核心
 6. 输出必须是纯JSON，不要包含markdown代码块标记
 """
@@ -269,7 +295,7 @@ async def short_term_scorer(
             interaction_type="short_term_scoring",
             input_messages=messages,
             output_content=json_mod.dumps(score_data, ensure_ascii=False),
-            model_config={"model": model_name, "temperature": 1.0, "max_tokens": 16000, "thinking": "enabled"},
+            model_config={"model": resolved_model, "temperature": 1.0, "max_tokens": 16000, "thinking": "enabled" if thinking_enabled else "disabled"},
             execution_time=llm_time
         )
 

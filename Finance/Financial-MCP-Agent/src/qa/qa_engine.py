@@ -20,7 +20,7 @@ from src.qa.evidence_assembler import (
     assemble_evidence_react,
     EvidencePackage,
 )
-from src.qa.answer_generator import generate_answer_stream
+from src.qa.answer_generator import generate_answer_stream, format_answer
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 
 logger = setup_logger(__name__)
@@ -66,16 +66,7 @@ async def process_question(
         f"触发={complexity.triggers}, ReAct={complexity.recommended_react}"
     )
 
-    # 如果需要澄清
-    if complexity.need_clarify:
-        yield _sse_event("clarify", {
-            "message": "我需要确认一下：您指的是哪只股票或哪个板块？请补充股票代码或名称。",
-            "session_id": actual_session_id,
-        })
-        yield "data: [DONE]\n\n"
-        return
-
-    # Step 2: 提取股票信息
+    # Step 2: 提取股票信息（优先于澄清检查，因会话上下文可消歧）
     stock_code, company_name = extract_stock_from_question(
         question,
         session_stock_code=session.last_stock_code or "",
@@ -85,6 +76,7 @@ async def process_question(
     # 无股票代码时尝试主题匹配
     topic_context = ""
     matched_topic_name = ""
+    topic_rep_stocks: list = []  # [(code, name), ...] 代表性个股供并行拉取数据
     if not stock_code and not company_name:
         topic_info = match_topic(question)
         if topic_info:
@@ -92,15 +84,25 @@ async def process_question(
             etf = topic_data["etfs"][0]
             stock_code = etf[0]
             company_name = f"{matched_topic_name}主题({etf[1]})"
+            topic_rep_stocks = topic_data["stocks"][:5]  # 最多5只代表股
             # 构建主题上下文供LLM参考
-            related = [f"{c}({n})" for c, n in topic_data["stocks"][:3]]
+            related = [f"{c}({n})" for c, n in topic_rep_stocks]
             topic_context = (
-                f"[主题匹配] 用户询问{matched_topic_name}相关话题。使用代表性ETF {stock_code} "
-                f"作为主要数据源。相关A股标的: {', '.join(related)}。"
-                f"请基于A股{matched_topic_name}相关标的数据进行分析，注意区分A股黄金相关标的"
-                f"与国际金价的差异。"
+                f"[主题匹配] 用户询问{matched_topic_name}板块/赛道。"
+                f"使用代表性ETF {stock_code} 作为基准数据源，"
+                f"代表性个股: {', '.join(related)}。"
+                f"请优先使用已获取的ETF行情数据和板块成分股数据进行客观分析，"
+                f"辅以行业常识，避免仅凭旧知识即兴发挥。"
+                f"如板块成分股数据已获取，请从中选取龙头标的重点分析。"
             )
             logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")
+
+    # 澄清检查：已尝试所有消歧手段（问题文本+会话上下文+主题匹配）仍无标的时才反问
+    if complexity.need_clarify and not stock_code and not company_name:
+        clarify_msg = "我需要确认一下您具体想了解哪只股票或哪个板块，请提供股票名称，我会自动为您查找对应的信息。"
+        yield f"event: clarify\ndata: {clarify_msg}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     if stock_code:
         session_mgr.update_context(
@@ -120,7 +122,8 @@ async def process_question(
     # Step 3: 任务规划
     history_text = _build_history_text(session)
     task_plan = plan_task(question, complexity.level, history_text,
-                          topic_name=matched_topic_name)
+                          topic_name=matched_topic_name,
+                          stock_code=stock_code or "", company_name=company_name or "")
 
     logger.info(
         f"QA Engine: 任务规划 — 数据域={task_plan.domains}, "
@@ -144,6 +147,8 @@ async def process_question(
         evidence = await _assemble_with_fallback(
         task_plan, complexity, stock_code or "", company_name or "",
         question, current_date, current_time_info, actual_session_id,
+        topic_name=matched_topic_name,
+        representative_stocks=topic_rep_stocks,
     )
 
     # ── 运行时升级（Layer 3） ──
@@ -212,11 +217,12 @@ async def process_question(
             history_text=history_text,
             current_date=current_date,
         ):
-            # 拦截 [DONE]：先保存再发送，确保前端拉取时数据已落地
+            # 拦截 [DONE]：先格式化排版再保存，确保前端拉取时数据已落地
             if chunk.strip() == "data: [DONE]":
                 if full_answer.strip():
+                    formatted = format_answer(full_answer.strip())
                     session.add_message("user", question)
-                    session.add_message("assistant", full_answer.strip())
+                    session.add_message("assistant", formatted)
                     session_mgr.save_session(actual_session_id)
                 yield chunk
                 llm_success = True
@@ -236,8 +242,9 @@ async def process_question(
         yield "data: [DONE]\n\n"
         full_answer = fallback
         if full_answer.strip():
+            formatted = format_answer(full_answer.strip())
             session.add_message("user", question)
-            session.add_message("assistant", full_answer.strip())
+            session.add_message("assistant", formatted)
             session_mgr.save_session(actual_session_id)
 
     total_time = time.time() - start_time
@@ -265,6 +272,8 @@ async def process_question(
 async def _assemble_with_fallback(
     task_plan, complexity, stock_code, company_name,
     question, current_date, current_time_info, session_id,
+    topic_name: str = "",
+    representative_stocks: list = None,
 ) -> EvidencePackage:
     """证据装配 + 降级保护"""
     try:
@@ -280,6 +289,8 @@ async def _assemble_with_fallback(
                 stock_code, company_name,
                 task_plan.tools, question, current_date,
                 session_id=session_id,
+                topic_name=topic_name,
+                representative_stocks=representative_stocks,
             )
     except Exception as e:
         logger.error(f"{ERROR_ICON} QA Engine: 证据装配失败: {e}")

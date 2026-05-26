@@ -28,10 +28,17 @@ def _strip_exchange_prefix(code: str) -> str:
     return code
 
 
+_akshare_module = None
+
+
 def _ensure_akshare():
-    """Lazy import check for akshare."""
+    """Lazy import check for akshare. Caches the module to avoid repeated slow imports."""
+    global _akshare_module
+    if _akshare_module is not None:
+        return _akshare_module
     try:
         import akshare
+        _akshare_module = akshare
         return akshare
     except ImportError:
         raise DataSourceError("akshare is not installed. Run: pip install akshare")
@@ -39,8 +46,8 @@ def _ensure_akshare():
 
 class AkshareDataSource(FinancialDataSource):
     """
-    AKshare-based implementation of FinancialDataSource.
-    AKshare does not require login, so all methods are direct API calls.
+    AKshare-based data source. Uses Sina HTTP for K-line (akshare's wrapper crashes on Windows),
+    Sina code_name list for basic info, with Tencent/East Money as fallbacks.
     """
 
     # ---- K-line data ----
@@ -53,60 +60,95 @@ class AkshareDataSource(FinancialDataSource):
         adjust_flag: str = "3",
         fields: Optional[List[str]] = None,
     ) -> pd.DataFrame:
-        ak = _ensure_akshare()
         symbol = _strip_exchange_prefix(code)
-        logger.info(f"[AKshare] K-line data for {code}, {start_date}~{end_date}, freq={frequency}, adjust={adjust_flag}")
+        logger.info(f"[AKshare] K-line for {code}, {start_date}~{end_date}, freq={frequency}")
 
-        # Map adjust_flag: Baostock 1=前复权, 2=后复权, 3=不复权
-        # AKshare Sina: "qfq"=前复权, "hfq"=后复权, ""=不复权
-        adjust_map = {"1": "qfq", "2": "hfq", "3": ""}
-        adjust = adjust_map.get(adjust_flag, "")
+        # Build Sina code format: sh600519 / sz000001
+        if symbol.startswith(("sh", "sz")):
+            sina_code = symbol
+        elif symbol.startswith("6") or symbol.startswith("688"):
+            sina_code = f"sh{symbol}"
+        else:
+            sina_code = f"sz{symbol}"
 
-        # Try Sina first (more reliable in some environments)
-        last_error = None
+        # 1. Sina HTTP K-line (direct, no akshare wrapper)
         try:
-            # Sina API uses symbol with exchange prefix: sh603871
-            sina_symbol = symbol
-            if not sina_symbol.startswith(("sh", "sz")):
-                # Determine exchange from code
-                if symbol.startswith("6"):
-                    sina_symbol = f"sh{symbol}"
-                else:
-                    sina_symbol = f"sz{symbol}"
-
-            df = ak.stock_zh_a_daily(symbol=sina_symbol, start_date=start_date, end_date=end_date, adjust=adjust)
-            if df is None or df.empty:
-                raise NoDataFoundError(f"[AKshare] No K-line data for {code} in {start_date}~{end_date}")
-            # Sina returns date as index or 'date' column
-            if "date" not in df.columns and df.index.name == "date":
-                df = df.reset_index()
-            df["code"] = code
-            logger.info(f"[AKshare] Retrieved {len(df)} K-line records for {code} (Sina)")
-            return self._normalize_kline_fields(df, fields)
-        except Exception as e:
-            last_error = e
-            logger.debug(f"[AKshare] Sina K-line failed: {e}, trying East Money...")
-
-        # Fallback to East Money
-        try:
-            period_map = {"d": "daily", "w": "weekly", "m": "monthly"}
-            period = period_map.get(frequency, "daily")
-            df = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period=period,
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
-                adjust=adjust,
+            import requests, json
+            days_needed = 1100
+            url = (
+                "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                f"CN_MarketData.getKLineData?symbol={sina_code}&scale=240&ma=no&datalen={days_needed}"
             )
-            if df is None or df.empty:
-                raise NoDataFoundError(f"[AKshare] No K-line data for {code} in {start_date}~{end_date}")
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            raw_data = json.loads(resp.text.strip())
+            if not raw_data:
+                raise ValueError("Sina K-line returned empty")
+
+            rows = []
+            for item in raw_data:
+                rows.append({
+                    "date": item.get("day", ""),
+                    "open": item.get("open", ""),
+                    "high": item.get("high", ""),
+                    "low": item.get("low", ""),
+                    "close": item.get("close", ""),
+                    "volume": item.get("volume", ""),
+                })
+            df = pd.DataFrame(rows)
+            # Filter by date range
+            if "date" in df.columns:
+                df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
+            if df.empty:
+                raise NoDataFoundError(f"No K-line data for {code} in range")
             df["code"] = code
-            logger.info(f"[AKshare] Retrieved {len(df)} K-line records for {code} (East Money)")
+            # Compute pctChg
+            if "close" in df.columns:
+                df["close_f"] = pd.to_numeric(df["close"], errors="coerce")
+                df["pctChg"] = df["close_f"].pct_change() * 100
+                df.drop(columns=["close_f"], inplace=True)
+            logger.info(f"[AKshare] {len(df)} K-line rows via Sina HTTP for {code}")
             return self._normalize_kline_fields(df, fields)
-        except NoDataFoundError:
-            raise
         except Exception as e:
-            raise DataSourceError(f"[AKshare] K-line data error for {code}: {e}")
+            logger.debug(f"[AKshare] Sina HTTP K-line failed: {e}")
+
+        # 2. Tencent HTTP K-line fallback
+        try:
+            import requests, json
+            from datetime import datetime, timedelta
+            tx_code = f"sh{symbol}" if (symbol.startswith("6") or symbol.startswith("688")) else f"sz{symbol}"
+            start_d = (datetime.now() - timedelta(days=1100)).strftime("%Y-%m-%d")
+            url = (
+                f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+                f"?param={tx_code},day,{start_d},,1100,qfq"
+            )
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            data = json.loads(resp.text)
+            day_data = None
+            stock_info = data.get("data", {}).get(tx_code, {})
+            day_data = stock_info.get("qfqday") or stock_info.get("day")
+            if not day_data:
+                raise ValueError("Tencent K-line empty")
+            rows = []
+            for item in day_data:
+                rows.append({
+                    "date": item[0], "open": item[1], "close": item[2],
+                    "high": item[3], "low": item[4], "volume": item[5],
+                })
+            df = pd.DataFrame(rows)
+            if "date" in df.columns:
+                df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
+            df["code"] = code
+            if "close" in df.columns:
+                df["close_f"] = pd.to_numeric(df["close"], errors="coerce")
+                df["pctChg"] = df["close_f"].pct_change() * 100
+                df.drop(columns=["close_f"], inplace=True)
+            logger.info(f"[AKshare] {len(df)} K-line rows via Tencent for {code}")
+            return self._normalize_kline_fields(df, fields)
+        except Exception as e2:
+            logger.debug(f"[AKshare] Tencent K-line also failed: {e2}")
+
+        raise DataSourceError(f"All K-line sources failed for {code}")
 
     def _normalize_kline_fields(self, df: pd.DataFrame, fields: Optional[List[str]]) -> pd.DataFrame:
         """Normalize K-line column names from various AKshare sources."""
@@ -134,7 +176,23 @@ class AkshareDataSource(FinancialDataSource):
         symbol = _strip_exchange_prefix(code)
         logger.info(f"[AKshare] Basic info for {code}")
 
-        # Try East Money first
+        # 1. Sina code name list (reliable, no East Money dependency)
+        try:
+            all_stocks = ak.stock_info_a_code_name()
+            if all_stocks is not None and not all_stocks.empty:
+                row = all_stocks[all_stocks["code"] == symbol]
+                if not row.empty:
+                    df = pd.DataFrame({
+                        "code": [code],
+                        "code_name": [row.iloc[0]["name"]],
+                        "tradeStatus": ["1"],
+                    })
+                    logger.info(f"[AKshare] Basic info for {code} (Sina code_name)")
+                    return df
+        except Exception as e:
+            logger.debug(f"[AKshare] Sina code_name basic info failed: {e}")
+
+        # 2. East Money fallback
         try:
             df = ak.stock_individual_info_em(symbol=symbol)
             if df is not None and not df.empty:
@@ -148,26 +206,10 @@ class AkshareDataSource(FinancialDataSource):
                         df["code_name"] = None
                     if "tradeStatus" not in df.columns:
                         df["tradeStatus"] = "1"
-                logger.info(f"[AKshare] Retrieved basic info for {code} (East Money)")
+                logger.info(f"[AKshare] Basic info for {code} (East Money)")
                 return df
         except Exception as e:
             logger.debug(f"[AKshare] East Money basic info failed: {e}")
-
-        # Fallback: use stock_info_a_code_name
-        try:
-            all_stocks = ak.stock_info_a_code_name()
-            if all_stocks is not None and not all_stocks.empty:
-                row = all_stocks[all_stocks["code"] == symbol]
-                if not row.empty:
-                    df = pd.DataFrame({
-                        "code": [code],
-                        "code_name": [row.iloc[0]["name"]],
-                        "tradeStatus": ["1"],
-                    })
-                    logger.info(f"[AKshare] Retrieved basic info for {code} (Sina)")
-                    return df
-        except Exception as e:
-            logger.debug(f"[AKshare] Sina basic info failed: {e}")
 
         raise NoDataFoundError(f"[AKshare] No basic info for {code}")
 

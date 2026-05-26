@@ -79,6 +79,8 @@ async def assemble_evidence_fast(
     question: str,
     current_date: str,
     session_id: str = "",
+    topic_name: str = "",
+    representative_stocks: list = None,
 ) -> EvidencePackage:
     """
     快路径：并行拉取所有所需工具的数据，组装为证据包。
@@ -93,16 +95,31 @@ async def assemble_evidence_fast(
         domains_queried=[],
     )
 
-    # 无股票代码时，跳过 MCP 工具调用，给出明确提示
+    # 无股票代码时：仅当请求的全部是宏观/市场类工具（无需代码）时才继续
+    _NO_CODE_TOOLS = {
+        "get_deposit_rate_data", "get_loan_rate_data",
+        "get_required_reserve_ratio_data", "get_money_supply_data_month",
+        "get_money_supply_data_year", "get_latest_trading_date",
+        "get_market_analysis_timeframe", "get_trade_dates", "get_all_stock",
+        "get_sz50_stocks", "get_hs300_stocks", "get_zz500_stocks",
+        "tushare_concept_list", "tushare_ths_index", "tushare_dc_index",
+        "tushare_search_stock",
+        "tushare_cn_cpi", "tushare_cn_gdp", "tushare_cn_pmi",
+        "tushare_cn_ppi", "tushare_cn_m", "tushare_shibor",
+        "tushare_fx_daily", "tushare_eco_cal",
+    }
     if not stock_code and not company_name:
-        evidence.raw_text = (
-            "当前问题未指定具体的A股股票或公司，且A股数据工具主要覆盖个股、行业和板块数据。"
-            "对于黄金、商品期货、宏观经济等非A股标的的问题，请基于现有知识和行业理解作答，"
-            "明确说明数据来源限制，不编造任何数据。"
-        )
-        evidence.tool_call_summary = "无股票代码，跳过数据获取"
-        evidence.missing.append("未指定A股标的")
-        return evidence
+        if tools and all(t in _NO_CODE_TOOLS for t in tools):
+            pass  # 宏观/市场类查询，无需股票代码，继续执行
+        else:
+            evidence.raw_text = (
+                "当前问题未指定具体的A股股票或公司，且A股数据工具主要覆盖个股、行业和板块数据。"
+                "对于黄金、商品期货、宏观经济等非A股标的的问题，请基于现有知识和行业理解作答，"
+                "明确说明数据来源限制，不编造任何数据。"
+            )
+            evidence.tool_call_summary = "无股票代码，跳过数据获取"
+            evidence.missing.append("未指定A股标的")
+            return evidence
 
     # 获取 MCP 工具（含重试）
     all_mcp_tools = None
@@ -139,11 +156,29 @@ async def assemble_evidence_fast(
     tasks = []
     labels = []
     for tool in all_mcp_tools:
-        kwargs = _build_tool_kwargs(tool.name, stock_code, company_name, question, current_date)
+        kwargs = _build_tool_kwargs(tool.name, stock_code, company_name, question, current_date, topic_name)
         tasks.append(_call_tool_safe(tool, kwargs, TOOL_TIMEOUT, tool.name, session_id))
         labels.append(tool.name)
 
     results = await asyncio.gather(*tasks)
+
+    # 板块/主题查询：并行拉取代表性个股的估值+基本信息+近K线
+    if representative_stocks:
+        _REP_TOOLS = ["get_stock_basic_info", "tushare_daily_basic", "tushare_kline"]
+        rep_tool_map = {t.name: t for t in all_mcp_tools}
+        rep_tasks = []
+        rep_labels = []
+        for rep_code, rep_name in representative_stocks:
+            for tname in _REP_TOOLS:
+                tool = rep_tool_map.get(tname)
+                if tool:
+                    rep_kwargs = _build_tool_kwargs(tname, rep_code, rep_name, question, current_date, topic_name)
+                    rep_tasks.append(_call_tool_safe(tool, rep_kwargs, TOOL_TIMEOUT, f"{tname}({rep_name})", session_id))
+                    rep_labels.append(f"{tname}({rep_name})")
+        if rep_tasks:
+            rep_results = await asyncio.gather(*rep_tasks)
+            labels.extend(rep_labels)
+            results = list(results) + list(rep_results)
 
     # 组装原始文本
     raw_parts = []
@@ -200,6 +235,9 @@ async def assemble_evidence_react(
         "get_growth_data", "get_dupont_data",
         "crawl_news", "tushare_st_status", "get_st_risk_data",
         "get_latest_trading_date", "get_market_analysis_timeframe",
+        "tushare_search_stock", "tushare_stock_info",
+        "tushare_concept_list", "tushare_hsgt_flow",
+        "tushare_top10_holders", "tushare_news",
     ]
     try:
         all_mcp_tools = await get_mcp_tools(tool_filter=_REACT_TOOL_FILTER)
@@ -251,7 +289,8 @@ async def assemble_evidence_react(
 
 
 def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
-                        question: str, current_date: str = "") -> dict:
+                        question: str, current_date: str = "",
+                        topic_name: str = "") -> dict:
     """根据工具名构建合适的参数（含日期计算）"""
     clean_code = stock_code.replace("sh.", "").replace("sz.", "") if stock_code else ""
     code = stock_code or ""
@@ -263,7 +302,7 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
     except ValueError:
         base_date = datetime.now()
     this_year = str(base_date.year)
-    this_quarter = str((base_date.month - 1) // 3 + 1)
+    this_quarter = (base_date.month - 1) // 3 + 1  # int, 财务工具期望整数
     start_date = (base_date - timedelta(days=180)).strftime("%Y-%m-%d")
     end_date = base_date.strftime("%Y-%m-%d")
 
@@ -271,23 +310,29 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         # 行情类
         "get_stock_basic_info": {"code": code},
         "get_historical_k_data": {"code": code, "start_date": start_date, "end_date": end_date},
-        "tushare_kline": {"code": code, "start_date": start_date, "end_date": end_date},
-        "tushare_daily_basic": {"code": code, "trade_date": end_date},
+        "tushare_kline": {"code": code, "days": 250},
+        "tushare_daily_basic": {"code": code, "days": 500},
         "get_latest_trading_date": {},
         "get_market_analysis_timeframe": {},
-        # 宏观类
-        "tushare_shibor": {"date": end_date},
+        # 宏观类（Tushare，无需股票代码）
         "tushare_cn_cpi": {"start_date": start_date, "end_date": end_date},
-        "tushare_cn_ppi": {"start_date": start_date, "end_date": end_date},
         "tushare_cn_gdp": {"start_date": start_date, "end_date": end_date},
         "tushare_cn_pmi": {"start_date": start_date, "end_date": end_date},
-        "tushare_fx_daily": {"start_date": start_date, "end_date": end_date},
+        "tushare_cn_ppi": {"start_date": start_date, "end_date": end_date},
         "tushare_cn_m": {"start_date": start_date, "end_date": end_date},
+        "tushare_shibor": {"date": end_date},
+        "tushare_fx_daily": {"start_date": start_date, "end_date": end_date},
         "tushare_eco_cal": {"date": end_date},
+        # baostock 宏观工具
+        "get_deposit_rate_data": {"start_date": start_date, "end_date": end_date},
+        "get_loan_rate_data": {"start_date": start_date, "end_date": end_date},
+        "get_required_reserve_ratio_data": {"start_date": start_date, "end_date": end_date, "year_type": "0"},
+        "get_money_supply_data_month": {"start_date": start_date, "end_date": end_date},
+        "get_money_supply_data_year": {"start_date": start_date, "end_date": end_date},
         # 估值类
-        "tushare_pe_percentile": {"ts_code": code},
-        "tushare_ev_ebitda": {"ts_code": code},
-        "tushare_dividend": {"ts_code": code},
+        "tushare_pe_percentile": {"code": code},
+        "tushare_ev_ebitda": {"code": code},
+        "tushare_dividend": {"code": code},
         "get_dividend_data": {"code": code, "year": this_year, "year_type": "report"},
         # 财务类 — 需要 year + quarter
         "get_profit_data": {"code": code, "year": this_year, "quarter": this_quarter},
@@ -296,10 +341,11 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         "get_growth_data": {"code": code, "year": this_year, "quarter": this_quarter},
         "get_operation_data": {"code": code, "year": this_year, "quarter": this_quarter},
         "get_dupont_data": {"code": code, "year": this_year, "quarter": this_quarter},
-        "tushare_fina_indicator": {"ts_code": code, "start_date": start_date, "end_date": end_date},
-        "tushare_stock_info": {"ts_code": code},
+        "tushare_fina_indicator": {"code": code, "years": 3},
+        "tushare_stock_info": {"code": code},
         # 资金类
-        "tushare_moneyflow": {"ts_code": code, "start_date": start_date, "end_date": end_date},
+        "tushare_moneyflow": {"code": code, "days": 60},
+        "tushare_hsgt_flow": {"code": code},
         # 行业类
         "get_stock_industry": {"code": code},
         # 新闻/风险类
@@ -309,7 +355,14 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
             "top_k": 10,
         },
         "get_st_risk_data": {"code": code},
-        "tushare_st_status": {"ts_code": code},
+        "tushare_st_status": {"code": code},
+        "tushare_news": {"code": code},
+        # 板块/概念类（快路径只用搜索工具，明细由ReAct二次调用）
+        "tushare_concept_list": {"keyword": topic_name or company_name or question},
+        "tushare_ths_index": {"keyword": topic_name or company_name or question},
+        "tushare_dc_index": {"keyword": topic_name or company_name or question},
+        # 股票名称搜索
+        "tushare_search_stock": {"keyword": company_name or clean_code or question},
     }
 
     if tool_name in tool_kwargs_map:

@@ -439,14 +439,14 @@ for key in list(st.session_state.keys()):
             r = handle_poll_score_all(task_id)
             if r.get("status") == "completed":
                 res = r["result"]
-                st = res.get("short_term_score", {})
-                mt = res.get("medium_term_score", {})
-                lt = res.get("long_term_score", {})
-                ss = st.get("score", "-")
-                ms = mt.get("score", "-")
-                ls = lt.get("score", "-")
+                short_ts = res.get("short_term_score", {})
+                medium_ts = res.get("medium_term_score", {})
+                long_ts = res.get("long_term_score", {})
+                ss = short_ts.get("score", "-")
+                ms = medium_ts.get("score", "-")
+                ls = long_ts.get("score", "-")
                 st.session_state["_pool_scores_fine"][code] = {
-                    "short": st, "medium": mt, "long": lt,
+                    "short": short_ts, "medium": medium_ts, "long": long_ts,
                     "score_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 }
                 st.session_state[_rk("fine", "_action_result")] = (

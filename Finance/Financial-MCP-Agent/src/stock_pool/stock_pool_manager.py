@@ -94,7 +94,7 @@ class StockPoolManager:
         else:
             # 旧格式迁移：将扁平 stocks dict 复制到三个独立池
             old_stocks = data.get("stocks", {})
-            for term in VALID_TERMS:
+            for term in ("short", "medium", "long"):
                 for code, stock_data in old_stocks.items():
                     entry = {
                         "stock_code": stock_data.get("stock_code", code),
@@ -114,6 +114,7 @@ class StockPoolManager:
         """将 short/medium/long 三池股票合并到 fine（精筛）池，去重，保留已有评分"""
         fine_stocks = self.pools["fine"]["stocks"]
         migrated = 0
+        updated = 0
 
         for src_term in ("short", "medium", "long"):
             for code, stock in self.pools[src_term]["stocks"].items():
@@ -131,6 +132,7 @@ class StockPoolManager:
                             "risk_warning": ts.get("risk_warning", ""),
                             "suggested_action": ts.get("suggested_action", ""),
                         }
+                        updated += 1
                     if stock.get("company_name") and not existing.get("company_name"):
                         existing["company_name"] = stock["company_name"]
                     existing["last_updated"] = stock.get("last_updated") or existing.get("last_updated", "")
@@ -157,8 +159,8 @@ class StockPoolManager:
                     fine_stocks[code] = entry
                     migrated += 1
 
-        if migrated > 0:
-            logger.info(f"{SUCCESS_ICON} 精筛池迁移完成: 从短/中/长池合并 {migrated} 只新股票")
+        if migrated > 0 or updated > 0:
+            logger.info(f"{SUCCESS_ICON} 精筛池迁移完成: 新{migrated}只, 更新{updated}只")
             self._save()
 
     # ─── 精筛池专用操作 ───
@@ -389,7 +391,7 @@ class StockPoolManager:
             "long": score_data.get("long_term_score", {}),
         }
 
-        for term in VALID_TERMS:
+        for term in ("short", "medium", "long"):
             ts = term_scores[term]
             if stock_code in self.pools[term]["stocks"]:
                 stock = self.pools[term]["stocks"][stock_code]

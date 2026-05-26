@@ -1145,7 +1145,7 @@ async def get_report_status(task_id: str):
 async def get_pool(term: str):
     """获取指定期限股票池内容（term: short/medium/long）"""
     if term not in ("short", "medium", "long", "quick_screen", "fine"):
-        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
+        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen/fine")
 
     if not _pool_manager:
         raise HTTPException(status_code=500, detail="股票池管理器未初始化")
@@ -1158,7 +1158,7 @@ async def get_pool(term: str):
 async def add_to_pool(term: str, request: PoolAddRequest):
     """向指定期限股票池添加股票"""
     if term not in ("short", "medium", "long", "quick_screen", "fine"):
-        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
+        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen/fine")
 
     if not _pool_manager:
         raise HTTPException(status_code=500, detail="股票池管理器未初始化")
@@ -1172,7 +1172,7 @@ async def add_to_pool(term: str, request: PoolAddRequest):
 async def remove_from_pool(term: str, stock_code: str):
     """从指定期限股票池删除股票"""
     if term not in ("short", "medium", "long", "quick_screen", "fine"):
-        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
+        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen/fine")
 
     if not _pool_manager:
         raise HTTPException(status_code=500, detail="股票池管理器未初始化")
@@ -1214,7 +1214,7 @@ async def _run_score_task(task_id: str, term: str, stock_code: str, company_name
 async def trigger_score(term: str, stock_code: str):
     """触发打分（后台异步），返回 task_id 供轮询"""
     if term not in ("short", "medium", "long", "quick_screen", "fine"):
-        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
+        raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen/fine")
 
     if not _pool_manager or not _scoring_engine:
         raise HTTPException(status_code=500, detail="服务未初始化")

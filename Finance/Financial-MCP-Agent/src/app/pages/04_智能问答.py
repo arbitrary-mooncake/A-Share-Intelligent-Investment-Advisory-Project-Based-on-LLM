@@ -245,9 +245,14 @@ def _process_pending():
                     current_event = None
 
                 elif current_event in (None, ""):
-                    # 普通文本块
+                    # 普通文本块（JSON编码保护了换行符）
                     status_el.empty()
-                    full_answer += data_str
+                    try:
+                        # 后端用 json.dumps 编码，前端 json.loads 解码
+                        text = json.loads(data_str)
+                    except Exception:
+                        text = data_str
+                    full_answer += text
                     answer_el.markdown(full_answer + "▌")
 
                 elif current_event == "clarify":
@@ -350,6 +355,23 @@ else:
         if st.button("◀ 收起", use_container_width=True):
             st.session_state.qa_sidebar_collapsed = True
             st.rerun()
+
+        # 新建 + 刷新（置顶，高频操作）
+        col_new, col_ref = st.columns(2)
+        with col_new:
+            if st.button("＋ 新建窗口", use_container_width=True):
+                result = _api_post("/api/qa/sessions", {"name": "新对话"})
+                sid = result.get("session_id", "")
+                st.session_state["qa_active_session"] = sid
+                st.session_state["_qa_loaded_for"] = sid
+                st.session_state["qa_messages"] = []
+                _refresh_sessions()
+                st.rerun()
+        with col_ref:
+            if st.button("🔄 刷新", use_container_width=True):
+                _refresh_sessions()
+                st.rerun()
+
         st.divider()
 
         # 会话项
@@ -425,22 +447,6 @@ else:
                         st.rerun()
 
             st.caption(f"  {msg_count}条 · {time_str}")
-
-        st.divider()
-
-        # 新建
-        if st.button("＋ 新建窗口", use_container_width=True):
-            result = _api_post("/api/qa/sessions", {"name": "新对话"})
-            sid = result.get("session_id", "")
-            st.session_state["qa_active_session"] = sid
-            st.session_state["_qa_loaded_for"] = sid
-            st.session_state["qa_messages"] = []
-            _refresh_sessions()
-            st.rerun()
-
-        if st.button("🔄 刷新", use_container_width=True):
-            _refresh_sessions()
-            st.rerun()
 
     with right:
         st.markdown(f"### 💬 {current_name}")

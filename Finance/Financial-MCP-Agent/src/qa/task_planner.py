@@ -30,7 +30,7 @@ TOPIC_STOCK_MAP = {
     "新能源": {
         "etfs": [("sh.516160", "新能源ETF"), ("sz.159875", "新能源ETF")],
         "stocks": [("sz.300750", "宁德时代"), ("sz.002594", "比亚迪"), ("sh.601012", "隆基绿能")],
-        "keywords": ["新能源", "光伏", "锂电", "储能", "风电", "电动车"],
+        "keywords": ["新能源", "风电", "核电", "氢能", "生物质能"],
     },
     "半导体": {
         "etfs": [("sh.512480", "半导体ETF"), ("sz.159995", "芯片ETF")],
@@ -50,7 +50,7 @@ TOPIC_STOCK_MAP = {
     "人工智能": {
         "etfs": [("sh.515070", "人工智能ETF"), ("sz.159819", "AI智能ETF")],
         "stocks": [("sz.002230", "科大讯飞"), ("sh.688256", "寒武纪"), ("sz.300033", "同花顺")],
-        "keywords": ["人工智能", "AI", "大模型", "ChatGPT", "智能", "算力"],
+        "keywords": ["人工智能", "AI", "大模型", "ChatGPT", "GPT", "AIGC"],
     },
     "医药": {
         "etfs": [("sh.512010", "医药ETF"), ("sh.512170", "医疗ETF")],
@@ -80,16 +80,158 @@ TOPIC_STOCK_MAP = {
     "汽车": {
         "etfs": [("sh.516110", "汽车ETF")],
         "stocks": [("sz.002594", "比亚迪"), ("sh.600104", "上汽集团"), ("sh.601633", "长城汽车")],
-        "keywords": ["汽车", "整车", "新能源汽车", "智能驾驶", "自动驾驶"],
+        "keywords": ["汽车", "整车", "智能驾驶", "自动驾驶", "新能源汽车", "电动车"],
+    },
+    # ── 以下为扩展板块（排序：细分→广义，避免关键词被父级吞掉）──
+    "光伏": {
+        "etfs": [("sh.515790", "光伏ETF"), ("sz.159857", "光伏ETF")],
+        "stocks": [("sh.601012", "隆基绿能"), ("sz.300274", "阳光电源"), ("sh.600438", "通威股份")],
+        "keywords": ["光伏", "太阳能", "硅料", "硅片", "逆变器", "HJT", "TOPCon"],
+    },
+    "锂电池": {
+        "etfs": [("sz.159840", "锂电池ETF")],
+        "stocks": [("sz.300750", "宁德时代"), ("sz.300014", "亿纬锂能"), ("sz.002460", "赣锋锂业")],
+        "keywords": ["锂电池", "锂电", "锂矿", "正极", "负极", "电解液", "隔膜", "碳酸锂"],
+    },
+    "储能": {
+        "etfs": [("sz.159611", "储能ETF")],
+        "stocks": [("sz.300274", "阳光电源"), ("sz.300750", "宁德时代"), ("sh.688063", "派能科技")],
+        "keywords": ["储能", "储能电池", "户储", "大储", "构网"],
+    },
+    "新能源车": {
+        "etfs": [("sh.515030", "新能源车ETF"), ("sh.516380", "智能电车ETF")],
+        "stocks": [("sz.002594", "比亚迪"), ("sz.300750", "宁德时代"), ("sh.601633", "长城汽车")],
+        "keywords": ["新能源车", "电动汽车", "电车", "充电桩", "换电"],
+    },
+    "芯片": {
+        "etfs": [("sz.159995", "芯片ETF"), ("sh.512760", "芯片ETF")],
+        "stocks": [("sh.688981", "中芯国际"), ("sz.002049", "紫光国微"), ("sh.603986", "兆易创新")],
+        "keywords": ["芯片", "集成电路", "晶圆", "光刻", "封装", "存储芯片", "GPU", "CPU", "FPGA"],
+    },
+    "PCB": {
+        "etfs": [("sh.515880", "通信ETF")],
+        "stocks": [("sz.002938", "鹏鼎控股"), ("sz.002916", "深南电路"), ("sz.002463", "沪电股份")],
+        "keywords": ["PCB", "印制电路板", "电路板", "HDI", "载板", "覆铜板"],
+    },
+    "CPO": {
+        "etfs": [("sh.515880", "通信ETF")],
+        "stocks": [("sz.300308", "中际旭创"), ("sz.300502", "新易盛"), ("sz.300394", "天孚通信")],
+        "keywords": ["CPO", "光模块", "光通信", "硅光", "共封装", "800G", "1.6T"],
+    },
+    "机器人": {
+        "etfs": [("sh.562500", "机器人ETF")],
+        "stocks": [("sh.688017", "绿的谐波"), ("sz.002747", "埃斯顿"), ("sz.300124", "汇川技术")],
+        "keywords": ["机器人", "人形机器人", "减速器", "伺服", "具身智能"],
+    },
+    "算力": {
+        "etfs": [("sh.515070", "人工智能ETF")],
+        "stocks": [("sz.300308", "中际旭创"), ("sz.002230", "科大讯飞"), ("sh.603019", "中科曙光")],
+        "keywords": ["算力", "智算", "数据中心", "服务器", "算力租赁", "云计算"],
+    },
+    "消费电子": {
+        "etfs": [("sh.159732", "消费电子ETF")],
+        "stocks": [("sz.002475", "立讯精密"), ("sz.002241", "歌尔股份"), ("sz.300433", "蓝思科技")],
+        "keywords": ["消费电子", "手机", "穿戴", "VR", "AR", "MR", "果链"],
+    },
+    "通信": {
+        "etfs": [("sh.515880", "通信ETF")],
+        "stocks": [("sz.000063", "中兴通讯"), ("sh.600050", "中国联通"), ("sz.300308", "中际旭创")],
+        "keywords": ["通信", "5G", "6G", "基站", "光缆", "卫星通信", "低轨卫星"],
+    },
+    "计算机": {
+        "etfs": [("sh.512720", "计算机ETF")],
+        "stocks": [("sz.002415", "海康威视"), ("sz.002230", "科大讯飞"), ("sh.603019", "中科曙光")],
+        "keywords": ["计算机", "信创", "数字经济", "数据要素", "信息安全", "操作系统"],
+    },
+    "软件": {
+        "etfs": [("sz.159852", "软件ETF")],
+        "stocks": [("sh.688111", "金山办公"), ("sh.600588", "用友网络"), ("sh.600570", "恒生电子")],
+        "keywords": ["软件", "SaaS", "ERP", "工业软件", "国产软件", "AI应用"],
+    },
+    "创新药": {
+        "etfs": [("sh.515120", "创新药ETF")],
+        "stocks": [("sh.688235", "百济神州"), ("sh.600276", "恒瑞医药"), ("sh.688180", "君实生物")],
+        "keywords": ["创新药", "生物药", "ADC", "PD-1", "CAR-T", "双抗", "GLP-1", "临床"],
+    },
+    "中药": {
+        "etfs": [("sz.159647", "中药ETF")],
+        "stocks": [("sh.600436", "片仔癀"), ("sz.000538", "云南白药"), ("sh.600085", "同仁堂")],
+        "keywords": ["中药", "中成药", "饮片", "配方颗粒"],
+    },
+    "证券": {
+        "etfs": [("sh.512880", "证券ETF")],
+        "stocks": [("sh.600030", "中信证券"), ("sz.300059", "东方财富"), ("sh.601688", "华泰证券")],
+        "keywords": ["证券", "券商", "投行", "经纪", "牛市旗手"],
+    },
+    "保险": {
+        "etfs": [("sh.512070", "证券保险ETF")],
+        "stocks": [("sh.601318", "中国平安"), ("sh.601628", "中国人寿"), ("sh.601601", "中国太保")],
+        "keywords": ["保险", "寿险", "财险", "保单", "保费"],
+    },
+    "家电": {
+        "etfs": [("sh.159996", "家电ETF")],
+        "stocks": [("sz.000333", "美的集团"), ("sz.000651", "格力电器"), ("sh.600690", "海尔智家")],
+        "keywords": ["家电", "白电", "黑电", "小家电", "空调"],
+    },
+    "有色金属": {
+        "etfs": [("sh.512400", "有色金属ETF")],
+        "stocks": [("sh.601899", "紫金矿业"), ("sh.603993", "洛阳钼业"), ("sh.600111", "北方稀土")],
+        "keywords": ["有色", "有色金属", "铜", "铝", "稀土", "黄金股"],
+    },
+    "化工": {
+        "etfs": [("sh.516020", "化工ETF")],
+        "stocks": [("sh.600309", "万华化学"), ("sh.600346", "恒力石化"), ("sh.600989", "宝丰能源")],
+        "keywords": ["化工", "石化", "煤化工", "精细化工", "MDI", "涤纶"],
+    },
+    "钢铁": {
+        "etfs": [("sh.515210", "钢铁ETF")],
+        "stocks": [("sh.600019", "宝钢股份"), ("sz.000898", "鞍钢股份"), ("sz.000932", "华菱钢铁")],
+        "keywords": ["钢铁", "螺纹钢", "热卷", "铁矿石", "粗钢"],
+    },
+    "建材": {
+        "etfs": [("sh.516750", "建材ETF")],
+        "stocks": [("sh.600585", "海螺水泥"), ("sz.002271", "东方雨虹"), ("sh.600176", "中国巨石")],
+        "keywords": ["建材", "水泥", "玻璃", "防水", "玻纤"],
+    },
+    "电力": {
+        "etfs": [("sh.561560", "电力ETF")],
+        "stocks": [("sh.600900", "长江电力"), ("sh.600011", "华能国际"), ("sh.600795", "国电电力")],
+        "keywords": ["电力", "火电", "水电", "核电", "绿电", "电力改革", "电价"],
+    },
+    "传媒": {
+        "etfs": [("sh.512980", "传媒ETF")],
+        "stocks": [("sz.002027", "分众传媒"), ("sz.300413", "芒果超媒"), ("sh.603000", "人民网")],
+        "keywords": ["传媒", "广告", "影视", "出版", "广电", "短视频"],
+    },
+    "游戏": {
+        "etfs": [("sz.159869", "游戏ETF")],
+        "stocks": [("sz.002555", "三七互娱"), ("sz.002624", "完美世界"), ("sh.603444", "吉比特")],
+        "keywords": ["游戏", "网游", "手游", "电竞", "版号"],
+    },
+    "农业": {
+        "etfs": [("sz.159825", "农业ETF")],
+        "stocks": [("sz.002714", "牧原股份"), ("sz.300498", "温氏股份"), ("sz.002311", "海大集团")],
+        "keywords": ["农业", "种业", "粮食", "猪肉", "养殖", "饲料", "转基因"],
+    },
+    "旅游": {
+        "etfs": [("sh.562510", "旅游ETF")],
+        "stocks": [("sh.601888", "中国中免"), ("sh.600754", "锦江酒店"), ("sh.600258", "首旅酒店")],
+        "keywords": ["旅游", "酒店", "免税", "出境游", "景区"],
+    },
+    "低空经济": {
+        "etfs": [("sh.563080", "低空经济ETF"), ("sh.512760", "芯片ETF")],
+        "stocks": [("sz.002389", "航天彩虹"), ("sh.688122", "西部超导"), ("sz.300699", "光威复材")],
+        "keywords": ["低空经济", "飞行汽车", "eVTOL", "无人机", "通航"],
     },
 }
 
 
 def match_topic(question: str) -> Optional[Tuple[str, dict]]:
-    """从问题中识别投资主题，返回 (主题名, 标的映射)"""
+    """从问题中识别投资主题，返回 (主题名, 标的映射)。大小写不敏感"""
+    q_lower = question.lower()
     for topic, info in TOPIC_STOCK_MAP.items():
         for kw in info["keywords"]:
-            if kw in question:
+            if kw.lower() in q_lower:
                 return topic, info
     return None
 
@@ -122,9 +264,9 @@ DATA_DOMAINS = {
     "资金": {
         "keywords": ["资金", "主力", "北向", "融资", "融券", "流入", "流出",
                      "成交", "量比", "换手", "净买"],
-        "tools": ["tushare_moneyflow", "get_market_analysis_timeframe",
-                  "tushare_daily_basic"],
-        "description": "主力资金流、融资融券、北向资金等资金面数据",
+        "tools": ["tushare_moneyflow", "tushare_hsgt_flow",
+                  "get_market_analysis_timeframe", "tushare_daily_basic"],
+        "description": "主力资金流、北向资金、融资融券等资金面数据",
     },
     "行业": {
         "keywords": ["行业", "板块", "赛道", "同行", "竞品", "龙头", "排名",
@@ -133,20 +275,28 @@ DATA_DOMAINS = {
                   "tushare_stock_info", "get_market_analysis_timeframe"],
         "description": "行业分类、行业对比、板块强弱等行业数据",
     },
+    "板块": {
+        "keywords": ["板块", "赛道", "行业", "概念", "题材", "热点", "风口",
+                     "行业分析", "板块轮动", "赛道股", "概念股", "主题投资"],
+        "tools": ["tushare_concept_list", "tushare_ths_index", "tushare_dc_index"],
+        "description": "板块/概念/行业分类搜索（成分股明细由ReAct路径二次调用）",
+    },
     "新闻": {
         "keywords": ["新闻", "公告", "消息", "事件", "发布", "披露", "分红方案",
                      "回购", "减持", "增持", "业绩预告", "ST", "风险警示"],
-        "tools": ["crawl_news", "get_st_risk_data", "tushare_st_status"],
-        "description": "新闻公告、ST风险、重大事件等舆情数据",
+        "tools": ["crawl_news", "tushare_news", "get_st_risk_data", "tushare_st_status"],
+        "description": "新闻公告、ST风险、重大事件等舆情数据（多源）",
     },
     "宏观": {
         "keywords": ["利率", "汇率", "CPI", "PPI", "GDP", "PMI", "通胀", "货币",
                      "美联储", "央行", "加息", "降息", "经济形势", "宏观",
-                     "人民币", "美元", "外汇", "准备金", "LPR", "社融"],
-        "tools": ["tushare_shibor", "tushare_cn_cpi", "tushare_cn_ppi",
-                  "tushare_cn_gdp", "tushare_cn_pmi", "tushare_fx_daily",
-                  "tushare_cn_m", "tushare_eco_cal"],
-        "description": "利率、汇率、通胀、GDP、PMI等宏观经济指标",
+                     "人民币", "美元", "外汇", "准备金", "LPR", "社融",
+                     "经济", "复苏", "繁荣", "衰退", "周期", "景气",
+                     "价格指数", "采购经理", "M0", "M1", "M2", "SHIBOR"],
+        "tools": ["tushare_cn_cpi", "tushare_cn_gdp", "tushare_cn_pmi",
+                  "tushare_cn_ppi", "tushare_cn_m", "tushare_shibor",
+                  "tushare_fx_daily", "tushare_eco_cal"],
+        "description": "CPI、GDP、PMI、PPI、M2、SHIBOR、汇率等宏观经济指标（Tushare）",
     },
 }
 
@@ -162,7 +312,7 @@ class TaskPlan:
 
 
 def plan_task(question: str, complexity_level: str, history_text: str = "",
-              topic_name: str = "") -> TaskPlan:
+              topic_name: str = "", stock_code: str = "", company_name: str = "") -> TaskPlan:
     """
     根据问题内容和复杂度等级规划数据获取任务。
 
@@ -188,10 +338,21 @@ def plan_task(question: str, complexity_level: str, history_text: str = "",
 
     domains = _identify_domains(augmented_question)
 
+    # 兜底：有股票代码/名称但无数据域匹配时，默认查询行情（纯代码查询场景）
+    if not domains and (stock_code or company_name):
+        domains = ["行情"]
+        pure_code_match = re.search(r'(?<!\d)(\d{5,6})(?!\d)', question)
+        if pure_code_match and not company_name:
+            # 纯代码查询：行情 + 估值可提供更完整的概览
+            domains = ["行情", "估值"]
+
     # 主题/宏观问题自动追加新闻域和宏观域
     if topic_name:
         if "新闻" not in domains:
             domains.append("新闻")
+        # 主题/板块问题自动追加板块域（查概念成分股+板块指数）
+        if "板块" not in domains:
+            domains.append("板块")
         macro_topics = {"黄金", "白银", "原油", "煤炭", "房地产"}
         if topic_name in macro_topics and "宏观" not in domains:
             domains.append("宏观")
@@ -261,8 +422,8 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
     code = None
     name = None
 
-    # 提取股票代码
-    code_match = re.search(r'\b(\d{5,6})\b', question)
+    # 提取股票代码（用数字边界而非\b，因中文也是\w，\b不生效）
+    code_match = re.search(r'(?<!\d)(\d{5,6})(?!\d)', question)
     if code_match:
         code = code_match.group(1)
 
@@ -277,6 +438,20 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
     if re.search(ref_pattern, question) and not code:
         code = session_stock_code
         name = session_company_name
+
+    # 纯公司名称提取（无代码时的兜底）：问题开头/整体为中文名称
+    # 排除以通用疑问词/时间词开头的搜索性问题
+    _GENERIC_STARTS = r'^(?:现在|哪些|什么|怎么|如何|为什么|最近|当前|目前|哪只|哪个|哪家|哪类|怎样|何时|多少|有没有|是否)'
+    if not code and not name and not re.match(_GENERIC_STARTS, question):
+        # ② 先尝试前缀匹配："中际旭创最近..." → 提取开头的公司名（{2,8}?非贪婪）
+        name_match = re.match(
+            r'^([一-鿿·]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|能|该|值得|可以|是不是|表现|业绩|价格|涨|跌)',
+            question)
+        if name_match:
+            name = name_match.group(1)
+        # ① 兜底：整个输入就是2-4个纯中文字符 → 公司名
+        elif re.match(r'^[一-鿿·]{2,4}$', question):
+            name = question
 
     # 标准化代码格式（仅限合法A股前缀: 6=沪市, 0/3=深市, 688=科创板, 8=北交所）
     if code:

@@ -42,6 +42,10 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             current_time_info=data.get("current_time_info", ""),
             current_date=data.get("current_date", ""),
             query=data.get("query", ""),
+            model_name=data.get("model_name", ""),
+            model_api_key=data.get("model_api_key", ""),
+            model_base_url=data.get("model_base_url", ""),
+            thinking_enabled=data.get("thinking_enabled", True),
         )
 
         logger.info(f"{SUCCESS_ICON} ShortTermScorerNode: {company_name} 短线评分={result['score']} ({result['recommendation']})")
@@ -79,6 +83,10 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             current_time_info=data.get("current_time_info", ""),
             current_date=data.get("current_date", ""),
             query=data.get("query", ""),
+            model_name=data.get("model_name", ""),
+            model_api_key=data.get("model_api_key", ""),
+            model_base_url=data.get("model_base_url", ""),
+            thinking_enabled=data.get("thinking_enabled", True),
         )
 
         logger.info(f"{SUCCESS_ICON} MediumTermScorerNode: {company_name} 中线评分={result['score']} ({result['rating']})")
@@ -116,6 +124,10 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             current_time_info=data.get("current_time_info", ""),
             current_date=data.get("current_date", ""),
             query=data.get("query", ""),
+            model_name=data.get("model_name", ""),
+            model_api_key=data.get("model_api_key", ""),
+            model_base_url=data.get("model_base_url", ""),
+            thinking_enabled=data.get("thinking_enabled", True),
         )
 
         logger.info(f"{SUCCESS_ICON} LongTermScorerNode: {company_name} 长线评分={result['score']} ({result['rating']}) 护城河={result.get('moat_type', 'N/A')}")

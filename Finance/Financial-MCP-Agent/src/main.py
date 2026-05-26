@@ -21,6 +21,17 @@ start_node → [fundamental_analyst, technical_analyst, value_analyst] → summa
 import os
 import sys
 
+# Windows: 使用 SelectorEventLoop 以支持子进程（MCP stdio 传输需要）
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # 设置控制台UTF-8编码以支持中文和Emoji
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # 设置环境变量来抑制transformers和其他库的冗余输出
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"  # 只显示错误信息
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 禁用tokenizer并行化警告
@@ -370,7 +381,7 @@ async def main():
                 company_name = match17.group(1).strip()
             
             # 模式18: 直接包含5-6位数字股票代码
-            pattern18 = r'\b(\d{5,6})\b'
+            pattern18 = r'(?<!\d)(\d{5,6})(?!\d)'
             match18 = re.search(pattern18, query)
             if match18:
                 stock_code = match18.group(1)

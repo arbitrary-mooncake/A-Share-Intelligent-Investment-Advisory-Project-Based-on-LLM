@@ -38,11 +38,21 @@ from src.utils.industry_knowledge import (
     identify_industry,
     generate_industry_context_prompt,
 )
+from src.utils.model_config import get_model_config_for_agent
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
+
+
+def _build_extra_body(base_url: str, thinking_enabled: bool) -> dict:
+    """根据 API 提供商返回正确的 thinking 参数格式"""
+    if not thinking_enabled:
+        return {}
+    if "dashscope" in base_url:
+        return {"enable_thinking": True}
+    return {"thinking": {"type": "enabled"}}
 
 
 async def long_term_scorer(
@@ -55,6 +65,10 @@ async def long_term_scorer(
     current_time_info: str = "",
     current_date: str = "",
     query: str = "",
+    model_name: str = "",
+    model_api_key: str = "",
+    model_base_url: str = "",
+    thinking_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     长线投资打分 (1-3年以上持仓)
@@ -89,20 +103,23 @@ async def long_term_scorer(
     })
 
     try:
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+        # 模型配置：优先显式参数（快筛覆盖），否则使用 agent 分配的模型 (MiMo-V2.5-Pro)
+        model_cfg = get_model_config_for_agent("long_term_scorer")
+        api_key = model_api_key or model_cfg["api_key"]
+        base_url = model_base_url or model_cfg["base_url"]
+        resolved_model = model_name or model_cfg["model_name"]
 
-        if not all([api_key, base_url, model_name]):
+        if not all([api_key, base_url, resolved_model]):
             raise ValueError("缺少OpenAI环境变量")
 
         llm = ChatOpenAI(
-            model=model_name,
+            model=resolved_model,
             api_key=api_key,
             base_url=base_url,
             temperature=1.0,
+            request_timeout=360,
             max_tokens=16000,
-            extra_body={"thinking": {"type": "enabled"}}
+            extra_body=_build_extra_body(base_url, thinking_enabled)
         )
 
         # 生成行业上下文指引
@@ -242,6 +259,15 @@ async def long_term_scorer(
     "rating": "长线投资评级（强烈买入/买入/持有/观望/规避/卖出）",
     "reasoning": "打分核心理由（3-5句话，指出最强的2-3个因素和最弱的1-2个因素，特别要说明护城河和行业景气的判断依据）",
     "risk_warning": "长线风险提示（1-2句话，指出未来3年最大的1-2个风险点）",
+    "data_basis": {{
+        "business_moat": "列出本维度评分依据的具体数据点",
+        "industry_outlook": "列出本维度评分依据的具体数据点",
+        "valuation": "列出本维度评分依据的具体数据点",
+        "growth": "列出本维度评分依据的具体数据点",
+        "technical": "列出本维度评分依据的具体数据点",
+        "risk_governance": "列出本维度评分依据的具体数据点"
+    }},
+    "data_reliability": "数据可靠性(高/中/低)，注明哪些基于直接数据，哪些基于推断",
     "suggested_action": "具体操作建议（2-3句话，含建议建仓策略如"分批建仓，首次建仓30%，回调加仓"）",
     "time_horizon": "建议持仓周期（如：建议持有3年以上，核心逻辑是XX）",
     "moat_type": "护城河类型（如：技术壁垒+品牌壁垒 / 规模效应+转换成本 / 无明显护城河）"
@@ -251,7 +277,8 @@ async def long_term_scorer(
 
 1. 所有分数必须是**整数**，不能是小数
 2. 各子项分数之和必须严格等于总分
-3. 打分必须基于提供的四维分析数据，不能凭空臆断
+3. **评分前必须先列出每个维度的数据依据**（见data_basis字段），数据不充分时必须在data_reliability中标注"低"
+4. 打分必须基于提供的四维分析数据，不能凭空臆断；如果某项数据缺失，在data_basis中标注"无直接数据，基于已有信息推断"
 4. 每个维度的打分必须有具体数据引用
 5. 长线打分应**以护城河和行业为核心**，技术面权重极低
 6. 如果某个维度的分析数据缺失，请在reasoning中说明
@@ -320,7 +347,7 @@ async def long_term_scorer(
             interaction_type="long_term_scoring",
             input_messages=messages,
             output_content=json_mod.dumps(score_data, ensure_ascii=False),
-            model_config={"model": model_name, "temperature": 1.0, "max_tokens": 16000, "thinking": "enabled"},
+            model_config={"model": resolved_model, "temperature": 1.0, "max_tokens": 16000, "thinking": "enabled" if thinking_enabled else "disabled"},
             execution_time=llm_time
         )
 

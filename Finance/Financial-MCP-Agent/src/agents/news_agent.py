@@ -197,7 +197,7 @@ async def news_agent(state: AgentState) -> AgentState:
 
     # 并行执行（第一轮）
     try:
-        results = await asyncio.gather(*tasks) if tasks else []
+        results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
     except Exception as gather_err:
         logger.error(f"{ERROR_ICON} NewsAgent: 并行工具调用异常: {gather_err}")
         results = []

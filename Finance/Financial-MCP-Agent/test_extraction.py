@@ -131,7 +131,7 @@ def extract_stock_info(query):
         company_name = match17.group(1).strip()
     
     # 模式18: 直接包含5-6位数字股票代码
-    pattern18 = r'\b(\d{5,6})\b'
+    pattern18 = r'(?<!\d)(\d{5,6})(?!\d)'
     match18 = re.search(pattern18, query)
     if match18:
         stock_code = match18.group(1)
@@ -258,7 +258,7 @@ def test_extraction():
         # 11. 边界情况测试
         # ============================================================================
         ("分析", None, None),
-        ("分析123456", None, None),
+        ("分析123456", None, "123456"),  # 数字边界正则能正确提取中文后的6位数字
         ("嘉友国际", None, None),
         ("603871", None, "603871"),
         ("", None, None),

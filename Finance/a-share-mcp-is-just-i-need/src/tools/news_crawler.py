@@ -22,34 +22,76 @@ def register_news_crawler_tools(app: FastMCP, data_source: FinancialDataSource):
     @app.tool()
     def crawl_news(query: str, top_k: int = 10) -> str:
         """
-        爬取相关新闻
-        
-        使用百度搜索爬取与查询词相关的新闻文章，并返回格式化的结果。
-        
+        获取个股或行业相关新闻（来源：东方财富）
+
         Args:
-            query: 搜索查询词，如"嘉友国际"、"人工智能投资"等
+            query: 搜索查询词，如股票代码"600519"、公司名"嘉友国际"、行业名"白酒"等
             top_k: 返回的新闻数量，默认为10条
-            
+
         Returns:
-            格式化的新闻结果字符串，包含标题、内容摘要、链接等信息
-            
-        Example:
-            >>> crawl_news("嘉友国际", 5)
-            "找到以下相关新闻：
-            
-            1. 嘉友国际发布2024年第一季度财报
-               来源: 百度搜索
-               内容: 嘉友国际今日发布2024年第一季度财报，营收同比增长15%...
-               链接: https://example.com/news/123
-            "
+            格式化的新闻结果，包含标题、时间、来源、链接
         """
         try:
-            logger.info(f"开始爬取新闻，查询词: {query}, 数量: {top_k}")
-            result = data_source.crawl_news(query, top_k)
-            logger.info(f"新闻爬取完成，返回结果长度: {len(result)}")
-            return result
+            import akshare as ak
+            import re
+
+            # 尝试多种方式获取新闻
+            df = None
+            search_method = ""
+
+            # 方式1: 提取5-6位数字代码查询
+            code_match = re.search(r'(\d{5,6})', query)
+            if code_match:
+                symbol = code_match.group(1)
+                try:
+                    df = ak.stock_news_em(symbol=symbol)
+                    if df is not None and not df.empty:
+                        search_method = f"代码({symbol})"
+                except Exception:
+                    df = None
+
+            # 方式2: 如果代码查询失败或query不含代码，尝试用原始query直接搜索
+            if (df is None or df.empty) and not code_match:
+                try:
+                    # 直接用原始查询词（可能是公司名）调用
+                    df = ak.stock_news_em(symbol=query.strip())
+                    if df is not None and not df.empty:
+                        search_method = f"关键词({query})"
+                except Exception:
+                    df = None
+
+            # 方式3: 如果仍无结果，尝试用纯数字部分（移除交易所前缀 sh./sz./.SH/.SZ）
+            if df is None or df.empty:
+                clean = re.sub(r'(sh\.|sz\.|\.SH|\.SZ)', '', query, flags=re.IGNORECASE).strip()
+                if clean != query.strip():
+                    try:
+                        df = ak.stock_news_em(symbol=clean)
+                        if df is not None and not df.empty:
+                            search_method = f"清洗代码({clean})"
+                    except Exception:
+                        df = None
+
+            # 格式化结果
+            if df is not None and not df.empty:
+                n = min(len(df), top_k)
+                lines = [f"找到 {n} 条关于 {query} 的新闻（搜索方式: {search_method}）：\n"]
+                for i, (_, row) in enumerate(df.head(top_k).iterrows()):
+                    title = str(row.get("新闻标题", ""))
+                    content = str(row.get("新闻内容", ""))[:200]
+                    src = str(row.get("文章来源", ""))
+                    url = str(row.get("新闻链接", ""))
+                    dt = str(row.get("发布时间", ""))
+                    lines.append(
+                        f"{i+1}. **{title}**\n"
+                        f"   来源: {src} | 时间: {dt}\n"
+                        f"   摘要: {content}\n"
+                        f"   链接: {url}\n"
+                    )
+                return "\n".join(lines)
+
+            return f"未找到关于 '{query}' 的新闻。请尝试输入股票代码（如600519）或公司名称。"
         except Exception as e:
             logger.error(f"爬取新闻时出错: {e}")
-            return f"爬取新闻时出错: {str(e)}"
-    
+            return f"新闻获取失败: {str(e)}"
+
     

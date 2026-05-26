@@ -33,11 +33,21 @@ from src.utils.industry_knowledge import (
     generate_industry_context_prompt,
     INDUSTRY_BENCHMARKS,
 )
+from src.utils.model_config import get_model_config_for_agent
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
+
+
+def _build_extra_body(base_url: str, thinking_enabled: bool) -> dict:
+    """根据 API 提供商返回正确的 thinking 参数格式"""
+    if not thinking_enabled:
+        return {}
+    if "dashscope" in base_url:
+        return {"enable_thinking": True}
+    return {"thinking": {"type": "enabled"}}
 
 
 async def medium_term_scorer(
@@ -50,6 +60,10 @@ async def medium_term_scorer(
     current_time_info: str = "",
     current_date: str = "",
     query: str = "",
+    model_name: str = "",
+    model_api_key: str = "",
+    model_base_url: str = "",
+    thinking_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     中线投资打分 (1-3个月持仓)
@@ -84,20 +98,23 @@ async def medium_term_scorer(
     })
 
     try:
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
-        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
-        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+        # 模型配置：优先显式参数（快筛覆盖），否则使用 agent 分配的模型 (MiMo-V2.5-Pro)
+        model_cfg = get_model_config_for_agent("medium_term_scorer")
+        api_key = model_api_key or model_cfg["api_key"]
+        base_url = model_base_url or model_cfg["base_url"]
+        resolved_model = model_name or model_cfg["model_name"]
 
-        if not all([api_key, base_url, model_name]):
+        if not all([api_key, base_url, resolved_model]):
             raise ValueError("缺少OpenAI环境变量")
 
         llm = ChatOpenAI(
-            model=model_name,
+            model=resolved_model,
             api_key=api_key,
             base_url=base_url,
             temperature=1.0,
+            request_timeout=360,
             max_tokens=16000,
-            extra_body={"thinking": {"type": "enabled"}}
+            extra_body=_build_extra_body(base_url, thinking_enabled)
         )
 
         # 生成行业上下文指引
@@ -230,6 +247,15 @@ async def medium_term_scorer(
     "rating": "投资评级（强烈推荐/推荐/谨慎推荐/中性/谨慎减持/减持）",
     "reasoning": "打分核心理由（3-5句话，指出最强的2-3个因素和最弱的1-2个因素）",
     "risk_warning": "中线风险提示（1-2句话，指出最大1-2个风险点）",
+    "data_basis": {{
+        "fundamental_quality": "列出本维度评分依据的具体数据点",
+        "growth": "列出本维度评分依据的具体数据点",
+        "valuation": "列出本维度评分依据的具体数据点",
+        "technical_trend": "列出本维度评分依据的具体数据点",
+        "sentiment_flow": "列出本维度评分依据的具体数据点",
+        "risk_assessment": "列出本维度评分依据的具体数据点"
+    }},
+    "data_reliability": "数据可靠性(高/中/低)，注明哪些基于直接数据，哪些基于推断",
     "suggested_action": "具体操作建议（2-3句话，含建议买入价位区间和目标价位区间）",
     "time_horizon": "建议持仓周期（如：建议持有1-3个月，关注XX事件催化）"
 }}
@@ -238,7 +264,8 @@ async def medium_term_scorer(
 
 1. 所有分数必须是**整数**，不能是小数
 2. 各子项分数之和必须严格等于总分
-3. 打分必须基于提供的四维分析数据，不能凭空臆断
+3. **评分前必须先列出每个维度的数据依据**（见data_basis字段），数据不充分时必须在data_reliability中标注"低"
+4. 打分必须基于提供的四维分析数据，不能凭空臆断；如果某项数据缺失，在data_basis中标注"无直接数据，基于已有信息推断"
 4. 每个维度的打分必须有具体数据引用（如"ROE为18%，属于优秀水平，得7/8分"）
 5. 中线打分应**综合权衡**，不能过度偏重某一个维度
 6. 如果某个维度的分析数据缺失，请在reasoning中说明并酌情调整
@@ -305,7 +332,7 @@ async def medium_term_scorer(
             interaction_type="medium_term_scoring",
             input_messages=messages,
             output_content=json_mod.dumps(score_data, ensure_ascii=False),
-            model_config={"model": model_name, "temperature": 1.0, "max_tokens": 16000, "thinking": "enabled"},
+            model_config={"model": resolved_model, "temperature": 1.0, "max_tokens": 16000, "thinking": "enabled" if thinking_enabled else "disabled"},
             execution_time=llm_time
         )
 

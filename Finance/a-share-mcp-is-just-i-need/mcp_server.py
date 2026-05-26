@@ -1,4 +1,11 @@
 # Main MCP server file
+import sys
+
+# Windows: 使用 SelectorEventLoop 以支持子进程
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import logging
 from datetime import datetime
 

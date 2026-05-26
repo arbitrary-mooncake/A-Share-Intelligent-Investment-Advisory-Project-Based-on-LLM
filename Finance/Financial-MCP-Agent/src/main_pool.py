@@ -14,6 +14,17 @@
 import os
 import sys
 import asyncio
+
+# Windows: 使用 SelectorEventLoop 以支持子进程（MCP stdio 传输需要）
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # 设置控制台UTF-8编码以支持中文和Emoji
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import re
 from typing import Optional
 
@@ -88,7 +99,7 @@ def normalize_stock_code(code: str) -> str:
 
 
 async def cmd_add(pool: StockPoolManager, engine: ScoringEngine, args):
-    """添加股票到池中"""
+    """添加股票到中线池（CLI 默认添加到中线池）"""
     if len(args) < 2:
         print(f"{ERROR_ICON} 用法: add <股票代码> <公司名称>")
         print(f"  示例: add 603871 嘉友国际")
@@ -97,10 +108,10 @@ async def cmd_add(pool: StockPoolManager, engine: ScoringEngine, args):
     stock_code = normalize_stock_code(args[0])
     company_name = args[1]
 
-    stock = pool.add_stock(stock_code, company_name)
-    print(f"{SUCCESS_ICON} 已添加: {company_name}({stock_code})")
+    stock = pool.add_stock_to_term("medium", stock_code, company_name)
+    print(f"{SUCCESS_ICON} 已添加: {company_name}({stock_code}) 到中线池")
     print(f"  状态: {stock['status']}")
-    print(f"\n是否立即对该股票进行评分? (y/n, 默认n): ", end="")
+    print(f"\n是否立即对该股票进行完整评分（短+中+长线）? (y/n, 默认n): ", end="")
     try:
         answer = input().strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -124,22 +135,22 @@ async def cmd_add(pool: StockPoolManager, engine: ScoringEngine, args):
 
 
 async def cmd_remove(pool: StockPoolManager, engine: ScoringEngine, args):
-    """从池中删除股票"""
+    """从中线池删除股票"""
     if len(args) < 1:
         print(f"{ERROR_ICON} 用法: remove <股票代码>")
         return
 
     stock_code = normalize_stock_code(args[0])
-    stock = pool.get_stock(stock_code)
+    stock = pool.get_stock_in_term("medium", stock_code)
     if stock:
-        print(f"确认删除 {stock['company_name']}({stock_code})? (y/n): ", end="")
+        print(f"确认从池删除 {stock['company_name']}({stock_code})? (y/n): ", end="")
         try:
             answer = input().strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = "n"
 
         if answer == "y":
-            pool.remove_stock(stock_code)
+            pool.remove_stock_from_term("medium", stock_code)
             print(f"{SUCCESS_ICON} 已删除: {stock['company_name']}({stock_code})")
         else:
             print("  已取消删除")

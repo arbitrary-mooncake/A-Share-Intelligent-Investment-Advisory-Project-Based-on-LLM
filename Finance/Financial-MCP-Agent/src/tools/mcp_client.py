@@ -1,8 +1,9 @@
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 from src.tools.mcp_config import SERVER_CONFIGS
-import asyncio  # 异步操作所需，如get_tools
+import asyncio
 import json
+from typing import List, Optional
 
 logger = setup_logger(__name__)
 
@@ -29,55 +30,57 @@ def print_tool_details(tools):
         logger.info("     " + "-" * 50)
 
 
-async def get_mcp_tools():
+async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
     """
     使用定义的服务器配置初始化MultiServerMCPClient，
     并从a-share-mcp-v2服务器获取可用工具。
 
+    全量工具列表只加载一次并全局缓存。不同 Agent 通过 tool_filter
+    从缓存中过滤所需工具，不会重复创建 MCP 客户端或子进程。
+
+    Args:
+        tool_filter: 可选工具名白名单，只返回列表中指定的工具
+
     返回:
         list: 从MCP服务器加载的LangChain兼容工具列表。
-              如果初始化或工具加载失败，则返回空列表。
     """
     global _mcp_client_instance, _mcp_tools
 
-    if _mcp_tools is not None:
-        logger.info(f"{SUCCESS_ICON} Returning cached MCP tools.")
-        return _mcp_tools
-
-    logger.info(
-        f"{WAIT_ICON} Initializing MultiServerMCPClient with config: {SERVER_CONFIGS}")
-    try:
-        _mcp_client_instance = MultiServerMCPClient(SERVER_CONFIGS)
-
+    # 首次加载：创建 MCP 客户端，加载全量工具，全局缓存
+    if _mcp_tools is None:
         logger.info(
-            f"{WAIT_ICON} Fetching tools from MCP server 'a_share_mcp_v2'...")
-        # The get_tools() method is asynchronous.
-        loaded_tools = await _mcp_client_instance.get_tools()
+            f"{WAIT_ICON} Initializing MultiServerMCPClient with config: {SERVER_CONFIGS}")
+        try:
+            _mcp_client_instance = MultiServerMCPClient(SERVER_CONFIGS)
 
-        if not loaded_tools:
-            logger.warning(
-                f"{ERROR_ICON} No tools loaded from MCP server 'a_share_mcp_v2'. Check server logs and configuration.")
-            _mcp_tools = []  # Cache empty list on failure to load
+            logger.info(
+                f"{WAIT_ICON} Fetching tools from MCP server 'a_share_mcp_v2'...")
+            loaded_tools = await _mcp_client_instance.get_tools()
+
+            if not loaded_tools:
+                logger.warning(
+                    f"{ERROR_ICON} No tools loaded from MCP server.")
+                _mcp_tools = []
+                return []
+
+            _mcp_tools = loaded_tools
+            logger.info(
+                f"{SUCCESS_ICON} Successfully loaded {len(_mcp_tools)} tools (cached).")
+        except Exception as e:
+            logger.error(
+                f"{ERROR_ICON} Failed to initialize MCP client: {e}", exc_info=True)
+            _mcp_tools = []
             return []
 
-        _mcp_tools = loaded_tools
+    # 从缓存过滤
+    if tool_filter is not None:
+        filtered = [t for t in _mcp_tools if t.name in tool_filter]
         logger.info(
-            f"{SUCCESS_ICON} Successfully loaded {len(_mcp_tools)} tools from 'a_share_mcp_v2'.")
+            f"{SUCCESS_ICON} Returning {len(filtered)}/{len(_mcp_tools)} tools (filtered).")
+        return filtered
 
-        # # 打印工具名称列表
-        # tool_names = [tool.name for tool in _mcp_tools]
-        # logger.info(f"工具名称列表: {tool_names}")
-
-        # 打印详细的工具信息
-        # print_tool_details(_mcp_tools)
-
-        return _mcp_tools
-
-    except Exception as e:
-        logger.error(
-            f"{ERROR_ICON} Failed to initialize MCP client or load tools: {e}", exc_info=True)
-        _mcp_tools = []  # Cache empty list on failure
-        return []
+    logger.info(f"{SUCCESS_ICON} Returning all {len(_mcp_tools)} cached MCP tools.")
+    return _mcp_tools
 
 
 async def close_mcp_client_sessions():

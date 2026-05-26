@@ -403,7 +403,7 @@ def _compress_history(old_messages: list) -> str:
     for msg in old_messages:
         content = msg.content[:300]
         # 提取股票代码
-        codes = re.findall(r'\b\d{5,6}\b', content)
+        codes = re.findall(r'(?<!\d)\d{5,6}(?!\d)', content)
         stocks_mentioned.update(codes)
         # 提取问题（用户消息）
         if msg.role == "user":

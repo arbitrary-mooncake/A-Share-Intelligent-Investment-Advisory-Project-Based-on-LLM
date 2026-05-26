@@ -37,10 +37,19 @@ def _call(api_name: str, params: dict = None, fields: str = "") -> Optional[dict
         }, timeout=15)
         data = resp.json()
         if data.get("code") != 0:
+            logging.getLogger("tushare_mcp").warning(
+                f"Tushare API {api_name} 返回错误: code={data.get('code')}, msg={data.get('msg', '')}"
+            )
             return None
         r = data.get("data", {})
-        return r if r.get("items") else None
-    except Exception:
+        if not r.get("items"):
+            logging.getLogger("tushare_mcp").warning(
+                f"Tushare API {api_name} 返回空数据 (params={params})"
+            )
+            return None
+        return r
+    except Exception as e:
+        logging.getLogger("tushare_mcp").warning(f"Tushare API {api_name} 调用异常: {e}")
         return None
 
 def _dicts(result) -> list:
@@ -54,19 +63,37 @@ def _ts_code(code: str) -> str:
     # 0xxxxx=深市主板, 3xxxxx=创业板, 1xxxxx=深市基金/ETF, 4xxxxx=深市
     return f"{c}.SH" if (c.startswith(("6", "688", "5", "8"))) else f"{c}.SZ"
 
+def _is_etf(code: str) -> bool:
+    """检测是否为 ETF/基金代码（上交所51/58，深交所15/16/18）"""
+    c = code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+    return c.startswith(("51", "58", "15", "16", "18"))
+
 def ts_stock_info(code: str) -> list:
+    # ETF 无 stock_basic 数据，尝试 fund_basic
+    if _is_etf(code):
+        return _dicts(_call("fund_basic", {"ts_code": _ts_code(code)}, "ts_code,name,fund_type,found_date,management"))
     return _dicts(_call("stock_basic", {"ts_code": _ts_code(code)}, "ts_code,name,industry,list_date,area"))
 
 def ts_kline(code: str, days: int = 250) -> list:
     s = (_datetime.now() - _timedelta(days=days + 30)).strftime("%Y%m%d")
     e = _datetime.now().strftime("%Y%m%d")
-    return _dicts(_call("daily", {"ts_code": _ts_code(code), "start_date": s, "end_date": e},
+    ts = _ts_code(code)
+    if _is_etf(code):
+        # ETF/基金使用 fund_daily（Tushare stock daily API 不支持 ETF 代码）
+        return _dicts(_call("fund_daily", {"ts_code": ts, "start_date": s, "end_date": e},
+                            "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount"))
+    return _dicts(_call("daily", {"ts_code": ts, "start_date": s, "end_date": e},
                         "trade_date,open,high,low,close,vol,amount,pct_chg"))
 
 def ts_daily_basic(code: str, days: int = 500) -> list:
     s = (_datetime.now() - _timedelta(days=days + 30)).strftime("%Y%m%d")
     e = _datetime.now().strftime("%Y%m%d")
-    return _dicts(_call("daily_basic", {"ts_code": _ts_code(code), "start_date": s, "end_date": e},
+    ts = _ts_code(code)
+    if _is_etf(code):
+        # ETF 无 PE/PB，用 fund_daily 返回价格+成交量+换手率（若可用）
+        return _dicts(_call("fund_daily", {"ts_code": ts, "start_date": s, "end_date": e},
+                            "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount"))
+    return _dicts(_call("daily_basic", {"ts_code": ts, "start_date": s, "end_date": e},
                         "trade_date,pe,pe_ttm,pb,ps,ps_ttm,total_mv,circ_mv,turnover_rate"))
 
 def ts_fina_indicator(code: str, years: int = 3) -> list:

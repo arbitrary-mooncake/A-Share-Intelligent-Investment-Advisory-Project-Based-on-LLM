@@ -16,7 +16,9 @@ from config import (
     API_BASE_URL,
     QUERY_TIMEOUT,
     REPORT_TIMEOUT,
-    SCORE_TIMEOUT,
+    SCORE_TRIGGER_TIMEOUT,
+    SCORE_POLL_INTERVAL,
+    SCORE_POLL_MAX_ATTEMPTS,
     QUICK_SCREEN_TIMEOUT,
     BATCH_UPLOAD_TIMEOUT,
     BATCH_POLL_INTERVAL,
@@ -226,57 +228,120 @@ async def remove_from_pool(term: str, stock_code: str) -> dict:
 
 
 # ──────────────────────────────────────────────
-# 打分 API
+# 打分 API（防刷新：触发 → 轮询模式）
 # ──────────────────────────────────────────────
 
-async def score_stock(term: str, stock_code: str) -> dict:
-    """对指定股票执行指定限期打分"""
+async def trigger_score(term: str, stock_code: str) -> str:
+    """触发打分（后台异步），返回 task_id"""
+    if MOCK_MODE:
+        return "mock_task_12345"
+
+    try:
+        async with httpx.AsyncClient(timeout=SCORE_TRIGGER_TIMEOUT) as client:
+            resp = await client.post(f"{API_BASE_URL}/api/score/{term}/{stock_code}")
+            resp.raise_for_status()
+            return resp.json()["task_id"]
+    except httpx.HTTPStatusError as e:
+        raise APIError(f"触发打分失败: {e.response.text}", e.response.status_code)
+    except httpx.RequestError as e:
+        raise APIError(f"连接后端失败: {e}")
+
+
+async def poll_score_result(task_id: str) -> dict:
+    """轮询打分结果直到完成或失败"""
     if MOCK_MODE:
         import random
         from datetime import datetime
+        await asyncio.sleep(1)
         return {
-            "score": round(random.uniform(50, 90), 1),
-            "score_time": datetime.now().strftime("%Y-%m-%d %H:%M")
+            "status": "completed",
+            "result": {
+                "score": round(random.uniform(50, 90), 1),
+                "score_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "term": "medium", "stock_code": "sh.603871", "company_name": "嘉友国际",
+            }
         }
 
     try:
-        async with httpx.AsyncClient(timeout=SCORE_TIMEOUT) as client:
-            resp = await client.post(f"{API_BASE_URL}/api/score/{term}/{stock_code}")
-            resp.raise_for_status()
-            return resp.json()
-    except httpx.HTTPStatusError as e:
-        raise APIError(f"打分失败: {e.response.text}", e.response.status_code)
+        for attempt in range(SCORE_POLL_MAX_ATTEMPTS):
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{API_BASE_URL}/api/score/{task_id}")
+                resp.raise_for_status()
+                data = resp.json()
+                if data["status"] in ("completed", "failed"):
+                    return data
+            await asyncio.sleep(SCORE_POLL_INTERVAL)
+
+        raise APIError(f"打分超时（{SCORE_POLL_MAX_ATTEMPTS * SCORE_POLL_INTERVAL}s）")
     except httpx.RequestError as e:
-        raise APIError(f"连接后端失败: {e}")
+        raise APIError(f"查询打分状态失败: {e}")
+
+
+async def score_stock(term: str, stock_code: str) -> dict:
+    """便捷方法：触发 + 轮询，返回最终结果（向后兼容）"""
+    task_id = await trigger_score(term, stock_code)
+    data = await poll_score_result(task_id)
+    if data["status"] == "completed":
+        return data["result"]
+    raise APIError(data.get("error", "打分失败"))
 
 
 # ──────────────────────────────────────────────
 # 缓存状态 API
 # ──────────────────────────────────────────────
 
-async def score_quick_screen(term: str, stock_code: str) -> dict:
-    """快筛股票池 — 对指定股票执行单期打分（使用 qwen3.6-flash）"""
+async def trigger_quick_score(term: str, stock_code: str) -> str:
+    """触发快筛打分（后台异步），返回 task_id"""
+    if MOCK_MODE:
+        return "mock_qs_task_12345"
+
+    try:
+        async with httpx.AsyncClient(timeout=SCORE_TRIGGER_TIMEOUT) as client:
+            resp = await client.post(f"{API_BASE_URL}/api/quick-screen/score/{term}/{stock_code}")
+            resp.raise_for_status()
+            return resp.json()["task_id"]
+    except httpx.HTTPStatusError as e:
+        raise APIError(f"触发快筛打分失败: {e.response.text}", e.response.status_code)
+    except httpx.RequestError as e:
+        raise APIError(f"连接后端失败: {e}")
+
+
+async def poll_quick_score_result(task_id: str) -> dict:
+    """轮询快筛打分结果"""
     if MOCK_MODE:
         import random
         from datetime import datetime
+        await asyncio.sleep(0.5)
         return {
-            "score": round(random.uniform(50, 90), 1),
-            "score_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "term": term,
-            "stock_code": stock_code,
+            "status": "completed",
+            "result": {
+                "score": round(random.uniform(50, 90), 1),
+                "score_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "term": "medium", "stock_code": "sh.603871", "company_name": "嘉友国际",
+            }
         }
 
     try:
-        async with httpx.AsyncClient(timeout=QUICK_SCREEN_TIMEOUT) as client:
-            resp = await client.post(f"{API_BASE_URL}/api/quick-screen/score/{term}/{stock_code}")
-            resp.raise_for_status()
-            return resp.json()
-    except httpx.HTTPStatusError as e:
-        raise APIError(f"快筛打分失败: {e.response.text}", e.response.status_code)
+        for attempt in range(SCORE_POLL_MAX_ATTEMPTS):
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{API_BASE_URL}/api/quick-screen/score/{task_id}")
+                resp.raise_for_status()
+                data = resp.json()
+                if data["status"] in ("completed", "failed"):
+                    return data
+            await asyncio.sleep(SCORE_POLL_INTERVAL)
+        raise APIError(f"快筛打分超时")
     except httpx.RequestError as e:
-        raise APIError(f"连接后端失败: {e}")
-    except Exception as e:
-        raise APIError(f"快筛打分未知错误: {e}")
+        raise APIError(f"查询快筛打分状态失败: {e}")
+
+
+async def score_quick_screen(term: str, stock_code: str) -> dict:
+    """便捷方法：触发 + 轮询，返回最终结果（向后兼容）"""
+    task_id = await trigger_quick_score(term, stock_code)
+    data = await poll_quick_score_result(task_id)
+    if data["status"] == "completed":
+        return data["result"]
+    raise APIError(data.get("error", "快筛打分失败"))
 
 
 async def get_cache_status(stock_code: str) -> dict:
@@ -504,7 +569,12 @@ async def qa_ask_stream(question: str, session_id: Optional[str] = None):
                             yield {"type": current_event, "data": parsed}
                             current_event = None
                         else:
-                            yield {"type": "answer", "data": data_str}
+                            try:
+                                import json as _json
+                                text = _json.loads(data_str)
+                            except Exception:
+                                text = data_str
+                            yield {"type": "answer", "data": text}
 
     except httpx.HTTPStatusError as e:
         yield {"type": "error", "data": f"请求失败: {e.response.text}"}

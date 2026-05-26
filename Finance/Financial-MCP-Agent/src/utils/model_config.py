@@ -26,11 +26,11 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
     "medium_term_scorer": "",
     "long_term_scorer": "",
 
-    # ── Model 3: Qwen3.6-Plus ──
+    # ── Model 3: Qwen3.6-Plus (快速工具调用，适合ReAct) ──
+    "technical_agent": "_3",
     "short_term_scorer": "_3",
 
-    # ── Model 4: Kimi K2.6 (全部分析Agent) ──
-    "technical_agent": "_4",
+    # ── Model 4: Kimi K2.6 (深度分析Agent) ──
     "news_agent": "_4",
     "fundamental_agent": "_4",
     "value_agent": "_4",

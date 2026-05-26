@@ -14,9 +14,11 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 # ──────────────────────────────────────────────
 QUERY_TIMEOUT = 60        # 快速查询超时
 REPORT_TIMEOUT = 2400     # 深度报告超时（40分钟，4分析Agent+总结Agent+MCP）
-SCORE_TIMEOUT = 2100      # 打分超时（35分钟，MCP ReAct+LLM生成深度分析）
-POLL_INTERVAL = 3         # 报告任务轮询间隔（秒）
-POLL_MAX_ATTEMPTS = 800   # 报告任务最大轮询次数 ≈ 40 分钟
+SCORE_TRIGGER_TIMEOUT = 15   # 打分触发超时（秒，仅触发调用）
+SCORE_POLL_INTERVAL = 2      # 打分任务轮询间隔（秒）
+SCORE_POLL_MAX_ATTEMPTS = 450  # 打分任务最大轮询次数 ≈ 15 分钟
+POLL_INTERVAL = 3            # 报告任务轮询间隔（秒）
+POLL_MAX_ATTEMPTS = 800      # 报告任务最大轮询次数 ≈ 40 分钟
 
 # ──────────────────────────────────────────────
 # 模型选择（供前端展示用，实际由后端控制）

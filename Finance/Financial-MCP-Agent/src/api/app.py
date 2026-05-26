@@ -84,6 +84,8 @@ class PoolAddRequest(BaseModel):
 _task_results: Dict[str, Dict[str, Any]] = {}
 _task_statuses: Dict[str, str] = {}
 _task_progress: Dict[str, float] = {}  # task_id → 0.0~1.0
+_score_tasks: Dict[str, Dict[str, Any]] = {}  # task_id → {status, result, ...}
+_quick_score_tasks: Dict[str, Dict[str, Any]] = {}  # task_id → {status, result, ...}
 _scoring_engine: Optional[ScoringEngine] = None
 _pool_manager: Optional[StockPoolManager] = None
 
@@ -178,8 +180,8 @@ def extract_stock_info(user_input: str) -> tuple:
     """从用户输入提取股票代码和名称"""
     user_input = user_input.strip()
 
-    # 提取股票代码（6位数字，可能带 sh./sz. 前缀）
-    code_match = re.search(r'\b(\d{5,6})\b', user_input)
+    # 提取股票代码（6位数字；数字边界避免中文粘连时\b失效）
+    code_match = re.search(r'(?<!\d)(\d{5,6})(?!\d)', user_input)
     stock_code = code_match.group(1) if code_match else None
 
     # 括号内提取: 嘉友国际(603871) 或 茅台（600519）
@@ -1181,9 +1183,35 @@ async def remove_from_pool(term: str, stock_code: str):
     return {"status": "ok"}
 
 
+async def _run_score_task(task_id: str, term: str, stock_code: str, company_name: str):
+    """后台执行打分任务（防刷新：独立于 HTTP 请求生命周期）"""
+    try:
+        _score_tasks[task_id]["status"] = "running"
+        result = await _scoring_engine.score_stock_for_term(term, stock_code, company_name)
+
+        if result.get("error"):
+            _score_tasks[task_id] = {"status": "failed", "error": result["error"]}
+            return
+
+        term_score = result["term_score"]
+        _score_tasks[task_id] = {
+            "status": "completed",
+            "result": {
+                "score": term_score.get("score"),
+                "score_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "term": term,
+                "stock_code": stock_code,
+                "company_name": company_name,
+            }
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 打分后台任务失败: {e}", exc_info=True)
+        _score_tasks[task_id] = {"status": "failed", "error": str(e)}
+
+
 @app.post("/api/score/{term}/{stock_code}")
-async def score_stock(term: str, stock_code: str):
-    """对指定股票执行指定限期打分"""
+async def trigger_score(term: str, stock_code: str):
+    """触发打分（后台异步），返回 task_id 供轮询"""
     if term not in ("short", "medium", "long", "quick_screen"):
         raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
 
@@ -1195,21 +1223,30 @@ async def score_stock(term: str, stock_code: str):
     if not stock:
         raise HTTPException(status_code=404, detail=f"股票 {stock_code} 不在{term}池中")
 
-    # 运行完整分析+打分，但只存储当前期限的评分
-    result = await _scoring_engine.score_stock_for_term(term, stock_code, stock["company_name"])
-
-    if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
-
-    term_score = result["term_score"]
-
-    return {
-        "score": term_score.get("score"),
-        "score_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "term": term,
-        "stock_code": stock_code,
-        "company_name": stock["company_name"],
+    task_id = str(uuid.uuid4())[:8]
+    company_name = stock["company_name"]
+    _score_tasks[task_id] = {
+        "status": "pending", "term": term,
+        "stock_code": stock_code, "company_name": company_name,
     }
+    asyncio.create_task(_run_score_task(task_id, term, stock_code, company_name))
+
+    return {"task_id": task_id, "status": "pending", "stock_code": stock_code, "company_name": company_name}
+
+
+@app.get("/api/score/{task_id}")
+async def get_score_status(task_id: str):
+    """查询打分任务状态（轮询用）"""
+    task = _score_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if task["status"] == "completed":
+        return {"status": "completed", "result": task["result"]}
+    elif task["status"] == "failed":
+        return {"status": "failed", "error": task.get("error", "未知错误")}
+    else:
+        return {"status": task["status"]}
 
 
 # ──────────────────────────────────────────────
@@ -1410,9 +1447,32 @@ async def _direct_llm_score(
         raise
 
 
+async def _run_quick_score_task(task_id: str, term: str, stock_code: str, company_name: str):
+    """后台执行快筛打分（防刷新）"""
+    try:
+        _quick_score_tasks[task_id]["status"] = "running"
+        stock_data = await fetch_stock_data(stock_code)
+        company_name = stock_data.get("company_name") or company_name
+        result = await _direct_llm_score(term, stock_code, company_name, stock_data)
+
+        _pool_manager.update_quick_screen_score(stock_code, term, {
+            "score": result.get("score"),
+            "score_time": result.get("score_time", ""),
+            "recommendation": result.get("recommendation", ""),
+            "suggested_action": result.get("suggested_action", ""),
+            "reasoning": result.get("reasoning", ""),
+            "risk_warning": result.get("risk_warning", ""),
+        })
+
+        _quick_score_tasks[task_id] = {"status": "completed", "result": result}
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 快筛打分后台任务失败: {e}", exc_info=True)
+        _quick_score_tasks[task_id] = {"status": "failed", "error": str(e)}
+
+
 @app.post("/api/quick-screen/score/{term}/{stock_code}")
-async def quick_screen_score(term: str, stock_code: str):
-    """快筛股票池打分 — 绕过MCP ReAct，直连HTTP数据+LLM打分（qwen3.6-flash）"""
+async def trigger_quick_screen_score(term: str, stock_code: str):
+    """触发快筛打分（后台异步），返回 task_id 供轮询"""
     if term not in ("short", "medium", "long"):
         raise HTTPException(status_code=400, detail="期限必须为 short/medium/long")
 
@@ -1424,30 +1484,30 @@ async def quick_screen_score(term: str, stock_code: str):
     if not stock:
         raise HTTPException(status_code=404, detail=f"股票 {stock_code} 不在快筛股票池中")
 
+    task_id = str(uuid.uuid4())[:8]
     company_name = stock["company_name"]
+    _quick_score_tasks[task_id] = {
+        "status": "pending", "term": term,
+        "stock_code": stock_code, "company_name": company_name,
+    }
+    asyncio.create_task(_run_quick_score_task(task_id, term, stock_code, company_name))
 
-    try:
-        # 1. 直连 HTTP 获取股票数据（1-3秒，复用快速查询路径）
-        stock_data = await fetch_stock_data(stock_code)
-        company_name = stock_data.get("company_name") or company_name
+    return {"task_id": task_id, "status": "pending", "stock_code": stock_code, "company_name": company_name}
 
-        # 2. 构建打分 prompt + 调用 qwen3.6-flash
-        result = await _direct_llm_score(term, stock_code, company_name, stock_data)
 
-        # 3. 持久化打分结果到股票池
-        _pool_manager.update_quick_screen_score(stock_code, term, {
-            "score": result.get("score"),
-            "score_time": result.get("score_time", ""),
-            "recommendation": result.get("recommendation", ""),
-            "suggested_action": result.get("suggested_action", ""),
-            "reasoning": result.get("reasoning", ""),
-            "risk_warning": result.get("risk_warning", ""),
-        })
+@app.get("/api/quick-screen/score/{task_id}")
+async def get_quick_score_status(task_id: str):
+    """查询快筛打分任务状态（轮询用）"""
+    task = _quick_score_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
 
-        return result
-    except Exception as e:
-        logger.error(f"{ERROR_ICON} 快筛直接打分失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    if task["status"] == "completed":
+        return {"status": "completed", "result": task["result"]}
+    elif task["status"] == "failed":
+        return {"status": "failed", "error": task.get("error", "未知错误")}
+    else:
+        return {"status": task["status"]}
 
 
 @app.get("/api/cache/{stock_code}")
@@ -1869,6 +1929,17 @@ async def qa_ask(req: QARequest):
         raise HTTPException(status_code=400, detail="问题不能为空")
 
     question = req.question.strip()
+
+    # 名称→代码自动查找：用户只提供股票名称时，自动补全代码
+    from src.qa.task_planner import extract_stock_from_question
+    qa_code, qa_name = extract_stock_from_question(question, "", "")
+    if not qa_code and qa_name:
+        found_code = _lookup_stock_code_by_name(qa_name)
+        if found_code:
+            qa_code = normalize_code(found_code)
+            logger.info(f"QA名称→代码: {qa_name} → {qa_code}")
+            # 将代码追加到问题中，确保下游解析能正确提取
+            question = f"{question}（{found_code}）"
 
     now = datetime.now()
     current_date = now.strftime("%Y-%m-%d")

@@ -28,7 +28,10 @@ from api_client import (
     get_pool,
     add_to_pool,
     remove_from_pool,
-    score_stock,
+    trigger_score,
+    poll_score_result,
+    trigger_quick_score,
+    poll_quick_score_result,
     score_quick_screen,
     trigger_report,
     poll_report_status,
@@ -57,8 +60,17 @@ def handle_add_to_pool(term: str, code: str, name: str) -> dict:
 def handle_remove_from_pool(term: str, code: str) -> dict:
     return _ar(remove_from_pool(term, code))
 
-def handle_score_stock(term: str, code: str) -> dict:
-    return _ar(score_stock(term, code))
+def handle_trigger_score(term: str, code: str) -> str:
+    return _ar(trigger_score(term, code))
+
+def handle_poll_score(task_id: str) -> dict:
+    return _ar(poll_score_result(task_id))
+
+def handle_trigger_quick_score(term: str, code: str) -> str:
+    return _ar(trigger_quick_score(term, code))
+
+def handle_poll_quick_score(task_id: str) -> dict:
+    return _ar(poll_quick_score_result(task_id))
 
 def handle_trigger_report(stock_input: str) -> str:
     return _ar(trigger_report(stock_input))
@@ -170,55 +182,32 @@ def _on_cancel_delete(tk):
     st.rerun()
 
 def _on_score(tk, code):
-    st.session_state["_pool_busy"] = True
+    """触发打分（后台异步），立即返回 task_id"""
     st.session_state[_rk(tk, "_action_result")] = None
     st.session_state[_rk(tk, "_action_error")] = None
     try:
-        r = handle_score_stock(tk, code)
-        st.session_state["_pool_scores"].setdefault(tk, {})[code] = {
-            "score": r.get("score"), "score_time": r.get("score_time", ""),
-        }
-        st.session_state[_rk(tk, "_action_result")] = f"打分完成: {code} → {r.get('score', '?')} 分"
+        task_id = handle_trigger_score(tk, code)
+        st.session_state[f"_score_task_{tk}_{code}"] = task_id
+        st.session_state[f"_score_label_{tk}_{code}"] = code
     except APIError as e:
-        st.session_state[_rk(tk, "_action_error")] = f"打分失败: {e}"
+        st.session_state[_rk(tk, "_action_error")] = f"触发打分失败: {e}"
     except Exception as e:
-        st.session_state[_rk(tk, "_action_error")] = f"打分异常: {e}"
-    finally:
-        st.session_state["_pool_busy"] = False
-        st.rerun()
+        st.session_state[_rk(tk, "_action_error")] = f"触发打分异常: {e}"
+    st.rerun()
 
 def _on_qs_score(tk, term, code):
-    st.session_state["_pool_busy"] = True
+    """触发快筛打分（后台异步），立即返回 task_id"""
     st.session_state[_rk(tk, "_action_result")] = None
     st.session_state[_rk(tk, "_action_error")] = None
     try:
-        r = handle_quick_screen_score(term, code)
-        raw = r.get("score")
-        try:
-            sc = float(raw) if raw is not None else None
-        except (ValueError, TypeError):
-            sc = None
-        qs = st.session_state["_pool_scores_quick"]
-        if code not in qs: qs[code] = {}
-        qs[code][term] = {
-            "score": sc, "score_time": r.get("score_time", ""),
-            "recommendation": r.get("recommendation", ""),
-            "suggested_action": r.get("suggested_action", ""),
-            "reasoning": r.get("reasoning", ""),
-            "risk_warning": r.get("risk_warning", ""),
-        }
-        lbl = {"short": "短线", "medium": "中线", "long": "长线"}[term]
-        st.session_state[_rk(tk, "_action_result")] = (
-            f"快筛{lbl}打分完成: {code} → {sc:.1f} 分" if sc is not None
-            else f"快筛{lbl}打分完成: {code} → 评分失败"
-        )
+        task_id = handle_trigger_quick_score(term, code)
+        st.session_state[f"_qs_task_{tk}_{term}_{code}"] = task_id
+        st.session_state[f"_qs_label_{tk}_{term}_{code}"] = f"{code} {term}"
     except APIError as e:
-        st.session_state[_rk(tk, "_action_error")] = f"快筛打分失败: {e}"
+        st.session_state[_rk(tk, "_action_error")] = f"触发快筛打分失败: {e}"
     except Exception as e:
-        st.session_state[_rk(tk, "_action_error")] = f"快筛打分异常: {e}"
-    finally:
-        st.session_state["_pool_busy"] = False
-        st.rerun()
+        st.session_state[_rk(tk, "_action_error")] = f"触发快筛打分异常: {e}"
+    st.rerun()
 
 def _on_report(code, name):
     st.session_state["_pool_busy"] = True
@@ -413,6 +402,91 @@ for tab, tk in zip(tabs, TERM_KEYS):
             st.session_state[pk] = 0
             st.rerun()
 
+
+# ──────────────────────────────────────────────
+# 打分轮询（Tab 外，刷新安全）
+# ──────────────────────────────────────────────
+for tk in TERM_KEYS:
+    for key in list(st.session_state.keys()):
+        if not key.startswith(f"_score_task_{tk}_"):
+            continue
+        code = key[len(f"_score_task_{tk}_"):]
+        task_id = st.session_state[key]
+        if not task_id:
+            continue
+        with st.status(f"正在对 **{code}** 进行{POOL_TERMS.get(tk, tk)}打分...", expanded=True, state="running") as status:
+            try:
+                r = handle_poll_score(task_id)
+                if r.get("status") == "completed":
+                    res = r["result"]
+                    st.session_state["_pool_scores"].setdefault(tk, {})[code] = {
+                        "score": res.get("score"), "score_time": res.get("score_time", ""),
+                    }
+                    st.session_state[_rk(tk, "_action_result")] = f"打分完成: {code} → {res.get('score', '?')} 分"
+                    status.update(label=f"打分完成: {code}", state="complete", expanded=False)
+                else:
+                    st.session_state[_rk(tk, "_action_error")] = f"打分失败: {r.get('error', '未知错误')}"
+                    status.update(label="打分失败", state="error", expanded=False)
+            except APIError as e:
+                st.session_state[_rk(tk, "_action_error")] = f"打分轮询失败: {e}"
+                status.update(label="打分失败", state="error", expanded=False)
+            except Exception as e:
+                st.session_state[_rk(tk, "_action_error")] = f"打分轮询异常: {e}"
+                status.update(label="打分失败", state="error", expanded=False)
+            finally:
+                st.session_state.pop(key, None)
+                _refresh_pool(tk)
+
+# 快筛打分轮询
+for code_key in list(st.session_state.keys()):
+    if not code_key.startswith("_qs_task_"):
+        continue
+    # key format: _qs_task_{tk}_{term}_{code}
+    parts = code_key[len("_qs_task_"):].split("_", 2)
+    if len(parts) < 3:
+        continue
+    tk, term, code = parts[0], parts[1], parts[2]
+    task_id = st.session_state[code_key]
+    if not task_id:
+        continue
+    lbl = {"short": "短线", "medium": "中线", "long": "长线"}.get(term, term)
+    pool_label = POOL_TERMS.get(tk, tk)
+    with st.status(f"正在对 **{code}** 进行快筛{lbl}打分...", expanded=True, state="running") as status:
+        try:
+            r = handle_poll_quick_score(task_id)
+            if r.get("status") == "completed":
+                res = r["result"]
+                raw = res.get("score")
+                try:
+                    sc = float(raw) if raw is not None else None
+                except (ValueError, TypeError):
+                    sc = None
+                qs = st.session_state["_pool_scores_quick"]
+                if code not in qs: qs[code] = {}
+                qs[code][term] = {
+                    "score": sc, "score_time": res.get("score_time", ""),
+                    "recommendation": res.get("recommendation", ""),
+                    "suggested_action": res.get("suggested_action", ""),
+                    "reasoning": res.get("reasoning", ""),
+                    "risk_warning": res.get("risk_warning", ""),
+                }
+                st.session_state[_rk(tk, "_action_result")] = (
+                    f"快筛{lbl}打分完成: {code} → {sc:.1f} 分" if sc is not None
+                    else f"快筛{lbl}打分完成: {code} → 评分失败"
+                )
+                status.update(label=f"快筛{lbl}打分完成: {code}", state="complete", expanded=False)
+            else:
+                st.session_state[_rk(tk, "_action_error")] = f"快筛打分失败: {r.get('error', '未知错误')}"
+                status.update(label="快筛打分失败", state="error", expanded=False)
+        except APIError as e:
+            st.session_state[_rk(tk, "_action_error")] = f"快筛打分轮询失败: {e}"
+            status.update(label="快筛打分失败", state="error", expanded=False)
+        except Exception as e:
+            st.session_state[_rk(tk, "_action_error")] = f"快筛打分轮询异常: {e}"
+            status.update(label="快筛打分失败", state="error", expanded=False)
+        finally:
+            st.session_state.pop(code_key, None)
+            _refresh_pool(tk)
 
 # ──────────────────────────────────────────────
 # 报告生成状态（Tab 外，避免切换丢失）

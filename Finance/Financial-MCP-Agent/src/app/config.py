@@ -34,6 +34,7 @@ POOL_TERMS = {
     "short": "短线投资池",
     "medium": "中线投资池",
     "long": "长线投资池",
+    "fine": "📊 精筛股票池",
 }
 
 QUICK_SCREEN_TIMEOUT = 600  # 快筛单期打分超时（秒），需覆盖4分析Agent+1打分Agent

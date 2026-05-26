@@ -86,6 +86,7 @@ _task_statuses: Dict[str, str] = {}
 _task_progress: Dict[str, float] = {}  # task_id → 0.0~1.0
 _score_tasks: Dict[str, Dict[str, Any]] = {}  # task_id → {status, result, ...}
 _quick_score_tasks: Dict[str, Dict[str, Any]] = {}  # task_id → {status, result, ...}
+_score_all_tasks: Dict[str, Dict[str, Any]] = {}  # task_id → {status, result, ...}
 _scoring_engine: Optional[ScoringEngine] = None
 _pool_manager: Optional[StockPoolManager] = None
 
@@ -1143,7 +1144,7 @@ async def get_report_status(task_id: str):
 @app.get("/api/pool/{term}")
 async def get_pool(term: str):
     """获取指定期限股票池内容（term: short/medium/long）"""
-    if term not in ("short", "medium", "long", "quick_screen"):
+    if term not in ("short", "medium", "long", "quick_screen", "fine"):
         raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
 
     if not _pool_manager:
@@ -1156,7 +1157,7 @@ async def get_pool(term: str):
 @app.post("/api/pool/{term}")
 async def add_to_pool(term: str, request: PoolAddRequest):
     """向指定期限股票池添加股票"""
-    if term not in ("short", "medium", "long", "quick_screen"):
+    if term not in ("short", "medium", "long", "quick_screen", "fine"):
         raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
 
     if not _pool_manager:
@@ -1170,7 +1171,7 @@ async def add_to_pool(term: str, request: PoolAddRequest):
 @app.delete("/api/pool/{term}/{stock_code}")
 async def remove_from_pool(term: str, stock_code: str):
     """从指定期限股票池删除股票"""
-    if term not in ("short", "medium", "long", "quick_screen"):
+    if term not in ("short", "medium", "long", "quick_screen", "fine"):
         raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
 
     if not _pool_manager:
@@ -1212,7 +1213,7 @@ async def _run_score_task(task_id: str, term: str, stock_code: str, company_name
 @app.post("/api/score/{term}/{stock_code}")
 async def trigger_score(term: str, stock_code: str):
     """触发打分（后台异步），返回 task_id 供轮询"""
-    if term not in ("short", "medium", "long", "quick_screen"):
+    if term not in ("short", "medium", "long", "quick_screen", "fine"):
         raise HTTPException(status_code=400, detail="期限必须为 short/medium/long/quick_screen")
 
     if not _pool_manager or not _scoring_engine:
@@ -1238,6 +1239,83 @@ async def trigger_score(term: str, stock_code: str):
 async def get_score_status(task_id: str):
     """查询打分任务状态（轮询用）"""
     task = _score_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if task["status"] == "completed":
+        return {"status": "completed", "result": task["result"]}
+    elif task["status"] == "failed":
+        return {"status": "failed", "error": task.get("error", "未知错误")}
+    else:
+        return {"status": task["status"]}
+
+
+# ──────────────────────────────────────────────
+# 精筛股票池三期限并行打分
+# ──────────────────────────────────────────────
+
+async def _run_score_all_task(task_id: str, stock_code: str, company_name: str):
+    """后台执行精筛打分（三期限并行）"""
+    try:
+        _score_all_tasks[task_id]["status"] = "running"
+        result = await _scoring_engine.score_stock(stock_code, company_name)
+
+        if result.get("error"):
+            _score_all_tasks[task_id] = {"status": "failed", "error": result["error"]}
+            return
+
+        score_data = result["score_data"]
+        short_ts = score_data.get("short_term_score", {})
+        medium_ts = score_data.get("medium_term_score", {})
+        long_ts = score_data.get("long_term_score", {})
+
+        _pool_manager.update_fine_scores(stock_code, {
+            "short_term_score": short_ts,
+            "medium_term_score": medium_ts,
+            "long_term_score": long_ts,
+        })
+
+        _score_all_tasks[task_id] = {
+            "status": "completed",
+            "result": {
+                "stock_code": stock_code,
+                "company_name": company_name,
+                "short_term_score": short_ts,
+                "medium_term_score": medium_ts,
+                "long_term_score": long_ts,
+                "execution_time": result.get("execution_time"),
+            }
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 精筛打分后台任务失败: {e}", exc_info=True)
+        _score_all_tasks[task_id] = {"status": "failed", "error": str(e)}
+
+
+@app.post("/api/score-all/{stock_code}")
+async def trigger_score_all(stock_code: str):
+    """触发精筛三期限并行打分（后台异步），返回 task_id"""
+    if not _pool_manager or not _scoring_engine:
+        raise HTTPException(status_code=500, detail="服务未初始化")
+
+    stock_code = normalize_code(stock_code)
+    stock = _pool_manager.get_stock_in_fine(stock_code)
+    if not stock:
+        raise HTTPException(status_code=404, detail=f"股票 {stock_code} 不在精筛池中")
+
+    task_id = str(uuid.uuid4())[:8]
+    company_name = stock["company_name"]
+    _score_all_tasks[task_id] = {
+        "status": "pending", "stock_code": stock_code, "company_name": company_name,
+    }
+    asyncio.create_task(_run_score_all_task(task_id, stock_code, company_name))
+
+    return {"task_id": task_id, "status": "pending", "stock_code": stock_code, "company_name": company_name}
+
+
+@app.get("/api/score-all/{task_id}")
+async def get_score_all_status(task_id: str):
+    """查询精筛打分任务状态（轮询用）"""
+    task = _score_all_tasks.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 

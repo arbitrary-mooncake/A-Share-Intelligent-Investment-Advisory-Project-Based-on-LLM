@@ -344,6 +344,57 @@ async def score_quick_screen(term: str, stock_code: str) -> dict:
     raise APIError(data.get("error", "快筛打分失败"))
 
 
+# ──────────────────────────────────────────────
+# 精筛股票池三期限并行打分 API
+# ──────────────────────────────────────────────
+
+async def trigger_score_all(stock_code: str) -> str:
+    """触发精筛三期限并行打分，返回 task_id"""
+    if MOCK_MODE:
+        return "mock_fine_task_12345"
+
+    try:
+        async with httpx.AsyncClient(timeout=SCORE_TRIGGER_TIMEOUT) as client:
+            resp = await client.post(f"{API_BASE_URL}/api/score-all/{stock_code}")
+            resp.raise_for_status()
+            return resp.json()["task_id"]
+    except httpx.HTTPStatusError as e:
+        raise APIError(f"触发精筛打分失败: {e.response.text}", e.response.status_code)
+    except httpx.RequestError as e:
+        raise APIError(f"连接后端失败: {e}")
+
+
+async def poll_score_all_result(task_id: str) -> dict:
+    """轮询精筛打分结果直到完成或失败"""
+    if MOCK_MODE:
+        import random
+        from datetime import datetime
+        await asyncio.sleep(1)
+        return {
+            "status": "completed",
+            "result": {
+                "stock_code": "sh.603871", "company_name": "嘉友国际",
+                "short_term_score": {"score": 72, "rating": "买入"},
+                "medium_term_score": {"score": 77, "rating": "推荐"},
+                "long_term_score": {"score": 85, "rating": "强烈买入"},
+                "execution_time": 94.5,
+            }
+        }
+
+    try:
+        for attempt in range(SCORE_POLL_MAX_ATTEMPTS):
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{API_BASE_URL}/api/score-all/{task_id}")
+                resp.raise_for_status()
+                data = resp.json()
+                if data["status"] in ("completed", "failed"):
+                    return data
+            await asyncio.sleep(SCORE_POLL_INTERVAL)
+        raise APIError(f"精筛打分超时")
+    except httpx.RequestError as e:
+        raise APIError(f"查询精筛打分状态失败: {e}")
+
+
 async def get_cache_status(stock_code: str) -> dict:
     """查看某只股票的中间产物缓存状态"""
     if MOCK_MODE:

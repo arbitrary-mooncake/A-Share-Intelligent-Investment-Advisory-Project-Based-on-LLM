@@ -6,6 +6,7 @@
 import asyncio
 import os
 import sys
+from datetime import datetime
 
 _app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _app_dir not in sys.path:
@@ -17,6 +18,8 @@ from components.pool_table import (
     render_add_stock_form,
     render_display_row,
     render_pool_list,
+    render_fine_display_row,
+    render_fine_pool_list,
     render_pagination,
 )
 from components.quick_screen_table import (
@@ -28,8 +31,8 @@ from api_client import (
     get_pool,
     add_to_pool,
     remove_from_pool,
-    trigger_score,
-    poll_score_result,
+    trigger_score_all,
+    poll_score_all_result,
     trigger_quick_score,
     poll_quick_score_result,
     score_quick_screen,
@@ -60,11 +63,11 @@ def handle_add_to_pool(term: str, code: str, name: str) -> dict:
 def handle_remove_from_pool(term: str, code: str) -> dict:
     return _ar(remove_from_pool(term, code))
 
-def handle_trigger_score(term: str, code: str) -> str:
-    return _ar(trigger_score(term, code))
+def handle_trigger_score_all(code: str) -> str:
+    return _ar(trigger_score_all(code))
 
-def handle_poll_score(task_id: str) -> dict:
-    return _ar(poll_score_result(task_id))
+def handle_poll_score_all(task_id: str) -> dict:
+    return _ar(poll_score_all_result(task_id))
 
 def handle_trigger_quick_score(term: str, code: str) -> str:
     return _ar(trigger_quick_score(term, code))
@@ -87,8 +90,8 @@ def handle_quick_screen_score(term: str, code: str) -> dict:
 # ──────────────────────────────────────────────
 if "_pool_busy" not in st.session_state:
     st.session_state["_pool_busy"] = False
-if "_pool_scores" not in st.session_state:
-    st.session_state["_pool_scores"] = {"short": {}, "medium": {}, "long": {}}
+if "_pool_scores_fine" not in st.session_state:
+    st.session_state["_pool_scores_fine"] = {}
 if "_pool_scores_quick" not in st.session_state:
     st.session_state["_pool_scores_quick"] = {}
 if "_report_task_id" not in st.session_state:
@@ -98,7 +101,7 @@ if "_report_result" not in st.session_state:
 if "_report_error" not in st.session_state:
     st.session_state["_report_error"] = None
 
-TERM_KEYS = ["quick_screen", "short", "medium", "long"]
+TERM_KEYS = ["quick_screen", "fine"]
 for tk in TERM_KEYS:
     for s, d in [
         ("_action_result", None), ("_action_error", None),
@@ -165,8 +168,8 @@ def _on_confirm_delete(tk):
         st.session_state[_rk(tk, "_action_result")] = f"已删除 {code}"
         if tk == "quick_screen":
             st.session_state["_pool_scores_quick"].pop(code, None)
-        else:
-            st.session_state["_pool_scores"].setdefault(tk, {}).pop(code, None)
+        elif tk == "fine":
+            st.session_state["_pool_scores_fine"].pop(code, None)
         st.session_state[_rk(tk, "_selected")] = None
         st.session_state[_rk(tk, "_confirm_delete")] = False
     except APIError as e:
@@ -181,19 +184,34 @@ def _on_cancel_delete(tk):
     st.session_state[_rk(tk, "_confirm_delete")] = False
     st.rerun()
 
-def _on_score(tk, code):
-    """触发打分（后台异步），立即返回 task_id"""
-    st.session_state[_rk(tk, "_action_result")] = None
-    st.session_state[_rk(tk, "_action_error")] = None
+def _on_fine_score(code):
+    """精筛池触发三期限并行打分"""
+    st.session_state[_rk("fine", "_action_result")] = None
+    st.session_state[_rk("fine", "_action_error")] = None
     try:
-        task_id = handle_trigger_score(tk, code)
-        st.session_state[f"_score_task_{tk}_{code}"] = task_id
-        st.session_state[f"_score_label_{tk}_{code}"] = code
+        task_id = handle_trigger_score_all(code)
+        st.session_state[f"_fine_score_task_{code}"] = task_id
     except APIError as e:
-        st.session_state[_rk(tk, "_action_error")] = f"触发打分失败: {e}"
+        st.session_state[_rk("fine", "_action_error")] = f"触发打分失败: {e}"
     except Exception as e:
-        st.session_state[_rk(tk, "_action_error")] = f"触发打分异常: {e}"
+        st.session_state[_rk("fine", "_action_error")] = f"触发打分异常: {e}"
     st.rerun()
+
+def _on_fine_report(code, name):
+    """精筛池触发深度报告"""
+    st.session_state["_pool_busy"] = True
+    st.session_state["_report_task_id"] = None
+    st.session_state["_report_result"] = None
+    st.session_state["_report_error"] = None
+    st.session_state["_report_input_label"] = f"{name}({code})"
+    try:
+        st.session_state["_report_task_id"] = handle_trigger_report(name)
+    except APIError as e:
+        st.session_state["_report_error"] = str(e)
+        st.session_state["_pool_busy"] = False
+    except Exception as e:
+        st.session_state["_report_error"] = f"触发报告异常: {e}"
+        st.session_state["_pool_busy"] = False
 
 def _on_qs_score(tk, term, code):
     """触发快筛打分（后台异步），立即返回 task_id"""
@@ -285,14 +303,6 @@ for tab, tk in zip(tabs, TERM_KEYS):
                     for t in ("short", "medium", "long"):
                         if t in persisted and persisted[t]:
                             qs[code][t] = persisted[t]
-        else:
-            ts = st.session_state["_pool_scores"].setdefault(tk, {})
-            for s in stocks:
-                code = s.get("stock_code", "")
-                if code and code not in ts:
-                    sc = s.get("score")
-                    if sc is not None:
-                        ts[code] = {"score": sc, "score_time": s.get("last_updated", "")}
 
         # 构建展示数据
         if tk == "quick_screen":
@@ -302,12 +312,23 @@ for tab, tk in zip(tabs, TERM_KEYS):
                           "scores": qs.get(s.get("stock_code", ""), {})}
                         for s in stocks]
         else:
-            ts = st.session_state["_pool_scores"].setdefault(tk, {})
-            d_stocks = [{"stock_code": s.get("stock_code", ""),
-                          "company_name": s.get("company_name", ""),
-                          "score": ts.get(s.get("stock_code", ""), {}).get("score"),
-                          "score_time": ts.get(s.get("stock_code", ""), {}).get("score_time", "")}
-                        for s in stocks]
+            # 精筛池：直接从后端数据读取三期限评分
+            d_stocks = []
+            for s in stocks:
+                code = s.get("stock_code", "")
+                name = s.get("company_name", "")
+                ss = s.get("scores", {})
+                d_stocks.append({
+                    "stock_code": code,
+                    "company_name": name,
+                    "scores": {
+                        "short": ss.get("short", {}),
+                        "medium": ss.get("medium", {}),
+                        "long": ss.get("long", {}),
+                    },
+                    "last_updated": s.get("last_updated", ""),
+                    "status": s.get("status", "pending"),
+                })
 
         # 选中状态
         sk = _rk(tk, "_selected")
@@ -367,16 +388,16 @@ for tab, tk in zip(tabs, TERM_KEYS):
                     disabled=is_busy,
                 )
             else:
-                render_display_row(
+                render_fine_display_row(
                     stock=sel_stock, term_key=tk,
-                    on_score=lambda c: _on_score(tk, c),
-                    on_report=lambda c, n: _on_report(c, n),
+                    on_score=lambda c: _on_fine_score(c),
+                    on_report=lambda c, n: _on_fine_report(c, n),
                     on_delete=lambda c: _on_delete(tk, c),
                     on_deselect=lambda: _on_deselect(tk),
                     disabled=is_busy,
                 )
 
-        # ── 下方：密集列表（点击选中，不跳页）──
+        # ── 下方：密集列表 ──
         pk = _rk(tk, "_page")
         psk = _rk(tk, "_page_size")
         page = st.session_state.get(pk, 0)
@@ -386,8 +407,8 @@ for tab, tk in zip(tabs, TERM_KEYS):
             st.caption("点击列表行选中股票，在上方显示行中进行交互。使用 qwen3.6-flash 高速模型。")
             render_quick_list(d_stocks, tk, sel_code, lambda c: _on_select(tk, c), page, page_size)
         else:
-            st.caption(f"点击列表行选中股票，在上方显示行中进行交互。当前池：{POOL_TERMS.get(tk, tk)}")
-            render_pool_list(d_stocks, tk, sel_code, lambda c: _on_select(tk, c), page, page_size)
+            st.caption("点击列表行选中股票。三期限并行打分：短线/中线/长线同步产出。")
+            render_fine_pool_list(d_stocks, tk, sel_code, lambda c: _on_select(tk, c), page, page_size)
 
         if not d_stocks:
             st.info("当前池为空，请添加股票")
@@ -404,38 +425,46 @@ for tab, tk in zip(tabs, TERM_KEYS):
 
 
 # ──────────────────────────────────────────────
-# 打分轮询（Tab 外，刷新安全）
+# 精筛打分轮询（Tab 外，刷新安全）
 # ──────────────────────────────────────────────
-for tk in TERM_KEYS:
-    for key in list(st.session_state.keys()):
-        if not key.startswith(f"_score_task_{tk}_"):
-            continue
-        code = key[len(f"_score_task_{tk}_"):]
-        task_id = st.session_state[key]
-        if not task_id:
-            continue
-        with st.status(f"正在对 **{code}** 进行{POOL_TERMS.get(tk, tk)}打分...", expanded=True, state="running") as status:
-            try:
-                r = handle_poll_score(task_id)
-                if r.get("status") == "completed":
-                    res = r["result"]
-                    st.session_state["_pool_scores"].setdefault(tk, {})[code] = {
-                        "score": res.get("score"), "score_time": res.get("score_time", ""),
-                    }
-                    st.session_state[_rk(tk, "_action_result")] = f"打分完成: {code} → {res.get('score', '?')} 分"
-                    status.update(label=f"打分完成: {code}", state="complete", expanded=False)
-                else:
-                    st.session_state[_rk(tk, "_action_error")] = f"打分失败: {r.get('error', '未知错误')}"
-                    status.update(label="打分失败", state="error", expanded=False)
-            except APIError as e:
-                st.session_state[_rk(tk, "_action_error")] = f"打分轮询失败: {e}"
+for key in list(st.session_state.keys()):
+    if not key.startswith("_fine_score_task_"):
+        continue
+    code = key[len("_fine_score_task_"):]
+    task_id = st.session_state[key]
+    if not task_id:
+        continue
+    with st.status(f"正在对 **{code}** 进行精筛三期限打分...", expanded=True, state="running") as status:
+        try:
+            r = handle_poll_score_all(task_id)
+            if r.get("status") == "completed":
+                res = r["result"]
+                st = res.get("short_term_score", {})
+                mt = res.get("medium_term_score", {})
+                lt = res.get("long_term_score", {})
+                ss = st.get("score", "-")
+                ms = mt.get("score", "-")
+                ls = lt.get("score", "-")
+                st.session_state["_pool_scores_fine"][code] = {
+                    "short": st, "medium": mt, "long": lt,
+                    "score_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+                st.session_state[_rk("fine", "_action_result")] = (
+                    f"打分完成: {code} → 短线{ss} / 中线{ms} / 长线{ls}"
+                )
+                status.update(label=f"打分完成: {code}", state="complete", expanded=False)
+            else:
+                st.session_state[_rk("fine", "_action_error")] = f"打分失败: {r.get('error', '未知错误')}"
                 status.update(label="打分失败", state="error", expanded=False)
-            except Exception as e:
-                st.session_state[_rk(tk, "_action_error")] = f"打分轮询异常: {e}"
-                status.update(label="打分失败", state="error", expanded=False)
-            finally:
-                st.session_state.pop(key, None)
-                _refresh_pool(tk)
+        except APIError as e:
+            st.session_state[_rk("fine", "_action_error")] = f"打分轮询失败: {e}"
+            status.update(label="打分失败", state="error", expanded=False)
+        except Exception as e:
+            st.session_state[_rk("fine", "_action_error")] = f"打分轮询异常: {e}"
+            status.update(label="打分失败", state="error", expanded=False)
+        finally:
+            st.session_state.pop(key, None)
+            _refresh_pool("fine")
 
 # 快筛打分轮询
 for code_key in list(st.session_state.keys()):

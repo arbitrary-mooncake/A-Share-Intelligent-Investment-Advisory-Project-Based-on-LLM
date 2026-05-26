@@ -37,8 +37,8 @@ class EvidencePackage:
 
 
 async def _call_tool_safe(tool, kwargs: dict, timeout: float, label: str,
-                         session_id: str = "") -> str:
-    """安全调用单个MCP工具，带超时、per-session缓存+全局缓存+异常保护"""
+                         session_id: str = "", max_retries: int = 2) -> str:
+    """安全调用单个MCP工具，带超时、per-session缓存+全局缓存+空数据重试"""
     # 先查 per-session 缓存
     if session_id:
         cached = get_cached_evidence(session_id, label, kwargs)
@@ -52,24 +52,32 @@ async def _call_tool_safe(tool, kwargs: dict, timeout: float, label: str,
         logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 命中全局缓存 ({len(cached)} 字符)")
         return cached
 
-    try:
-        result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=timeout)
-        text = str(result).strip()
-        if len(text) > 25:
-            logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 成功 ({len(text)} 字符)")
-            if session_id:
-                set_cached_evidence(session_id, label, kwargs, text)
-            set_global_cached_evidence(label, kwargs, text)
-            return text
-        else:
-            logger.warning(f"QA Evidence: {label} 返回过短 ({len(text)} 字符)")
-            return ""
-    except asyncio.TimeoutError:
-        logger.warning(f"QA Evidence: {label} 超时({timeout}s)")
-        return ""
-    except Exception as e:
-        logger.warning(f"QA Evidence: {label} 失败: {e}")
-        return ""
+    last_error = ""
+    for attempt in range(1 + max_retries):
+        try:
+            result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=timeout)
+            text = str(result).strip()
+            if len(text) > 25:
+                logger.info(f"{SUCCESS_ICON} QA Evidence: {label} 成功 ({len(text)} 字符)"
+                           + (f" (第{attempt+1}次)" if attempt > 0 else ""))
+                if session_id:
+                    set_cached_evidence(session_id, label, kwargs, text)
+                set_global_cached_evidence(label, kwargs, text)
+                return text
+            else:
+                last_error = f"返回过短 ({len(text)} 字符)"
+        except asyncio.TimeoutError:
+            last_error = f"超时({timeout}s)"
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < max_retries:
+            wait = 1.5 * (attempt + 1)  # 递增等待: 1.5s, 3s
+            logger.warning(f"QA Evidence: {label} {last_error}，{wait:.1f}s后重试({attempt+1}/{max_retries})...")
+            await asyncio.sleep(wait)
+
+    logger.warning(f"QA Evidence: {label} 最终失败: {last_error}（已重试{max_retries}次）")
+    return ""
 
 
 async def assemble_evidence_fast(

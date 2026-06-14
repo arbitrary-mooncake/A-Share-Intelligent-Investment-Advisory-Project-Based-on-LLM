@@ -144,18 +144,12 @@ async def event_analyst_agent(state: AgentState) -> AgentState:
         for tname in EVENT_TOOL_NAMES:
             if tname in tool_map:
                 if tname == "crawl_news":
-                    # 主查询：股票代码（提高精准度）
-                    if clean_code:
-                        kw1 = {"query": clean_code, "top_k": 10}
-                        tasks.append(_call_tool_safe(tool_map[tname], kw1, f"crawl_news(code={clean_code})"))
-                        labels.append(f"crawl_news(code)")
-                        tool_infos.append((tool_map[tname], kw1))
-                    # 备选查询：公司名称（提高命中率，学习fund event agent模式）
-                    if company_name:
-                        kw2 = {"query": company_name, "top_k": 10}
-                        tasks.append(_call_tool_safe(tool_map[tname], kw2, f"crawl_news(name={company_name})"))
-                        labels.append(f"crawl_news(name)")
-                        tool_infos.append((tool_map[tname], kw2))
+                    # 主查询：股票代码（备选查询通过alt_kwargs_list在重试时使用）
+                    _primary_kw = {"query": clean_code, "top_k": 10}
+                    _fallback_kw = {"query": company_name, "top_k": 10}
+                    tasks.append(_call_tool_safe(tool_map[tname], _primary_kw, f"crawl_news(code={clean_code})"))
+                    labels.append(f"crawl_news(code)")
+                    tool_infos.append((tool_map[tname], _primary_kw))
                 else:
                     kwargs = {"code": clean_code}
                     if tname == "tushare_anns_d":
@@ -167,9 +161,17 @@ async def event_analyst_agent(state: AgentState) -> AgentState:
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
 
         # 空数据重试（最多额外3轮，并发递减8→4→2）
+        # 为 crawl_news 构建备选关键词（首轮重试用公司名称替代股票代码）
+        _alt_kwargs = [None] * len(tool_infos)
+        if company_name and clean_code:
+            for _i, _lbl in enumerate(labels):
+                if "crawl_news" in _lbl and tool_infos[_i] is not None:
+                    _alt_kwargs[_i] = {"query": company_name, "top_k": 10}
+                    break
         results = await retry_failed_fetches(
             results, tool_infos, labels, _call_tool_safe,
             agent_label="EventAnalyst",
+            alt_kwargs_list=_alt_kwargs,
         )
 
         safe_results = []

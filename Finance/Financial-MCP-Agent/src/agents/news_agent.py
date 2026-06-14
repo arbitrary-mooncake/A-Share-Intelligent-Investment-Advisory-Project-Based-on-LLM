@@ -237,17 +237,11 @@ async def news_agent(state: AgentState) -> AgentState:
 
     for tool in news_tools:
         if tool.name == "crawl_news":
-            # 主查询：股票代码
-            if clean_code:
-                kw1 = {"query": clean_code, "top_k": 10}
-                tasks.append(_call_tool_with_timeout(tool, kw1, TOOL_TIMEOUT, f"crawl_news(code={clean_code})"))
-                task_labels.append(f"crawl_news(code)")
-                news_tool_infos.append((tool, kw1))
-            # 备选查询：公司名称
-            kw2 = {"query": company_name, "top_k": 10}
-            tasks.append(_call_tool_with_timeout(tool, kw2, TOOL_TIMEOUT, f"crawl_news(name={company_name})"))
-            task_labels.append(f"crawl_news(name)")
-            news_tool_infos.append((tool, kw2))
+            # 主查询：股票代码（备选查询通过alt_kwargs_list在重试时使用）
+            _primary_kw = {"query": clean_code, "top_k": 10}
+            tasks.append(_call_tool_with_timeout(tool, _primary_kw, TOOL_TIMEOUT, f"crawl_news(code={clean_code})"))
+            task_labels.append(f"crawl_news(code)")
+            news_tool_infos.append((tool, _primary_kw))
 
     # 并行执行（第一轮）
     try:
@@ -260,9 +254,18 @@ async def news_agent(state: AgentState) -> AgentState:
     async def _news_retry_call(tool, kwargs, label):
         return await _call_tool_with_timeout(tool, kwargs, TOOL_TIMEOUT, label)
 
+    # 为 crawl_news 构建备选关键词（首轮重试用公司名称替代股票代码）
+    _alt_kwargs = [None] * len(news_tool_infos)
+    if company_name and clean_code:
+        for _i, _lbl in enumerate(task_labels):
+            if "crawl_news" in _lbl and news_tool_infos[_i] is not None:
+                _alt_kwargs[_i] = {"query": company_name, "top_k": 10}
+                break
+
     results = await retry_failed_fetches(
         results, news_tool_infos, task_labels, _news_retry_call,
         agent_label="NewsAgent",
+        alt_kwargs_list=_alt_kwargs,
     )
 
     phase1_elapsed = time.time() - phase1_start

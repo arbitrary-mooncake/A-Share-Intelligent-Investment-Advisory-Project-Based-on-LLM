@@ -62,11 +62,17 @@ async def _noop_result(text: str) -> str:
 
 async def _call_tool_safe(tool, kwargs: dict, label: str) -> str:
     """调用单个 MCP 工具，带超时和异常保护"""
+    from src.utils.tool_cache import get_cached_tool_result, set_cached_tool_result
+    tool_name = getattr(tool, 'name', 'unknown')
+    cached = await get_cached_tool_result(tool_name, kwargs)
+    if cached:
+        return cached
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=TOOL_TIMEOUT)
         text = str(result).strip()
         if len(text) > 20:
             logger.info(f"{SUCCESS_ICON} FundEventAgent: {label} 获取成功 ({len(text)} 字符)")
+            await set_cached_tool_result(tool_name, kwargs, text)
             return text
         logger.warning(f"FundEventAgent: {label} 返回过短 ({len(text)} 字符)")
         return f"[{label}] 数据不可用（返回过短）"
@@ -107,6 +113,10 @@ async def fund_event_agent(state: AgentState) -> AgentState:
         if cached:
             logger.info(f"{SUCCESS_ICON} FundEventAgent: 命中缓存，跳过分析 ({cache_code})")
             current_data["fund_event"] = cached
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("fund_event", cache_code, cache_date)
+            if cached_sp:
+                current_data["fund_event_signal_pack"] = cached_sp
             current_metadata["fund_event_executed"] = True
             current_metadata["fund_event_cached"] = True
             return {"data": current_data,
@@ -408,7 +418,31 @@ async def fund_event_agent(state: AgentState) -> AgentState:
 6. 数据不可用时，使用「⚠️ 数据不可用：<具体说明缺失内容>」标注
 
 ## ⚠️ 数据限制最终声明
-在分析末尾，请以清单形式列出本次分析中所有「数据不可用」的维度和具体缺失内容，确保阅读者了解分析的局限性。"""
+在分析末尾，请以清单形式列出本次分析中所有「数据不可用」的维度和具体缺失内容，确保阅读者了解分析的局限性。
+
+⛔ 结构化输出要求：
+在完成上述分析后，请额外输出一个 JSON block：
+
+<SIGNAL_PACK>
+{{
+    "bias": "bullish"|"neutral"|"bearish",
+    "confidence": 0.0-1.0 (基金分析置信度),
+    "key_points": ["关键结论1", "关键结论2", ...] (最多5条,每条<80字),
+    "signals": [
+        {{
+            "factor": "因子名",
+            "direction": 1(利多)|-1(利空)|0(中性),
+            "strength": 0-100,
+            "time_horizon": ["medium","long"],
+            "source_level": "structured"|"derived",
+            "note": "一句话说明"
+        }}
+    ] (最多4条),
+    "risk_flags": [],
+    "missing_data": ["缺失项"],
+    "source_summary": "数据来源简述"
+}}
+</SIGNAL_PACK>"""
 
         messages = [
             {"role": "system", "content": "你是一位资深基金研究分析师，专注于中国公募基金的事件监测、风险预警和信息披露分析。你严格遵守数据限制，绝不编造信息，对无法获取的数据如实标注。"},
@@ -421,6 +455,21 @@ async def fund_event_agent(state: AgentState) -> AgentState:
                 timeout=float(LLM_TIMEOUT)
             )
             final_output = response.content.strip() if hasattr(response, 'content') else str(response)
+            # Extract signal_pack from LLM output
+            import json as _json, re as _re
+            sp = None
+            tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', final_output)
+            if tag_match:
+                try:
+                    sp = _json.loads(tag_match.group(1))
+                    sp["agent_name"] = "fund_event"
+                    sp["as_of_date"] = current_date
+                except Exception:
+                    pass
+            if sp is None:
+                from src.utils.analysis_package_builder import text_to_signal_pack
+                sp = text_to_signal_pack(final_output, "fund_event", current_date)
+            current_data["fund_event_signal_pack"] = sp
             phase2_elapsed = time.time() - phase2_start
             logger.info(f"FundEventAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
             llm_success = True
@@ -460,6 +509,9 @@ async def fund_event_agent(state: AgentState) -> AgentState:
         current_data["fund_event"] = final_output
         if not skip_cache and cache_date and cache_code:
             write_cache("fund_event", cache_code, cache_date, final_output)
+            if "fund_event_signal_pack" in current_data:
+                from src.utils.cache_utils import write_signal_pack_cache
+                write_signal_pack_cache("fund_event", cache_code, cache_date, current_data["fund_event_signal_pack"])
         current_metadata["fund_event_executed"] = True
         current_metadata["fund_event_timestamp"] = str(time.time())
         current_metadata["fund_event_execution_time"] = f"{total_time:.2f} seconds"

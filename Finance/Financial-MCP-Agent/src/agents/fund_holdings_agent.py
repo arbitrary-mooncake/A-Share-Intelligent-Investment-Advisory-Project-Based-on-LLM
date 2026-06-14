@@ -158,11 +158,17 @@ async def _noop_result(text: str) -> str:
 
 async def _call_tool_safe(tool, kwargs: dict, label: str) -> str:
     """调用单个 MCP 工具，带超时和异常保护"""
+    from src.utils.tool_cache import get_cached_tool_result, set_cached_tool_result
+    tool_name = getattr(tool, 'name', 'unknown')
+    cached = await get_cached_tool_result(tool_name, kwargs)
+    if cached:
+        return cached
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=TOOL_TIMEOUT)
         text = str(result).strip()
         if len(text) > 20:
             logger.info(f"{SUCCESS_ICON} FundHoldingsAgent: {label} 获取成功 ({len(text)} 字符)")
+            await set_cached_tool_result(tool_name, kwargs, text)
             return text
         logger.warning(f"FundHoldingsAgent: {label} 返回过短 ({len(text)} 字符)")
         return f"[{label}] 数据不可用（返回过短）"
@@ -179,7 +185,7 @@ async def fund_holdings_analysis(state: AgentState) -> AgentState:
     两阶段基金持仓穿透分析：
     Phase 1a: 并行获取基金基本信息与持仓数据
     Phase 1b: 解析持仓中的重仓股代码，为每只重仓股并行获取个股数据
-    Phase 2: 单次 LLM 深度分析（Kimi K2.6, thinking=enabled）
+    Phase 2: 单次 LLM 深度分析（MiMo-V2.5-Pro, thinking=enabled）
     """
     logger.info(f"{WAIT_ICON} FundHoldingsAgent: Starting two-phase fund holdings analysis.")
 
@@ -201,6 +207,10 @@ async def fund_holdings_analysis(state: AgentState) -> AgentState:
         if cached:
             logger.info(f"{SUCCESS_ICON} FundHoldingsAgent: 命中缓存，跳过分析 ({cache_code})")
             current_data["fund_holdings"] = cached
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("fund_holdings", cache_code, cache_date)
+            if cached_sp:
+                current_data["fund_holdings_signal_pack"] = cached_sp
             current_metadata["fund_holdings_executed"] = True
             current_metadata["fund_holdings_cached"] = True
             return {"data": current_data,
@@ -218,7 +228,7 @@ async def fund_holdings_analysis(state: AgentState) -> AgentState:
     agent_start_time = time.time()
 
     try:
-        # 模型配置：Kimi K2.6
+        # 模型配置：MiMo-V2.5-Pro
         model_cfg = get_model_config_for_agent("fund_holdings_agent", current_data)
         api_key = model_cfg["api_key"]
         base_url = model_cfg["base_url"]
@@ -566,7 +576,31 @@ async def fund_holdings_analysis(state: AgentState) -> AgentState:
 - 组合分散度（行业/个股集中度）: 25%
 - 风格一致性（不漂移/不抱团）: 20%
 - 资产配置合理性: 15%
-- 数据时效性（越新越高）: 10%"""
+- 数据时效性（越新越高）: 10%
+
+⛔ 结构化输出要求：
+在完成上述分析后，请额外输出一个 JSON block：
+
+<SIGNAL_PACK>
+{{
+    "bias": "bullish"|"neutral"|"bearish",
+    "confidence": 0.0-1.0 (基金分析置信度),
+    "key_points": ["关键结论1", "关键结论2", ...] (最多5条,每条<80字),
+    "signals": [
+        {{
+            "factor": "因子名",
+            "direction": 1(利多)|-1(利空)|0(中性),
+            "strength": 0-100,
+            "time_horizon": ["medium","long"],
+            "source_level": "structured"|"derived",
+            "note": "一句话说明"
+        }}
+    ] (最多4条),
+    "risk_flags": [],
+    "missing_data": ["缺失项"],
+    "source_summary": "数据来源简述"
+}}
+</SIGNAL_PACK>"""
 
         messages = [
             {"role": "system", "content": "你是一位资深基金分析师，专注于公募基金的持仓穿透、组合结构分析和风格漂移检测。你的分析以数据为驱动，对季报时滞风险保持高度警惕。"},
@@ -579,6 +613,21 @@ async def fund_holdings_analysis(state: AgentState) -> AgentState:
                 timeout=float(LLM_TIMEOUT)
             )
             final_output = response.content.strip() if hasattr(response, 'content') else str(response)
+            # Extract signal_pack from LLM output
+            import json as _json, re as _re
+            sp = None
+            tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', final_output)
+            if tag_match:
+                try:
+                    sp = _json.loads(tag_match.group(1))
+                    sp["agent_name"] = "fund_holdings"
+                    sp["as_of_date"] = current_date
+                except Exception:
+                    pass
+            if sp is None:
+                from src.utils.analysis_package_builder import text_to_signal_pack
+                sp = text_to_signal_pack(final_output, "fund_holdings", current_date)
+            current_data["fund_holdings_signal_pack"] = sp
             phase2_elapsed = time.time() - phase2_start
             logger.info(f"FundHoldingsAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
             llm_success = True
@@ -618,6 +667,9 @@ async def fund_holdings_analysis(state: AgentState) -> AgentState:
         current_data["fund_holdings"] = final_output
         if not skip_cache and cache_date and cache_code:
             write_cache("fund_holdings", cache_code, cache_date, final_output)
+            if "fund_holdings_signal_pack" in current_data:
+                from src.utils.cache_utils import write_signal_pack_cache
+                write_signal_pack_cache("fund_holdings", cache_code, cache_date, current_data["fund_holdings_signal_pack"])
         current_metadata["fund_holdings_executed"] = True
         current_metadata["fund_holdings_timestamp"] = str(time.time())
         current_metadata["fund_holdings_execution_time"] = f"{total_time:.2f} seconds"

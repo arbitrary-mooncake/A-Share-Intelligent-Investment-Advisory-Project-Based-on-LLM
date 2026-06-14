@@ -49,11 +49,17 @@ async def _noop_result(text: str) -> str:
 
 async def _call_tool_safe(tool, kwargs: dict, label: str) -> str:
     """调用单个 MCP 工具，带超时和异常保护"""
+    from src.utils.tool_cache import get_cached_tool_result, set_cached_tool_result
+    tool_name = getattr(tool, 'name', 'unknown')
+    cached = await get_cached_tool_result(tool_name, kwargs)
+    if cached:
+        return cached
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=TOOL_TIMEOUT)
         text = str(result).strip()
         if len(text) > 20:
             logger.info(f"{SUCCESS_ICON} FundManagerAgent: {label} 获取成功 ({len(text)} 字符)")
+            await set_cached_tool_result(tool_name, kwargs, text)
             return text
         logger.warning(f"FundManagerAgent: {label} 返回过短 ({len(text)} 字符)")
         return f"[{label}] 数据不可用（返回过短）"
@@ -91,6 +97,10 @@ async def fund_manager_agent(state: AgentState) -> AgentState:
         if cached:
             logger.info(f"{SUCCESS_ICON} FundManagerAgent: 命中缓存，跳过分析 ({fund_code})")
             current_data["fund_manager"] = cached
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("fund_manager", fund_code, cache_date)
+            if cached_sp:
+                current_data["fund_manager_signal_pack"] = cached_sp
             current_metadata["fund_manager_executed"] = True
             current_metadata["fund_manager_cached"] = True
             return {"data": current_data,
@@ -334,7 +344,31 @@ async def fund_manager_agent(state: AgentState) -> AgentState:
 - 请专注于基金经理和团队质量评估，不要分析基金的投资价值或业绩表现
 - 分析必须有数据支撑，引用上述原始数据中的具体信息
 - 如果某些数据无法获取，请说明原因并基于可用数据提供分析
-- 不要使用模型训练数据中的知识来补充数据事实"""
+- 不要使用模型训练数据中的知识来补充数据事实
+
+⛔ 结构化输出要求：
+在完成上述分析后，请额外输出一个 JSON block：
+
+<SIGNAL_PACK>
+{{
+    "bias": "bullish"|"neutral"|"bearish",
+    "confidence": 0.0-1.0 (基金分析置信度),
+    "key_points": ["关键结论1", "关键结论2", ...] (最多5条,每条<80字),
+    "signals": [
+        {{
+            "factor": "因子名",
+            "direction": 1(利多)|-1(利空)|0(中性),
+            "strength": 0-100,
+            "time_horizon": ["medium","long"],
+            "source_level": "structured"|"derived",
+            "note": "一句话说明"
+        }}
+    ] (最多4条),
+    "risk_flags": [],
+    "missing_data": ["缺失项"],
+    "source_summary": "数据来源简述"
+}}
+</SIGNAL_PACK>"""
 
         messages = [
             {"role": "system", "content": "你是一位资深基金评级分析师，专注于公募基金的基金经理和团队质量评估。你擅长从基金经理简历中提取关键信息，能客观评价管理人的专业能力和稳定性。"},
@@ -347,6 +381,21 @@ async def fund_manager_agent(state: AgentState) -> AgentState:
                 timeout=float(LLM_TIMEOUT)
             )
             final_output = response.content.strip() if hasattr(response, 'content') else str(response)
+            # Extract signal_pack from LLM output
+            import json as _json, re as _re
+            sp = None
+            tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', final_output)
+            if tag_match:
+                try:
+                    sp = _json.loads(tag_match.group(1))
+                    sp["agent_name"] = "fund_manager"
+                    sp["as_of_date"] = current_date
+                except Exception:
+                    pass
+            if sp is None:
+                from src.utils.analysis_package_builder import text_to_signal_pack
+                sp = text_to_signal_pack(final_output, "fund_manager", current_date)
+            current_data["fund_manager_signal_pack"] = sp
             phase2_elapsed = time.time() - phase2_start
             logger.info(f"FundManagerAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
             llm_success = True
@@ -386,6 +435,9 @@ async def fund_manager_agent(state: AgentState) -> AgentState:
         current_data["fund_manager"] = final_output
         if not skip_cache and cache_date and fund_code:
             write_cache("fund_manager", fund_code, cache_date, final_output)
+            if "fund_manager_signal_pack" in current_data:
+                from src.utils.cache_utils import write_signal_pack_cache
+                write_signal_pack_cache("fund_manager", fund_code, cache_date, current_data["fund_manager_signal_pack"])
         current_metadata["fund_manager_executed"] = True
         current_metadata["fund_manager_timestamp"] = str(time.time())
         current_metadata["fund_manager_execution_time"] = f"{total_time:.2f} seconds"

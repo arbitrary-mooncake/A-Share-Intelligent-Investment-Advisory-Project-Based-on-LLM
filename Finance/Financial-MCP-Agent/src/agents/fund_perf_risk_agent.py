@@ -52,11 +52,17 @@ async def _noop_result(text: str) -> str:
 
 async def _call_tool_safe(tool, kwargs: dict, label: str) -> str:
     """调用单个 MCP 工具，带超时和异常保护"""
+    from src.utils.tool_cache import get_cached_tool_result, set_cached_tool_result
+    tool_name = getattr(tool, 'name', 'unknown')
+    cached = await get_cached_tool_result(tool_name, kwargs)
+    if cached:
+        return cached
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=TOOL_TIMEOUT)
         text = str(result).strip()
         if len(text) > 20:
             logger.info(f"{SUCCESS_ICON} FundPerfRiskAgent: {label} 获取成功 ({len(text)} 字符)")
+            await set_cached_tool_result(tool_name, kwargs, text)
             return text
         logger.warning(f"FundPerfRiskAgent: {label} 返回过短 ({len(text)} 字符)")
         return f"[{label}] 数据不可用（返回过短）"
@@ -72,7 +78,7 @@ async def fund_perf_risk_agent(state: AgentState) -> AgentState:
     """
     两阶段基金业绩与风险评价：
     Phase 1: 并行获取全部白名单工具的数据
-    Phase 2: 单次 LLM 深度分析（Kimi K2.6, thinking=enabled）
+    Phase 2: 单次 LLM 深度分析（MiMo-V2.5-Pro, thinking=enabled）
     """
     logger.info(f"{WAIT_ICON} FundPerfRiskAgent: Starting two-phase performance & risk analysis.")
 
@@ -93,6 +99,10 @@ async def fund_perf_risk_agent(state: AgentState) -> AgentState:
         if cached:
             logger.info(f"{SUCCESS_ICON} FundPerfRiskAgent: 命中缓存，跳过分析 ({cache_code})")
             current_data["fund_perf_risk"] = cached
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("fund_perf_risk", cache_code, cache_date)
+            if cached_sp:
+                current_data["fund_perf_risk_signal_pack"] = cached_sp
             current_metadata["fund_perf_risk_executed"] = True
             current_metadata["fund_perf_risk_cached"] = True
             return {"data": current_data,
@@ -121,7 +131,7 @@ async def fund_perf_risk_agent(state: AgentState) -> AgentState:
     agent_start_time = time.time()
 
     try:
-        # 模型配置：Kimi K2.6
+        # 模型配置：MiMo-V2.5-Pro
         model_cfg = get_model_config_for_agent("fund_perf_risk_agent", current_data)
         api_key = model_cfg["api_key"]
         base_url = model_cfg["base_url"]
@@ -367,7 +377,31 @@ async def fund_perf_risk_agent(state: AgentState) -> AgentState:
 2. 使用「【基于数据的计算】」或「【分析师经验推断】」标注计算/推断性质
 3. 如果某个结论无法从数据中直接计算得出，必须声明「此为分析师推断」
 4. 不得在任何地方编造数据事实区没有的数值
-5. 不得编造原始数据中不存在的市场阶段事件或新闻"""
+5. 不得编造原始数据中不存在的市场阶段事件或新闻
+
+⛔ 结构化输出要求：
+在完成上述分析后，请额外输出一个 JSON block：
+
+<SIGNAL_PACK>
+{{
+    "bias": "bullish"|"neutral"|"bearish",
+    "confidence": 0.0-1.0 (基金分析置信度),
+    "key_points": ["关键结论1", "关键结论2", ...] (最多5条,每条<80字),
+    "signals": [
+        {{
+            "factor": "因子名",
+            "direction": 1(利多)|-1(利空)|0(中性),
+            "strength": 0-100,
+            "time_horizon": ["medium","long"],
+            "source_level": "structured"|"derived",
+            "note": "一句话说明"
+        }}
+    ] (最多4条),
+    "risk_flags": [],
+    "missing_data": ["缺失项"],
+    "source_summary": "数据来源简述"
+}}
+</SIGNAL_PACK>"""
 
         messages = [
             {"role": "system", "content": "你是一位资深基金分析师，专注于公募基金/ETF的业绩归因和量化风险评价。擅长使用净值数据和市场数据进行科学的业绩分析，严格遵守监管合规要求，所有分析均有数据支撑。"},
@@ -380,6 +414,21 @@ async def fund_perf_risk_agent(state: AgentState) -> AgentState:
                 timeout=float(LLM_TIMEOUT)
             )
             final_output = response.content.strip() if hasattr(response, 'content') else str(response)
+            # Extract signal_pack from LLM output
+            import json as _json, re as _re
+            sp = None
+            tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', final_output)
+            if tag_match:
+                try:
+                    sp = _json.loads(tag_match.group(1))
+                    sp["agent_name"] = "fund_perf_risk"
+                    sp["as_of_date"] = current_date
+                except Exception:
+                    pass
+            if sp is None:
+                from src.utils.analysis_package_builder import text_to_signal_pack
+                sp = text_to_signal_pack(final_output, "fund_perf_risk", current_date)
+            current_data["fund_perf_risk_signal_pack"] = sp
             phase2_elapsed = time.time() - phase2_start
             logger.info(f"FundPerfRiskAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
             llm_success = True
@@ -419,6 +468,9 @@ async def fund_perf_risk_agent(state: AgentState) -> AgentState:
         current_data["fund_perf_risk"] = final_output
         if not skip_cache and cache_date and cache_code:
             write_cache("fund_perf_risk", cache_code, cache_date, final_output)
+            if "fund_perf_risk_signal_pack" in current_data:
+                from src.utils.cache_utils import write_signal_pack_cache
+                write_signal_pack_cache("fund_perf_risk", cache_code, cache_date, current_data["fund_perf_risk_signal_pack"])
         current_metadata["fund_perf_risk_executed"] = True
         current_metadata["fund_perf_risk_timestamp"] = str(time.time())
         current_metadata["fund_perf_risk_execution_time"] = f"{total_time:.2f} seconds"

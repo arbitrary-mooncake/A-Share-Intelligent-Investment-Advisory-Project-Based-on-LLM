@@ -137,11 +137,20 @@ async def _noop_result(text: str) -> str:
 
 
 async def _call_tool_safe(tool, kwargs: dict, label: str) -> str:
+    """调用单个 MCP 工具，带超时、异常保护、和工具级缓存"""
+    from src.utils.tool_cache import get_cached_tool_result, set_cached_tool_result
+    tool_name = getattr(tool, 'name', 'unknown')
+    cached = await get_cached_tool_result(tool_name, kwargs)
+    if cached:
+        logger.info(f"{SUCCESS_ICON} ValueAgent: {label} [工具缓存命中]")
+        return cached
+
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=TOOL_TIMEOUT)
         text = str(result).strip()
         if len(text) > 20:
             logger.info(f"{SUCCESS_ICON} ValueAgent: {label} 获取成功 ({len(text)} 字符)")
+            await set_cached_tool_result(tool_name, kwargs, text)
             return text
         logger.warning(f"ValueAgent: {label} 返回过短 ({len(text)} 字符)")
         return f"[{label}] 数据不可用（返回过短）"

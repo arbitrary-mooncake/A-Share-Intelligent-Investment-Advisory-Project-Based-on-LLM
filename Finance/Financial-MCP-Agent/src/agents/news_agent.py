@@ -94,12 +94,20 @@ def _deduplicate_news(news_items: list) -> list:
 
 
 async def _call_tool_with_timeout(tool, kwargs: dict, timeout: float, label: str) -> str:
-    """调用单个MCP工具，带超时保护"""
+    """调用单个MCP工具，带超时、异常保护、和工具级缓存"""
+    from src.utils.tool_cache import get_cached_tool_result, set_cached_tool_result
+    tool_name = getattr(tool, 'name', 'unknown')
+    cached = await get_cached_tool_result(tool_name, kwargs)
+    if cached:
+        logger.info(f"{SUCCESS_ICON} NewsAgent: {label} [工具缓存命中]")
+        return cached
+
     try:
         result = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=timeout)
         text = str(result).strip()
         if len(text) > 25:
             logger.info(f"{SUCCESS_ICON} NewsAgent: {label} 获取成功 ({len(text)} 字符)")
+            await set_cached_tool_result(tool_name, kwargs, text)
             return text
         else:
             logger.warning(f"NewsAgent: {label} 返回过短 ({len(text)} 字符)")

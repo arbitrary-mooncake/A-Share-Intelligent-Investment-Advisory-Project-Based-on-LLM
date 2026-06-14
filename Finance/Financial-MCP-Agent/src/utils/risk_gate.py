@@ -40,7 +40,7 @@ def _count_signals_by_source(package, min_source_level: str) -> int:
     return count
 
 
-def apply_risk_gate(package, term: str, original_score: int) -> RiskGateResult:
+def apply_risk_gate(package: 'AnalysisPackage', term: str, original_score: int) -> RiskGateResult:
     risk_flags = package.global_risk_flags
     missing_agents = package.missing_agents
 
@@ -89,6 +89,7 @@ def apply_risk_gate(package, term: str, original_score: int) -> RiskGateResult:
             if score_cap is None or score_cap > 50:
                 score_cap = 50
                 downgrade = "观察"
+                found_critical.append("short_liquidity_risk")
 
     # risk_level
     if found_critical:
@@ -97,6 +98,9 @@ def apply_risk_gate(package, term: str, original_score: int) -> RiskGateResult:
         risk_level = "medium"
     else:
         risk_level = "low"
+
+    # 计算有效分数
+    effective_score = min(original_score, score_cap) if score_cap else original_score
 
     warnings = []
     if found_critical:
@@ -109,8 +113,8 @@ def apply_risk_gate(package, term: str, original_score: int) -> RiskGateResult:
         risk_flags_found=found_critical,
         score_cap=score_cap,
         action_downgrade=downgrade,
-        abstain=len(missing_agents) >= 3,
-        abstain_reason=f"核心agent缺失{len(missing_agents)}个: {', '.join(missing_agents)}" if len(missing_agents) >= 3 else "",
+        abstain=False,
+        abstain_reason="",
         data_quality_score=data_quality,
         warnings=warnings,
     )

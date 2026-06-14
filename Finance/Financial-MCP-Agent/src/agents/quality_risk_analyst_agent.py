@@ -18,7 +18,7 @@ from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAI
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
 from src.utils.model_config import get_model_config_for_agent, get_thinking_body
-from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
+from src.utils.fetch_utils import retry_failed_fetches
 from src.utils.analysis_package_builder import text_to_signal_pack
 
 load_dotenv(override=True)

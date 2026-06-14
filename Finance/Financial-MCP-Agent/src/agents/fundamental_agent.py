@@ -403,7 +403,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
    - 股东变化趋势（机构/散户持仓比例）
 
 5. ST风险警示分析（⚠️ 必查项）
-   - 检查上述原始数据中的 tushare_st_status 和 get_st_risk_data 数据
+   - 检查上述原始数据中的 tushare_st_status 数据
    - 分析当前ST状态：是否为ST/*ST、进入风险警示板的具体日期
    - ST类型判断：退市风险警示（*ST）还是其他风险警示（ST）
    - 触发原因分析（结合财务数据）：是否连续两年净利润为负、净资产是否为负等

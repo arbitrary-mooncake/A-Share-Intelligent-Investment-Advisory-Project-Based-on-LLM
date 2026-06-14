@@ -320,6 +320,9 @@ ETF基本信息：
             current_metadata["value_agent_executed"] = True
             if not skip_cache and cache_date and cache_code:
                 write_cache("value_analysis", cache_code, cache_date, etf_analysis)
+                if "value_signal_pack" in current_data:
+                    from src.utils.cache_utils import write_signal_pack_cache
+                    write_signal_pack_cache("value_analysis", cache_code, cache_date, current_data["value_signal_pack"])
             return {"data": current_data,
                     "messages": current_messages + [{"role": "assistant", "content": "ETF估值分析已完成"}],
                     "metadata": current_metadata}

@@ -118,7 +118,7 @@ def write_cache(agent_name: str, stock_code: str, date_str: str, content: str):
 
 
 def read_signal_pack_cache(agent_name: str, stock_code: str, date_str: str) -> dict | None:
-    """Read cached signal_pack JSON. Returns None if not found or expired."""
+    """Read cached signal_pack JSON. Returns None if not found."""
     safe_code = stock_code.replace(".", "_").replace("/", "_")
     cache_path = os.path.join(_CACHE_DIR, f"{agent_name}_signal_pack_{safe_code}_{date_str}.json")
     if not os.path.exists(cache_path):

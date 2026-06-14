@@ -46,6 +46,8 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
         )
 
         gate = apply_risk_gate(pkg, "short", result["score"])
+        if gate.score_cap is not None:
+            result["score"] = min(result["score"], gate.score_cap)
         result["risk_gate"] = {
             "risk_level": gate.risk_level,
             "risk_flags": gate.risk_flags_found,

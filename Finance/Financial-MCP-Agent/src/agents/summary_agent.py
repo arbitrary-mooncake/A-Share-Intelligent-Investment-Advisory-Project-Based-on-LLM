@@ -118,13 +118,11 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         "input_data_keys": list(current_data.keys())
     })
 
-    from src.utils.analysis_package_builder import build_analysis_package
-    pkg = build_analysis_package(current_data, current_date)
-
     # 记录 Agent开始时间，用于计算执行时长
     agent_start_time = time.time()
 
     # 获取之前 Agent的分析结果（mimo 大上下文，无需截断）
+    current_date = current_data.get("current_date", "未知日期")
     fundamental_analysis = current_data.get(
         "fundamental_analysis", "Not available")
     technical_analysis = current_data.get(
@@ -134,6 +132,9 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
     event_analysis = current_data.get("event_analysis", "Not available")
     quality_risk_analysis = current_data.get("quality_risk_analysis", "Not available")
     moneyflow_analysis = current_data.get("moneyflow_analysis", "Not available")
+
+    from src.utils.analysis_package_builder import build_analysis_package
+    pkg = build_analysis_package(current_data, current_date)
 
     # 处理各个分析的错误信息
     errors = []

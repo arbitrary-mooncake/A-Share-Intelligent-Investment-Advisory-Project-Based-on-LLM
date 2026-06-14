@@ -113,7 +113,10 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
             "fundamental": "fundamental_analysis" in current_data,
             "technical": "technical_analysis" in current_data,
             "value": "value_analysis" in current_data,
-            "news": "news_analysis" in current_data
+            "news": "news_analysis" in current_data,
+            "event": "event_analysis" in current_data,
+            "quality_risk": "quality_risk_analysis" in current_data,
+            "moneyflow": "moneyflow_analysis" in current_data,
         },
         "input_data_keys": list(current_data.keys())
     })
@@ -150,6 +153,15 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
     if "news_analysis_error" in current_data:
         errors.append(
             f"News Analysis Error: {current_data['news_analysis_error']}")
+    if "event_analysis_error" in current_data:
+        errors.append(
+            f"Event Analysis Error: {current_data['event_analysis_error']}")
+    if "quality_risk_analysis_error" in current_data:
+        errors.append(
+            f"Quality Risk Analysis Error: {current_data['quality_risk_analysis_error']}")
+    if "moneyflow_analysis_error" in current_data:
+        errors.append(
+            f"Moneyflow Analysis Error: {current_data['moneyflow_analysis_error']}")
 
     # 基本股票标识信息
     stock_code = current_data.get("stock_code", "Unknown Stock")

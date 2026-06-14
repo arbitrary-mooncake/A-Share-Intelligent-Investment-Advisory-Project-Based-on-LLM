@@ -2,9 +2,8 @@
 分析中间产物的结构化 Schema 定义。
 使用轻量 dataclass，不引入重型依赖。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
-from typing_extensions import TypedDict
 
 
 class SourceLevel:

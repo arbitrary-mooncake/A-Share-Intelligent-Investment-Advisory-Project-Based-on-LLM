@@ -182,6 +182,7 @@ JSON含: bias, confidence, key_points(≤5条), signals(≤8条,含factor/direct
     except Exception as e:
         logger.error(f"{ERROR_ICON} EventAnalyst 失败: {e}", exc_info=True)
         current_data["event_analysis"] = f"事件分析失败: {str(e)}"
+        current_data["event_analysis_error"] = str(e)
         current_data["event_signal_pack"] = text_to_signal_pack(current_data.get("event_analysis", ""), "event", current_date)
         current_metadata["event_agent_error"] = str(e)
         return {"data": current_data, "messages": current_messages, "metadata": current_metadata}

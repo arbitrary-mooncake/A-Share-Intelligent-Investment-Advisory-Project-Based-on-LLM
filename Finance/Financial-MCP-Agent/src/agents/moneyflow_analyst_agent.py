@@ -192,6 +192,7 @@ signal中source_level优先使用structured(如moneyflow/top_list等数值工具
     except Exception as e:
         logger.error(f"{ERROR_ICON} MoneyflowAnalyst 失败: {e}", exc_info=True)
         current_data["moneyflow_analysis"] = f"资金面分析失败: {str(e)}"
+        current_data["moneyflow_analysis_error"] = str(e)
         current_data["moneyflow_signal_pack"] = text_to_signal_pack(current_data.get("moneyflow_analysis", ""), "moneyflow", current_date)
         current_metadata["moneyflow_agent_error"] = str(e)
         return {"data": current_data, "messages": current_messages, "metadata": current_metadata}

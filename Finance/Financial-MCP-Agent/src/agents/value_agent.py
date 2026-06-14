@@ -92,6 +92,45 @@ def _get_recent_quarters(date_str: str, count: int = 2) -> List[Dict[str, Any]]:
     return quarters
 
 
+def _extract_signal_pack_from_llm(llm_output: str, agent_name: str, as_of_date: str) -> dict:
+    """
+    从LLM输出中提取signal_pack JSON。
+    三层fallback: JSON解析 → 正则提取 → 文本推断
+    """
+    import json as _json
+    import re as _re
+
+    # 第一层: <SIGNAL_PACK> 标签
+    tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', llm_output)
+    if tag_match:
+        try:
+            sp = _json.loads(tag_match.group(1))
+            sp["agent_name"] = agent_name
+            sp["as_of_date"] = as_of_date
+            sp.setdefault("analysis_text", llm_output[:500])
+            sp.setdefault("data_quality_score", 0.7)
+            return sp
+        except (_json.JSONDecodeError, ValueError):
+            pass
+
+    # 第二层: 从文本中找包含bias和signals的JSON
+    json_match = _re.search(r'\{[\s\S]*"bias"[\s\S]*"signals"[\s\S]*\}', llm_output)
+    if json_match:
+        try:
+            sp = _json.loads(json_match.group(0))
+            sp["agent_name"] = agent_name
+            sp["as_of_date"] = as_of_date
+            sp.setdefault("analysis_text", llm_output[:500])
+            sp.setdefault("data_quality_score", 0.5)
+            return sp
+        except (_json.JSONDecodeError, ValueError):
+            pass
+
+    # 第三层: 纯文本推断
+    from src.utils.analysis_package_builder import text_to_signal_pack
+    return text_to_signal_pack(llm_output, agent_name, as_of_date)
+
+
 async def _noop_result(text: str) -> str:
     """返回固定文本的占位协程"""
     return text
@@ -263,6 +302,12 @@ ETF基本信息：
             current_data["value_analysis"] = _build_etf_fallback(
                 current_data.get("company_name", ""),
                 current_data.get("stock_code", ""), "", "")
+            # ETF fallback signal_pack
+            try:
+                from src.utils.analysis_package_builder import text_to_signal_pack
+                current_data["value_signal_pack"] = text_to_signal_pack(str(e)[:500], "value", current_data.get("current_date", ""))
+            except Exception:
+                pass
             current_metadata["value_agent_executed"] = True
             return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
@@ -510,7 +555,35 @@ ETF基本信息：
 1. 引用数据事实区的具体数值
 2. 使用「【基于数据的推断】」或「【行业知识补充】」标注推断性质
 3. 如果某个结论无法从数据中直接得出，必须声明「此为分析师推断」
-4. 不得在任何地方编造数据事实区没有的数值"""
+4. 不得在任何地方编造数据事实区没有的数值
+
+⛔ 结构化输出要求：
+在完成上述分析的「🔍 分析判断区」之后，请额外输出一个 JSON block：
+
+<SIGNAL_PACK>
+{{
+    "bias": "bullish"|"neutral"|"bearish",
+    "confidence": 0.0-1.0,
+    "key_points": ["关键结论1"] (最多5条),
+    "signals": [
+        {{
+            "factor": "因子名(如:PE历史分位/EV-EBITDA/股息率)",
+            "direction": 1|-1|0,
+            "strength": 0-100,
+            "time_horizon": ["medium","long"],
+            "source_level": "structured"|"derived",
+            "risk_flags": [],
+            "freshness": "quarterly",
+            "note": "一句话说明"
+        }}
+    ] (最多5条),
+    "risk_flags": [],
+    "missing_data": ["未获取到某些指标"],
+    "source_summary": "Tushare估值(PE/PB/EV-EBITDA)+历史分位+行业对比"
+}}
+</SIGNAL_PACK>
+
+请确保SIGNAL_PACK内的JSON完全有效。"""
 
         messages = [
             {"role": "system", "content": "你是一位资深券商估值分析师，专注于A股公司的估值分析和投资价值判断。"},
@@ -523,6 +596,9 @@ ETF基本信息：
                 timeout=float(LLM_TIMEOUT)
             )
             final_output = response.content.strip() if hasattr(response, 'content') else str(response)
+            # 提取 signal_pack
+            value_signal_pack = _extract_signal_pack_from_llm(final_output, "value", current_date)
+            current_data["value_signal_pack"] = value_signal_pack
             phase2_elapsed = time.time() - phase2_start
             logger.info(f"ValueAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
             llm_success = True
@@ -530,11 +606,17 @@ ETF基本信息：
             phase2_elapsed = time.time() - phase2_start
             logger.error(f"{ERROR_ICON} ValueAgent: LLM 超时 ({phase2_elapsed:.0f}s)")
             final_output = f"## 📊 数据事实区\n\n{raw_data_text[:3000]}\n\n## 🔍 分析判断区\n\n⚠️ LLM分析超时，以上为原始数据，请人工分析。\n"
+            from src.utils.analysis_package_builder import text_to_signal_pack
+            value_signal_pack = text_to_signal_pack(final_output, "value", current_date)
+            current_data["value_signal_pack"] = value_signal_pack
             llm_success = False
         except Exception as llm_err:
             phase2_elapsed = time.time() - phase2_start
             logger.error(f"{ERROR_ICON} ValueAgent: LLM 失败: {llm_err}")
             final_output = f"## 📊 数据事实区\n\n{raw_data_text[:3000]}\n\n## 🔍 分析判断区\n\n⚠️ LLM分析失败({str(llm_err)[:100]})，以上为原始数据，请人工分析。\n"
+            from src.utils.analysis_package_builder import text_to_signal_pack
+            value_signal_pack = text_to_signal_pack(final_output, "value", current_date)
+            current_data["value_signal_pack"] = value_signal_pack
             llm_success = False
 
         model_config_log = {
@@ -585,6 +667,12 @@ ETF基本信息：
         logger.error(f"{ERROR_ICON} ValueAgent: Error: {e}", exc_info=True)
         current_data["value_analysis_error"] = f"Error: {e}"
         current_data["value_analysis"] = f"估值分析过程中出现错误: {str(e)}"
+        # fallback signal_pack
+        try:
+            from src.utils.analysis_package_builder import text_to_signal_pack
+            current_data["value_signal_pack"] = text_to_signal_pack(str(e)[:500], "value", current_date)
+        except Exception:
+            pass
         current_metadata["value_agent_error"] = str(e)
         execution_logger.log_agent_complete(agent_name, current_data, time.time() - agent_start_time, False, str(e))
         return {"data": current_data, "messages": current_messages, "metadata": current_metadata}

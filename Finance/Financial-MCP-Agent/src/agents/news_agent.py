@@ -41,6 +41,45 @@ def _extract_code(stock_code: str) -> str:
     return stock_code.replace("sh.", "").replace("sz.", "").replace("bj.", "").replace(".SH", "").replace(".SZ", "").replace(".BJ", "").strip()
 
 
+def _extract_signal_pack_from_llm(llm_output: str, agent_name: str, as_of_date: str) -> dict:
+    """
+    从LLM输出中提取signal_pack JSON。
+    三层fallback: JSON解析 → 正则提取 → 文本推断
+    """
+    import json as _json
+    import re as _re
+
+    # 第一层: <SIGNAL_PACK> 标签
+    tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', llm_output)
+    if tag_match:
+        try:
+            sp = _json.loads(tag_match.group(1))
+            sp["agent_name"] = agent_name
+            sp["as_of_date"] = as_of_date
+            sp.setdefault("analysis_text", llm_output[:500])
+            sp.setdefault("data_quality_score", 0.7)
+            return sp
+        except (_json.JSONDecodeError, ValueError):
+            pass
+
+    # 第二层: 从文本中找包含bias和signals的JSON
+    json_match = _re.search(r'\{[\s\S]*"bias"[\s\S]*"signals"[\s\S]*\}', llm_output)
+    if json_match:
+        try:
+            sp = _json.loads(json_match.group(0))
+            sp["agent_name"] = agent_name
+            sp["as_of_date"] = as_of_date
+            sp.setdefault("analysis_text", llm_output[:500])
+            sp.setdefault("data_quality_score", 0.5)
+            return sp
+        except (_json.JSONDecodeError, ValueError):
+            pass
+
+    # 第三层: 纯文本推断
+    from src.utils.analysis_package_builder import text_to_signal_pack
+    return text_to_signal_pack(llm_output, agent_name, as_of_date)
+
+
 def _deduplicate_news(news_items: list) -> list:
     """按标题去重，保留首次出现的条目"""
     seen = set()
@@ -265,24 +304,21 @@ async def news_agent(state: AgentState) -> AgentState:
     )
     _messages = [
         {"role": "system", "content": (
-            "你是一位资深的A股新闻分析师，擅长从新闻中提取关键信息并进行情感和风险分析。\n\n"
-            "分析要求：\n"
-            "0. **ST风险筛查**：优先检查是否有ST风险数据(st_risk标签)，若当前股票已标记ST/*ST，必须在分析中重点标注该风险，并在所有判断中考虑ST状态的影响\n"
-            "1. 逐条分析每一条新闻的核心内容和潜在影响\n"
-            "2. 对多条新闻进行综合归纳，识别关键事件和趋势\n"
-            "3. 评估新闻对股价的短期和中期潜在影响\n"
-            "4. 区分市场情绪和基本面变化\n"
-            "5. 提供基于新闻的综合判断\n\n"
-            "⛔ 输出格式要求（防幻觉机制）：\n"
-            "请将分析输出严格分为两个区域：\n\n"
-            "## 📊 数据事实区\n"
-            "列出上述新闻数据中的每一条真实新闻，逐条标注：序号、标题、来源、发布时间、核心内容摘要。\n"
-            "如果新闻数据不足或无新闻数据，必须标注「新闻数据有限」而不是编造任何新闻。\n\n"
-            "## 🔍 分析判断区\n"
-            "基于上述新闻事实进行分析。每个判断必须引用数据事实区的具体新闻条目编号，"
-            "使用「【基于新闻的推断】」标注推断性质。"
-            "不得在任何地方编造数据事实区没有的数值、事件或新闻。"
-            "不得使用模型训练数据中的知识来补充新闻事实。"
+            "你是一位资深的A股新闻舆情分析师。\n\n"
+            "你的职责范围（只做这些）：\n"
+            "1. 媒体新闻情绪判断\n"
+            "2. 行业/政策舆情分析\n"
+            "3. 题材热度与叙事强度评估\n"
+            "4. 市场关注点是否集中、是否形成一致预期\n\n"
+            "你不再负责（这些交给event_analyst）：\n"
+            "- 公司正式公告的事实判断\n"
+            "- 监管事件是否成立\n"
+            "- 重大事项的事实核实\n\n"
+            "换言之：你分析的是'市场如何看、如何传'，而不是'真实发生了什么'。\n\n"
+            "⛔ 输出格式：先输出「📊 数据事实区」「🔍 分析判断区」，"
+            "然后在末尾输出: <SIGNAL_PACK>{JSON}</SIGNAL_PACK>\n"
+            "其中JSON包含: bias, confidence, key_points(≤5条), signals(≤5条, source_level=\"news\"), "
+            "risk_flags, source_summary\n"
         )}
     ]
     if news_text:
@@ -319,6 +355,9 @@ async def news_agent(state: AgentState) -> AgentState:
         )
         phase2_elapsed = time.time() - phase2_start
         final_output = response.choices[0].message.content if response.choices else "No analysis generated."
+        # 提取 signal_pack
+        news_signal_pack = _extract_signal_pack_from_llm(final_output, "news", current_date)
+        current_data["news_signal_pack"] = news_signal_pack
         logger.info(f"NewsAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")
         llm_success = True
 
@@ -326,6 +365,9 @@ async def news_agent(state: AgentState) -> AgentState:
         phase2_elapsed = time.time() - phase2_start
         logger.error(f"{ERROR_ICON} NewsAgent: LLM 超时 ({phase2_elapsed:.0f}s)，降级返回原始数据")
         final_output = _build_fallback_output(news_text, news_parts, company_name, stock_code, current_date)
+        from src.utils.analysis_package_builder import text_to_signal_pack
+        news_signal_pack = text_to_signal_pack(final_output, "news", current_date)
+        current_data["news_signal_pack"] = news_signal_pack
         llm_success = False
 
     except Exception as llm_err:
@@ -333,6 +375,9 @@ async def news_agent(state: AgentState) -> AgentState:
         err_msg = str(llm_err) or type(llm_err).__name__
         logger.error(f"{ERROR_ICON} NewsAgent: LLM 失败 ({err_msg})，降级返回原始数据")
         final_output = _build_fallback_output(news_text, news_parts, company_name, stock_code, current_date)
+        from src.utils.analysis_package_builder import text_to_signal_pack
+        news_signal_pack = text_to_signal_pack(final_output, "news", current_date)
+        current_data["news_signal_pack"] = news_signal_pack
         llm_success = False
 
     # 记录LLM交互

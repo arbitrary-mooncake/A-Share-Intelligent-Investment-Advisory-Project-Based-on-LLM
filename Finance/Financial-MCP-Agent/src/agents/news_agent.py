@@ -219,7 +219,7 @@ async def news_agent(state: AgentState) -> AgentState:
     phase1_start = time.time()
 
     try:
-        news_tools = await get_mcp_tools(tool_filter=["crawl_news", "get_st_risk_data", "tushare_st_status"])
+        news_tools = await get_mcp_tools(tool_filter=["crawl_news", "tushare_st_status"])
     except Exception as e:
         logger.error(f"{ERROR_ICON} NewsAgent: 获取MCP工具失败: {e}")
         news_tools = []
@@ -248,23 +248,6 @@ async def news_agent(state: AgentState) -> AgentState:
             tasks.append(_call_tool_with_timeout(tool, kw2, TOOL_TIMEOUT, f"crawl_news(name={company_name})"))
             task_labels.append(f"crawl_news(name)")
             news_tool_infos.append((tool, kw2))
-
-        elif tool.name == "get_st_risk_data":
-            if clean_code:
-                _is_bse = (clean_code.startswith(("430", "431", "920")) or
-                           (len(clean_code) >= 3 and clean_code[:3] in
-                            ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
-                             "870", "871", "872", "873")))
-                if _is_bse:
-                    sh_code = f"bj.{clean_code}"
-                elif clean_code.startswith(("6", "688", "5")):
-                    sh_code = f"sh.{clean_code}"
-                else:
-                    sh_code = f"sz.{clean_code}"
-                kw = {"code": sh_code}
-                tasks.append(_call_tool_with_timeout(tool, kw, 5.0, f"st_risk(code={sh_code})"))
-                task_labels.append(f"st_risk")
-                news_tool_infos.append((tool, kw))
 
     # 并行执行（第一轮）
     try:

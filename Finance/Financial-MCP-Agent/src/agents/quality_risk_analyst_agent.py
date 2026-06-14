@@ -31,13 +31,11 @@ QUALITY_RISK_TOOL_NAMES = [
     "tushare_income",
     "tushare_balancesheet",
     "tushare_cashflow",
-    "tushare_fina_indicator",
+    "tushare_fina_indicator",    # 替代 get_dupont_data
     "tushare_pledge_stat",
     "tushare_top10_holders",
     "tushare_stk_holdertrade",
-    "tushare_st_status",
-    "get_st_risk_data",
-    "get_dupont_data",
+    "tushare_st_status",         # 替代 get_st_risk_data
 ]
 
 

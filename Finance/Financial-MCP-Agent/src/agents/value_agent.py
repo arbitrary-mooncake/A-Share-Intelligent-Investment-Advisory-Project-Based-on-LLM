@@ -30,19 +30,17 @@ logger = setup_logger(__name__)
 TOOL_TIMEOUT = 30
 LLM_TIMEOUT = 300
 
-# 估值分析白名单（2026-05 重构：全部切换为 Tushare 工具，移除 Baostock 依赖）
+# 估值分析白名单（2026-06 全量迁移至 Tushare，移除 AkShare 依赖）
 VALUE_TOOL_NAMES = [
     # 基本信息与行业
-    "tushare_stock_info", "get_stock_industry",
+    "tushare_stock_info",       # 行业分类（替代 get_stock_industry）
     # 三大报表 + 财务指标
     "tushare_income", "tushare_balancesheet", "tushare_cashflow",
-    "tushare_fina_indicator",
+    "tushare_fina_indicator",    # 财务指标（替代 get_dupont_data/get_operation_data/get_growth_data）
     # 估值核心
     "tushare_daily_basic", "tushare_pe_percentile", "tushare_ev_ebitda",
     # 分红与股东
     "tushare_dividend", "tushare_top10_holders", "tushare_holder_num",
-    # 保留的 AkShare 工具（无 Tushare 平替）
-    "get_dupont_data", "get_operation_data", "get_growth_data",
 ]
 
 
@@ -412,13 +410,10 @@ ETF基本信息：
         # --- 基本信息与行业 ---
         code_tools = [
             ("tushare_stock_info", "Tushare基本信息"),
-            ("get_stock_industry", "行业分类"),
         ]
         for tname, label in code_tools:
             if tname in tool_map:
                 kwargs = {"code": clean_code}
-                if tname == "get_stock_industry":
-                    kwargs["date"] = current_date
                 _add(_call_tool_safe(tool_map[tname], kwargs, label), label, (tool_map[tname], kwargs))
             else:
                 _placeholder(label, f"[{tname}] 工具不可用")
@@ -454,24 +449,6 @@ ETF基本信息：
             else:
                 _placeholder(label, f"[{tname}] 工具不可用")
 
-        # --- 保留的 AkShare 工具（无 Tushare 平替：杜邦/运营/成长） ---
-        legacy_fin_tools = [
-            ("get_dupont_data", "杜邦分析"),
-            ("get_operation_data", "运营数据"),
-            ("get_growth_data", "成长数据"),
-        ]
-        for tool_name, label_base in legacy_fin_tools:
-            if tool_name in tool_map:
-                t = tool_map[tool_name]
-                kw_latest = {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]}
-                kw_prior = {"code": clean_code, "year": q_prior["year"], "quarter": q_prior["quarter"]}
-                _add(_call_tool_safe(t, kw_latest, f"{label_base}({q_latest['year']}Q{q_latest['quarter']})"),
-                     f"{label_base}(最新)", (t, kw_latest))
-                _add(_call_tool_safe(t, kw_prior, f"{label_base}({q_prior['year']}Q{q_prior['quarter']})"),
-                     f"{label_base}(上期)", (t, kw_prior))
-            else:
-                _placeholder(f"{label_base}(最新)", f"[{tool_name}] 工具不可用")
-                _placeholder(f"{label_base}(上期)", f"[{tool_name}] 工具不可用")
 
         # 并行执行（第一轮）
         try:

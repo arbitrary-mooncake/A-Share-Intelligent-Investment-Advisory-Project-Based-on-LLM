@@ -30,21 +30,18 @@ TOOL_TIMEOUT = 30
 # LLM 整体超时（秒）
 LLM_TIMEOUT = 300
 
-# 基本面分析白名单（2026-05 重构：全部切换为 Tushare 工具，移除 Baostock 依赖）
+# 基本面分析白名单（2026-06 全量迁移至 Tushare，移除 AkShare 依赖）
 FUNDAMENTAL_TOOL_NAMES = [
     # 基本信息与行业
-    "tushare_stock_info", "get_stock_industry",
+    "tushare_stock_info",       # 行业分类（替代 get_stock_industry）
     # 财务报表（Tushare 三大报表 + 财务指标）
     "tushare_income", "tushare_balancesheet", "tushare_cashflow",
-    "tushare_fina_indicator",
+    "tushare_fina_indicator",    # 财务指标（替代 get_dupont_data/get_operation_data/get_growth_data）
     # 估值与分红
     "tushare_daily_basic", "tushare_dividend",
     "tushare_ev_ebitda", "tushare_adj_factor",
     # 股东与ST
-    "tushare_top10_holders", "tushare_st_status",
-    # 保留的 AkShare 工具（无 Tushare 平替）
-    "get_dupont_data", "get_operation_data", "get_growth_data",
-    "get_st_risk_data",
+    "tushare_top10_holders", "tushare_st_status",  # ST状态（替代 get_st_risk_data）
 ]
 
 
@@ -274,10 +271,6 @@ async def fundamental_agent(state: AgentState) -> AgentState:
                  (tool_map["tushare_stock_info"], {"code": clean_code}))
         else: _placeholder("Tushare基本信息", "[tushare_stock_info] 工具不可用")
 
-        if "get_stock_industry" in tool_map:
-            _add(_call_tool_safe(tool_map["get_stock_industry"], {"code": clean_code, "date": current_date}, "行业分类"), "行业分类",
-                 (tool_map["get_stock_industry"], {"code": clean_code, "date": current_date}))
-        else: _placeholder("行业分类", "[get_stock_industry] 工具不可用")
 
         # --- 三大报表（Tushare，无需 quarter 参数） ---
         for tname, label in [("tushare_income", "利润表"), ("tushare_balancesheet", "资产负债表"), ("tushare_cashflow", "现金流量表")]:
@@ -327,29 +320,6 @@ async def fundamental_agent(state: AgentState) -> AgentState:
                  (tool_map["tushare_st_status"], {"code": clean_code}))
         else: _placeholder("Tushare ST状态", "[tushare_st_status] 工具不可用")
 
-        if "get_st_risk_data" in tool_map:
-            _add(_call_tool_safe(tool_map["get_st_risk_data"], {"code": stock_code}, "ST风险数据"), "ST风险数据",
-                 (tool_map["get_st_risk_data"], {"code": stock_code}))
-        else: _placeholder("ST风险数据", "[get_st_risk_data] 工具不可用")
-
-        # --- 保留的 AkShare 工具（无 Tushare 平替：杜邦/运营/成长） ---
-        legacy_fin_tools = [
-            ("get_dupont_data", "杜邦分析"),
-            ("get_operation_data", "运营数据"),
-            ("get_growth_data", "成长数据"),
-        ]
-        for tool_name, label_base in legacy_fin_tools:
-            if tool_name in tool_map:
-                t = tool_map[tool_name]
-                kw_latest = {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]}
-                kw_prior = {"code": clean_code, "year": q_prior["year"], "quarter": q_prior["quarter"]}
-                _add(_call_tool_safe(t, kw_latest, f"{label_base}({q_latest['year']}Q{q_latest['quarter']})"),
-                     f"{label_base}(最新)", (t, kw_latest))
-                _add(_call_tool_safe(t, kw_prior, f"{label_base}({q_prior['year']}Q{q_prior['quarter']})"),
-                     f"{label_base}(上期)", (t, kw_prior))
-            else:
-                _placeholder(f"{label_base}(最新)", f"[{tool_name}] 工具不可用")
-                _placeholder(f"{label_base}(上期)", f"[{tool_name}] 工具不可用")
 
         # 并行执行所有任务（第一轮）
         try:

@@ -3,10 +3,15 @@
 
 .env 五模型架构：
   Model 1 (OPENAI_COMPATIBLE):      MiMo-V2.5-Pro  → summary, medium/long scorer
-  Model 2 (OPENAI_COMPATIBLE_2):    Qwen3.6-Flash  → 快速查询 + 快筛股票池（不动）
-  Model 3 (OPENAI_COMPATIBLE_3):    Qwen3.6-Plus   → technical, news, short scorer
+  Model 2 (OPENAI_COMPATIBLE_2):    Qwen3.7-Flash  → 快速查询 + 快筛股票池（不动）
+  Model 3 (OPENAI_COMPATIBLE_3):    Qwen3.7-Plus   → technical, news, short scorer
   Model 4 (OPENAI_COMPATIBLE_4):    Kimi K2.6      → fundamental, value
   Model 5 (OPENAI_COMPATIBLE_5):    MiMo-V2.5       → 智能问答主模型
+
+优化调整 (2026-06-02):
+  - news_agent: M4(Kimi K2.6) → M3(Qwen3.7-Plus)，新闻摘要无需深度推理，提速 5-10x
+  - 各 Agent temperature 统一 1.0（Kimi K2.6 仅接受 temperature=1）
+  - 提取 get_thinking_body() 统一 thinking 参数格式（DashScope/Qwen 用 enable_thinking，其余用 thinking.type）
 """
 import os
 from typing import Dict, Optional
@@ -19,19 +24,27 @@ load_dotenv(override=True)
 BASE_PREFIX = "OPENAI_COMPATIBLE"
 
 # 每个 Agent 分配的环境变量后缀
-# 空字符串 = Model 1, "_3" = Model 3, "_4" = Model 4
 AGENT_MODEL_SUFFIX: Dict[str, str] = {
-    # ── Model 1: MiMo-V2.5-Pro ──
+    # ── Model 1: MiMo-V2.5-Pro (1M上下文, 深度推理) ──
     "summary_agent": "",
     "medium_term_scorer": "",
     "long_term_scorer": "",
+    "fund_scoring_agent": "",         # MiMo-V2.5-Pro — best reasoning for scoring
+    "fund_report_agent": "",          # MiMo-V2.5-Pro — best quality for final report
+    "fund_perf_risk_agent": "",       # MiMo-V2.5-Pro — 1M context, deep quantitative analysis (500d NAV)
+    "fund_holdings_agent": "",        # MiMo-V2.5-Pro — 1M context, 80K+ token input (10 holdings × 3 tools)
 
-    # ── Model 3: Qwen3.6-Plus (快速工具调用，适合ReAct) ──
+    # ── Model 3: Qwen3.7-Plus (快速工具调用，适合ReAct；新闻摘要；基金结构化分析) ──
     "technical_agent": "_3",
+    "news_agent": "_3",
     "short_term_scorer": "_3",
+    "fund_manager_agent": "_3",
+    "fund_event_agent": "_3",
+    "fund_fee_agent": "_3",           # Qwen3.7-Plus — structured fee analysis
+    "fund_product_doc_agent": "_3",   # Qwen3.7-Plus — structured data parsing
+    "fund_benchmark_agent": "_3",     # Qwen3.7-Plus + thinking=enabled — style drift analysis
 
-    # ── Model 4: Kimi K2.6 (深度分析Agent) ──
-    "news_agent": "_4",
+    # ── Model 4: Kimi K2.6 (深度分析：基本面、估值) ──
     "fundamental_agent": "_4",
     "value_agent": "_4",
 
@@ -40,6 +53,20 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
     # 复杂问题升级模型 → Model 1 (MiMo-V2.5-Pro)
     "qa_engine_pro": "",
 }
+
+
+def get_thinking_body(base_url: str, enabled: bool = True) -> dict:
+    """
+    根据 API 提供商返回正确的 thinking 参数格式。
+
+    Qwen/DashScope 使用 enable_thinking，其余（Kimi/MiMo/OpenAI 兼容）使用 thinking.type。
+    各 Agent 统一调用此函数，不再各自硬编码。
+    """
+    if not enabled:
+        return {"thinking": {"type": "disabled"}}
+    if "dashscope" in base_url.lower():
+        return {"enable_thinking": True}
+    return {"thinking": {"type": "enabled"}}
 
 
 def get_model_config_for_agent(
@@ -70,9 +97,6 @@ def get_model_config_for_agent(
         }
 
     # 使用 Agent 分配的模型
-    # .env 命名: OPENAI_COMPATIBLE_{API_KEY,BASE_URL,MODEL}{suffix}
-    #   如 suffix=""  → OPENAI_COMPATIBLE_API_KEY
-    #   如 suffix="_3" → OPENAI_COMPATIBLE_API_KEY_3
     suffix = AGENT_MODEL_SUFFIX.get(agent_name, "")
 
     api_key = os.getenv(f"{BASE_PREFIX}_API_KEY{suffix}", "")

@@ -19,6 +19,7 @@ from src.qa.session_manager import (
 logger = setup_logger(__name__)
 
 TOOL_TIMEOUT = 30  # 单个工具超时（秒）
+MAX_CONCURRENT_TOOLS = 4  # 最大并发工具调用数（防止 Windows 子进程竞争）
 
 
 @dataclass
@@ -105,16 +106,12 @@ async def assemble_evidence_fast(
 
     # 无股票代码时：仅当请求的全部是宏观/市场类工具（无需代码）时才继续
     _NO_CODE_TOOLS = {
-        "get_deposit_rate_data", "get_loan_rate_data",
-        "get_required_reserve_ratio_data", "get_money_supply_data_month",
-        "get_money_supply_data_year", "get_latest_trading_date",
-        "get_market_analysis_timeframe", "get_trade_dates", "get_all_stock",
-        "get_sz50_stocks", "get_hs300_stocks", "get_zz500_stocks",
         "tushare_concept_list", "tushare_ths_index", "tushare_dc_index",
         "tushare_search_stock",
         "tushare_cn_cpi", "tushare_cn_gdp", "tushare_cn_pmi",
         "tushare_cn_ppi", "tushare_cn_m", "tushare_shibor",
         "tushare_fx_daily", "tushare_eco_cal",
+        "tushare_latest_trading_date", "tushare_top_list",
     }
     if not stock_code and not company_name:
         if tools and all(t in _NO_CODE_TOOLS for t in tools):
@@ -158,21 +155,38 @@ async def assemble_evidence_fast(
         evidence.missing.append("无可用MCP工具")
         return evidence
 
-    logger.info(f"{WAIT_ICON} QA Evidence: 并行调用 {len(all_mcp_tools)} 个工具...")
+    # Tushare→AkShare 托底映射（当 Tushare 工具全部失败时回退到旧 mcp_server.py 工具）
+    _FALLBACK_TOOL_MAP = {
+        "tushare_kline": "get_historical_k_data",
+        "tushare_daily_basic": None,  # AkShare 无直接等价工具
+        "tushare_stock_info": "get_stock_basic_info",
+        "tushare_latest_trading_date": "get_latest_trading_date",
+        "tushare_adj_factor": "get_adjust_factor_data",
+        "tushare_fina_indicator": None,  # AkShare 有 get_profit_data 等但参数不兼容
+    }
+
+    logger.info(f"{WAIT_ICON} QA Evidence: 并行调用 {len(all_mcp_tools)} 个工具 (并发上限={MAX_CONCURRENT_TOOLS}), stock_code={stock_code}...")
+
+    # 使用信号量限制并发，防止 Windows 上同时启动过多 MCP 子进程
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
+
+    async def _sem_tool_call(tool, kwargs, label):
+        async with semaphore:
+            return await _call_tool_safe(tool, kwargs, TOOL_TIMEOUT, label, session_id)
 
     # 并行调用所有工具
     tasks = []
     labels = []
     for tool in all_mcp_tools:
         kwargs = _build_tool_kwargs(tool.name, stock_code, company_name, question, current_date, topic_name)
-        tasks.append(_call_tool_safe(tool, kwargs, TOOL_TIMEOUT, tool.name, session_id))
+        tasks.append(_sem_tool_call(tool, kwargs, tool.name))
         labels.append(tool.name)
 
     results = await asyncio.gather(*tasks)
 
     # 板块/主题查询：并行拉取代表性个股的估值+基本信息+近K线
     if representative_stocks:
-        _REP_TOOLS = ["get_stock_basic_info", "tushare_daily_basic", "tushare_kline"]
+        _REP_TOOLS = ["tushare_stock_info", "tushare_daily_basic", "tushare_kline"]
         rep_tool_map = {t.name: t for t in all_mcp_tools}
         rep_tasks = []
         rep_labels = []
@@ -181,12 +195,128 @@ async def assemble_evidence_fast(
                 tool = rep_tool_map.get(tname)
                 if tool:
                     rep_kwargs = _build_tool_kwargs(tname, rep_code, rep_name, question, current_date, topic_name)
-                    rep_tasks.append(_call_tool_safe(tool, rep_kwargs, TOOL_TIMEOUT, f"{tname}({rep_name})", session_id))
+                    rep_tasks.append(_sem_tool_call(tool, rep_kwargs, f"{tname}({rep_name})"))
                     rep_labels.append(f"{tname}({rep_name})")
         if rep_tasks:
             rep_results = await asyncio.gather(*rep_tasks)
             labels.extend(rep_labels)
             results = list(results) + list(rep_results)
+
+    # ── 托底：Tushare 工具成功率低于 50% 时，回退到 AkShare（旧 mcp_server.py）──
+    total_called = len(labels)
+    initial_success = sum(1 for t in results if t)
+    if total_called > 0 and initial_success / total_called < 0.5 and stock_code:
+        fallback_tools_to_try = []
+        fallback_tool_objs = {}
+        # 先加载全部旧工具供回退
+        try:
+            _all_fb_tools = await get_mcp_tools()
+            for t in _all_fb_tools:
+                fallback_tool_objs[t.name] = t
+        except Exception:
+            pass
+
+        for orig_name in labels:
+            fb_name = _FALLBACK_TOOL_MAP.get(orig_name)
+            if fb_name and fb_name in fallback_tool_objs:
+                fb_kwargs = _build_tool_kwargs(fb_name, stock_code, company_name,
+                                                question, current_date, topic_name)
+                fallback_tools_to_try.append(
+                    _sem_tool_call(fallback_tool_objs[fb_name], fb_kwargs, f"{fb_name}(托底)")
+                )
+        if fallback_tools_to_try:
+            logger.warning(f"{WAIT_ICON} QA Evidence: Tushare工具全部失败，尝试 {len(fallback_tools_to_try)} 个AkShare托底工具...")
+            fb_results = await asyncio.gather(*fallback_tools_to_try)
+            fb_labels = [f"{_FALLBACK_TOOL_MAP.get(l, l)}(托底)" for l in labels if _FALLBACK_TOOL_MAP.get(l) in fallback_tool_objs]
+            labels = list(labels) + fb_labels
+            results = list(results) + list(fb_results)
+
+    # ── ETF 专属托底：MCP工具使用stock API对ETF代码无效，需用fund API ──
+    # 即使MCP工具"成功"返回了数据，也是stock类API的无效数据（ETF无ROE/PE等个股指标）
+    # 因此ETF查询一律补充fund_basic/fund_daily/fund_adj直连数据
+    _is_etf = stock_code and stock_code.replace("sh.", "").replace("sz.", "").startswith(("51", "58", "15", "16", "18"))
+    if _is_etf and stock_code:
+        logger.info(f"{WAIT_ICON} QA Evidence: ETF标的，补充fund_daily/fund_basic直连数据...")
+        try:
+            from src.utils.tushare_client import get_fund_basic, get_fund_daily, get_fund_adj
+            ts_code = stock_code.replace("sh.", "").replace("sz.", "")
+            _is_bse = (ts_code.startswith(("430", "431", "920")) or
+                       (len(ts_code) >= 3 and ts_code[:3] in
+                        ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+                         "870", "871", "872", "873")))
+            if _is_bse:
+                ts_code = f"{ts_code}.BJ"
+            elif ts_code.startswith(("6", "688", "5")):
+                ts_code = f"{ts_code}.SH"
+            else:
+                ts_code = f"{ts_code}.SZ"
+
+            loop = asyncio.get_running_loop()
+
+            # ETF基础信息
+            fund_info = await loop.run_in_executor(None, get_fund_basic, ts_code)
+            if fund_info:
+                info_text = f"名称: {fund_info.get('name', '')}, 管理公司: {fund_info.get('management', '')}, " \
+                           f"类型: {fund_info.get('fund_type', '')}, 成立日: {fund_info.get('setup_date', '') or fund_info.get('found_date', '')}, " \
+                           f"跟踪指数: {fund_info.get('index_name', '') or fund_info.get('index_code', '')}"
+                if fund_info.get("m_fee"):
+                    info_text += f", 管理费{fund_info['m_fee']}%, 托管费{fund_info.get('c_fee', '')}%"
+                labels.append("etf_fund_basic(ETF直连)")
+                results.append(info_text)
+
+            # ETF日K线
+            fund_kline = await loop.run_in_executor(None, get_fund_daily, ts_code, 120)
+            if fund_kline and len(fund_kline) >= 5:
+                lines = ["trade_date | open | high | low | close | pct_chg | vol | amount"]
+                lines.append("--- | --- | --- | --- | --- | --- | --- | ---")
+                for d in fund_kline[:30]:
+                    lines.append(f"{d.get('trade_date','')} | {d.get('open','')} | {d.get('high','')} | "
+                                f"{d.get('low','')} | {d.get('close','')} | {d.get('pct_chg','')} | "
+                                f"{d.get('vol','')} | {d.get('amount','')}")
+                kline_text = "\n".join(lines)
+                chg_5d = sum(float(d.get("pct_chg", 0) or 0) for d in fund_kline[:5])
+                chg_20d = sum(float(d.get("pct_chg", 0) or 0) for d in fund_kline[:20]) if len(fund_kline) >= 20 else None
+                chg_60d = sum(float(d.get("pct_chg", 0) or 0) for d in fund_kline[:60]) if len(fund_kline) >= 60 else None
+                trend = f"近5日累计{chg_5d:+.2f}%"
+                if chg_20d is not None:
+                    trend += f", 近20日累计{chg_20d:+.2f}%"
+                if chg_60d is not None:
+                    trend += f", 近60日累计{chg_60d:+.2f}%"
+                kline_text = f"趋势: {trend}\n\n" + kline_text
+                labels.append("etf_fund_daily(ETF直连)")
+                results.append(kline_text)
+
+            # ETF复权收益（用 fund_daily 500天 + fund_adj 500天，按日期对齐）
+            fund_kline_long = await loop.run_in_executor(None, get_fund_daily, ts_code, 500)
+            fund_adj_long = await loop.run_in_executor(None, get_fund_adj, ts_code, 500)
+            if fund_kline_long and len(fund_kline_long) >= 60 and fund_adj_long and len(fund_adj_long) >= 60:
+                adj_map = {}
+                for d in fund_adj_long:
+                    dt = d.get("trade_date", "")
+                    if dt:
+                        adj_map[dt] = float(d.get("adj_factor", 1) or 1)
+                latest_adj_val = adj_map.get(fund_kline_long[0].get("trade_date", ""), 1)
+
+                def _qfq_price(day_data):
+                    raw_close = float(day_data.get("close", 0) or 0)
+                    day_adj = adj_map.get(day_data.get("trade_date", ""), latest_adj_val)
+                    return raw_close * day_adj / latest_adj_val if latest_adj_val > 0 else raw_close
+
+                qfq_now = _qfq_price(fund_kline_long[0])
+                ret_parts = []
+                for days, label in [(60, "60日"), (120, "120日"), (250, "250日")]:
+                    idx = min(days, len(fund_kline_long) - 1)
+                    qfq_then = _qfq_price(fund_kline_long[idx])
+                    if qfq_then > 0:
+                        ret_pct = (qfq_now / qfq_then - 1) * 100
+                        ret_parts.append(f"{label}{ret_pct:+.1f}%")
+                adj_text = f"前复权收益 — {', '.join(ret_parts)}"
+                labels.append("etf_adj_return(ETF直连)")
+                results.append(adj_text)
+
+            logger.info(f"{SUCCESS_ICON} QA Evidence: ETF直连补充数据完成")
+        except Exception as e:
+            logger.warning(f"QA Evidence: ETF直连数据获取失败: {e}")
 
     # 组装原始文本
     raw_parts = []
@@ -234,18 +364,13 @@ async def assemble_evidence_react(
 
     # ReAct路径只加载核心分析工具（避免全量工具导致prompt过大）
     _REACT_TOOL_FILTER = [
-        "get_stock_basic_info", "get_stock_industry",
-        "get_historical_k_data", "tushare_kline",
-        "tushare_daily_basic", "tushare_pe_percentile",
-        "tushare_fina_indicator", "tushare_moneyflow",
-        "tushare_dividend", "tushare_ev_ebitda",
-        "get_profit_data", "get_balance_data", "get_cash_flow_data",
-        "get_growth_data", "get_dupont_data",
-        "crawl_news", "tushare_st_status", "get_st_risk_data",
-        "get_latest_trading_date", "get_market_analysis_timeframe",
-        "tushare_search_stock", "tushare_stock_info",
-        "tushare_concept_list", "tushare_hsgt_flow",
-        "tushare_top10_holders", "tushare_news",
+        "tushare_kline", "tushare_daily_basic", "tushare_stock_info",
+        "tushare_pe_percentile", "tushare_fina_indicator",
+        "tushare_moneyflow", "tushare_dividend", "tushare_ev_ebitda",
+        "tushare_news", "tushare_st_status",
+        "tushare_search_stock", "tushare_concept_list",
+        "tushare_hsgt_flow", "tushare_top10_holders",
+        "tushare_adj_factor", "tushare_latest_trading_date",
     ]
     try:
         all_mcp_tools = await get_mcp_tools(tool_filter=_REACT_TOOL_FILTER)
@@ -315,13 +440,12 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
     end_date = base_date.strftime("%Y-%m-%d")
 
     tool_kwargs_map = {
-        # 行情类
-        "get_stock_basic_info": {"code": code},
-        "get_historical_k_data": {"code": code, "start_date": start_date, "end_date": end_date},
+        # 行情类（tushare）
         "tushare_kline": {"code": code, "days": 250},
         "tushare_daily_basic": {"code": code, "days": 500},
-        "get_latest_trading_date": {},
-        "get_market_analysis_timeframe": {},
+        "tushare_stock_info": {"code": code},
+        "tushare_adj_factor": {"code": code, "days": 500},
+        "tushare_latest_trading_date": {},
         # 宏观类（Tushare，无需股票代码）
         "tushare_cn_cpi": {"start_date": start_date, "end_date": end_date},
         "tushare_cn_gdp": {"start_date": start_date, "end_date": end_date},
@@ -331,46 +455,32 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         "tushare_shibor": {"date": end_date},
         "tushare_fx_daily": {"start_date": start_date, "end_date": end_date},
         "tushare_eco_cal": {"date": end_date},
-        # baostock 宏观工具
-        "get_deposit_rate_data": {"start_date": start_date, "end_date": end_date},
-        "get_loan_rate_data": {"start_date": start_date, "end_date": end_date},
-        "get_required_reserve_ratio_data": {"start_date": start_date, "end_date": end_date, "year_type": "0"},
-        "get_money_supply_data_month": {"start_date": start_date, "end_date": end_date},
-        "get_money_supply_data_year": {"start_date": start_date, "end_date": end_date},
         # 估值类
         "tushare_pe_percentile": {"code": code},
         "tushare_ev_ebitda": {"code": code},
         "tushare_dividend": {"code": code},
-        "get_dividend_data": {"code": code, "year": this_year, "year_type": "report"},
-        # 财务类 — 需要 year + quarter
-        "get_profit_data": {"code": code, "year": this_year, "quarter": this_quarter},
-        "get_balance_data": {"code": code, "year": this_year, "quarter": this_quarter},
-        "get_cash_flow_data": {"code": code, "year": this_year, "quarter": this_quarter},
-        "get_growth_data": {"code": code, "year": this_year, "quarter": this_quarter},
-        "get_operation_data": {"code": code, "year": this_year, "quarter": this_quarter},
-        "get_dupont_data": {"code": code, "year": this_year, "quarter": this_quarter},
+        # 财务类
         "tushare_fina_indicator": {"code": code, "years": 3},
-        "tushare_stock_info": {"code": code},
+        "tushare_income": {"code": code},
+        "tushare_balancesheet": {"code": code},
+        "tushare_cashflow": {"code": code},
         # 资金类
         "tushare_moneyflow": {"code": code, "days": 60},
         "tushare_hsgt_flow": {"code": code},
-        # 行业类
-        "get_stock_industry": {"code": code},
+        "tushare_top10_holders": {"code": code},
+        "tushare_holder_num": {"code": code},
         # 新闻/风险类
-        # 主题类问题直接用问题原文搜新闻（含关键词），股票类用公司名
-        "crawl_news": {
-            "query": question if ("主题" in (company_name or "")) else (company_name or clean_code or question),
-            "top_k": 10,
-        },
-        "get_st_risk_data": {"code": code},
         "tushare_st_status": {"code": code},
         "tushare_news": {"code": code},
-        # 板块/概念类（快路径只用搜索工具，明细由ReAct二次调用）
+        # 板块/概念类
         "tushare_concept_list": {"keyword": topic_name or company_name or question},
+        "tushare_concept_detail": {"concept_code": topic_name or company_name or question},
         "tushare_ths_index": {"keyword": topic_name or company_name or question},
         "tushare_dc_index": {"keyword": topic_name or company_name or question},
         # 股票名称搜索
         "tushare_search_stock": {"keyword": company_name or clean_code or question},
+        # 龙虎榜
+        "tushare_top_list": {"date": end_date.replace("-", "")},
     }
 
     if tool_name in tool_kwargs_map:

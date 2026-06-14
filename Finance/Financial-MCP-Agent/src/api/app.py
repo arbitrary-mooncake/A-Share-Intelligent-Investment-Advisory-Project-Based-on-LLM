@@ -52,6 +52,7 @@ load_dotenv(override=True)
 # ──────────────────────────────────────────────
 from src.utils.state_definition import AgentState
 from src.utils.llm_clients import LLMClientFactory, OpenAICompatibleClient
+from src.utils.model_config import get_thinking_body
 from src.stock_pool.stock_pool_manager import StockPoolManager
 from src.stock_pool.scoring_engine import ScoringEngine
 from src.tools.mcp_client import get_mcp_tools
@@ -78,6 +79,20 @@ class PoolAddRequest(BaseModel):
     stock_code: str
     stock_name: str
 
+class FundSearchRequest(BaseModel):
+    keyword: str
+
+class FundReportRequest(BaseModel):
+    fund_code: str
+    fund_name: str = ""
+    mode: str = "report"  # "report" or "score"
+
+class FundPoolAddRequest(BaseModel):
+    stock_code: str = ""   # backward-compat with stock pool API
+    stock_name: str = ""   # backward-compat with stock pool API
+    fund_code: str = ""    # fund-zone preferred field name
+    fund_name: str = ""    # fund-zone preferred field name
+
 # ──────────────────────────────────────────────
 # 全局状态
 # ──────────────────────────────────────────────
@@ -89,6 +104,91 @@ _quick_score_tasks: Dict[str, Dict[str, Any]] = {}  # task_id → {status, resul
 _score_all_tasks: Dict[str, Dict[str, Any]] = {}  # task_id → {status, result, ...}
 _scoring_engine: Optional[ScoringEngine] = None
 _pool_manager: Optional[StockPoolManager] = None
+
+# 基金任务跟踪
+_fund_tasks: Dict[str, Dict[str, Any]] = {}
+_fund_pool_manager = None  # lazy init
+
+def _get_fund_pool_manager():
+    """延迟初始化基金池管理器。优先使用 src.fund_pool.fund_pool_manager，fallback 到简单本地实现。"""
+    global _fund_pool_manager
+    if _fund_pool_manager is None:
+        try:
+            from src.fund_pool.fund_pool_manager import FundPoolManager
+            _fund_pool_manager = FundPoolManager()
+        except ImportError:
+            _fund_pool_manager = _SimpleFundPoolManager()
+    return _fund_pool_manager
+
+
+class _SimpleFundPoolManager:
+    """简单的基金池管理器 fallback（文件持久化），当 FundPoolManager 不可用时使用。"""
+
+    def __init__(self):
+        import json as _json
+        self._pool_file = os.path.join(PROJECT_ROOT, "data", "fund_pool.json")
+        self._pools: Dict[str, Dict[str, Any]] = {}
+
+    def _load(self):
+        import json as _json
+        if os.path.exists(self._pool_file):
+            try:
+                with open(self._pool_file, "r", encoding="utf-8") as f:
+                    loaded = _json.load(f)
+                    if isinstance(loaded, dict):
+                        self._pools = loaded
+            except Exception:
+                pass
+
+    def _save(self):
+        import json as _json
+        os.makedirs(os.path.dirname(self._pool_file), exist_ok=True)
+        with open(self._pool_file, "w", encoding="utf-8") as f:
+            _json.dump(self._pools, f, ensure_ascii=False, indent=2)
+
+    def list_funds(self, pool: str = "scored") -> list:
+        self._load()
+        pool_data = self._pools.get(pool, {})
+        if isinstance(pool_data, dict):
+            return list(pool_data.values())
+        return []
+
+    def add_fund(self, fund_code: str, fund_name: str, pool: str = "scored"):
+        self._load()
+        self._pools.setdefault(pool, {})[fund_code] = {
+            "fund_code": fund_code,
+            "fund_name": fund_name,
+            "added_at": datetime.now().isoformat(),
+            "pool": pool,
+        }
+        self._save()
+
+    def remove_fund(self, fund_code: str, pool: str = "scored") -> bool:
+        self._load()
+        pool_data = self._pools.get(pool, {})
+        if fund_code in pool_data:
+            del pool_data[fund_code]
+            self._pools[pool] = pool_data
+            self._save()
+            return True
+        return False
+
+    def get_fund(self, fund_code: str, pool: str = "scored") -> Optional[Dict]:
+        self._load()
+        return self._pools.get(pool, {}).get(fund_code)
+
+    def update_score(self, fund_code: str, score_data: Dict, pool: str = "scored"):
+        self._load()
+        pool_data = self._pools.setdefault(pool, {})
+        if fund_code in pool_data:
+            pool_data[fund_code].update({
+                "score": score_data.get("score"),
+                "score_time": score_data.get("score_time", datetime.now().isoformat()),
+                "recommendation": score_data.get("recommendation", ""),
+                "status": "scored",
+            })
+        self._save()
+
 
 # ──────────────────────────────────────────────
 # 中间产物缓存管理
@@ -156,13 +256,40 @@ def get_cache_status_for_stock(stock_code: str) -> Dict[str, Any]:
     return {"stock_code": stock_code, "cached_agents": cached}
 
 
+def get_fund_cache_status(fund_code: str) -> Dict[str, Any]:
+    """查看某只基金的中间产物缓存状态"""
+    ensure_cache_dir()
+    cached = {}
+    for filepath in glob_module.glob(os.path.join(CACHE_DIR, f"fund_*_{fund_code}_*.json")):
+        filename = os.path.basename(filepath)
+        parts = filename.replace(".json", "").split("_")
+        # 解析文件名: fund_{agent_name}_{fund_code}_{date}.json
+        if len(parts) >= 4:
+            agent_name = "_".join(parts[1:-2])
+            date_str = parts[-1]
+            cached[agent_name] = date_str
+    return {"fund_code": fund_code, "cached_agents": cached}
+
+
 # ──────────────────────────────────────────────
 # 股票代码规范化
 # ──────────────────────────────────────────────
 
+def _is_bse_code(pure_code: str) -> bool:
+    """检测是否为北交所(BSE)代码: 430xxx, 431xxx, 830-839xxx, 870-873xxx, 920xxx"""
+    if len(pure_code) < 3:
+        return False
+    return (pure_code.startswith(("430", "431", "920")) or
+            (len(pure_code) >= 3 and pure_code[:3] in
+             ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+              "870", "871", "872", "873")))
+
+
 def _get_exchange_prefix(pure_code: str) -> str:
-    """返回交易所前缀 (sh/sz) 用于 Tencent/Sina API"""
-    if pure_code.startswith(("6", "688", "5", "8")):
+    """返回交易所前缀 (sh/sz/bj) 用于 Tencent/Sina API"""
+    if _is_bse_code(pure_code):
+        return "bj"
+    if pure_code.startswith(("6", "688", "5")):
         return "sh"
     elif pure_code.startswith(("0", "3", "1", "4")):
         return "sz"
@@ -171,7 +298,7 @@ def _get_exchange_prefix(pure_code: str) -> str:
 
 def normalize_code(code: str) -> str:
     code = code.strip()
-    if code.startswith("sh.") or code.startswith("sz."):
+    if code.startswith("sh.") or code.startswith("sz.") or code.startswith("bj."):
         return code
     prefix = _get_exchange_prefix(code)
     return f"{prefix}.{code}"
@@ -548,20 +675,26 @@ def _format_market_cap(value_str: str) -> str:
 def _enrich_with_tushare(stock_code: str, existing: Dict) -> Dict:
     """使用 Tushare 补充核心字段: 行业分类、PS、PE分位、ROE等财务指标。
     顺序调用（Tushare 有全局速率限制，并行无意义），每个调用独立隔离异常。
-    低优先级字段（十大股东、基金持仓等）由深度报告覆盖。"""
+    低优先级字段（十大股东、基金持仓等）由深度报告覆盖。
+    ETF代码(51/58/15/16/18开头)跳过股票专属字段(PE/PB/ROE/分红/EV_EBITDA)。"""
+    # 检测是否为 ETF/基金代码
+    _is_etf = stock_code.replace("sh.", "").replace("sz.", "").startswith(("51", "58", "15", "16", "18"))
     try:
         from src.utils.tushare_client import (
             get_stock_info, get_daily_basic, get_fina_indicator, get_dividend,
             compute_pe_percentile, compute_ev_ebitda, get_stock_news_em,
+            get_fund_basic, get_fund_daily, get_fund_adj,
         )
         ts_code = stock_code.replace("sh.", "").replace("sz.", "")
-        if ts_code.startswith(("6", "688", "5", "8")):
+        if _is_bse_code(ts_code):
+            ts_code = f"{ts_code}.BJ"
+        elif ts_code.startswith(("6", "688", "5")):
             ts_code = f"{ts_code}.SH"
         else:
             ts_code = f"{ts_code}.SZ"
 
-        # 1. 行业分类
-        if not existing.get("industry"):
+        # 1. 行业分类（ETF 无行业字段，跳过）
+        if not _is_etf and not existing.get("industry"):
             try:
                 info = get_stock_info(ts_code)
                 if info:
@@ -569,75 +702,165 @@ def _enrich_with_tushare(stock_code: str, existing: Dict) -> Dict:
             except Exception:
                 pass
 
-        # 2. 估值补充: PS, PE/PB确认
-        basics = None
-        try:
-            basics = get_daily_basic(ts_code, days=5)
-        except Exception:
-            pass
+        # 2. 估值补充: PS, PE/PB确认（ETF 无 PE/PB/PS，跳过）
+        if not _is_etf:
+            basics = None
+            try:
+                basics = get_daily_basic(ts_code, days=5)
+            except Exception:
+                pass
 
-        if basics and isinstance(basics, list) and basics:
-            latest = basics[0]
-            if not existing.get("pe"):
-                existing["pe"] = str(latest.get("pe_ttm", ""))
-            if not existing.get("pb"):
-                existing["pb"] = str(latest.get("pb", ""))
-            existing["ps"] = str(latest.get("ps_ttm", ""))
-            existing["total_mv_raw"] = str(latest.get("total_mv", ""))
+            if basics and isinstance(basics, list) and basics:
+                latest = basics[0]
+                if not existing.get("pe"):
+                    existing["pe"] = str(latest.get("pe_ttm", ""))
+                if not existing.get("pb"):
+                    existing["pb"] = str(latest.get("pb", ""))
+                if not existing.get("ps"):
+                    existing["ps"] = str(latest.get("ps_ttm", ""))
+                existing["total_mv_raw"] = str(latest.get("total_mv", ""))
 
-            # PE分位（单独Tushare调用，拉5年数据）
-            pe_val = latest.get("pe_ttm")
-            if pe_val and pe_val != "None":
+                # PE分位（单独Tushare调用，拉5年数据）
+                pe_val = latest.get("pe_ttm")
+                if pe_val and pe_val != "None":
+                    try:
+                        pe_pct = compute_pe_percentile(ts_code, float(pe_val), years=5)
+                        if pe_pct:
+                            existing["pe_percentile"] = (
+                                f"近5年PE分位: {pe_pct['percentile']}%, "
+                                f"最低{pe_pct['min_pe']:.1f}, 中位{pe_pct['median_pe']:.1f}, "
+                                f"最高{pe_pct['max_pe']:.1f}"
+                            )
+                    except Exception:
+                        pass
+
+        # 3. 财务指标摘要（ETF 无财务报表，跳过）
+        if not _is_etf:
+            try:
+                fina = get_fina_indicator(ts_code, years=2)
+                if fina and isinstance(fina, list) and fina:
+                    latest_f = fina[0]
+                    existing["roe"] = str(latest_f.get("roe", ""))
+                    existing["gross_margin"] = str(latest_f.get("grossprofit_margin", ""))
+                    existing["net_margin"] = str(latest_f.get("netprofit_margin", ""))
+                    existing["debt_ratio"] = str(latest_f.get("debt_to_assets", ""))
+                    existing["revenue_growth"] = str(latest_f.get("or_yoy", ""))
+                    existing["profit_growth"] = str(latest_f.get("profit_yoy", ""))
+            except Exception:
+                pass
+
+        # 4. 分红（ETF 无分红数据，跳过）
+        if not _is_etf:
+            try:
+                div = get_dividend(ts_code)
+                if div and isinstance(div, list) and div:
+                    recent = [d for d in div if d.get("cash_div") and float(d["cash_div"]) > 0][:3]
+                    if recent:
+                        existing["dividend_summary"] = "; ".join(
+                            f"{d['end_date'][:4]}年: {d['cash_div']}元/股" for d in recent
+                        )
+            except Exception:
+                pass
+
+        # 5. EV/EBITDA（ETF 无 EBITDA，跳过）
+        if not _is_etf:
+            mv_raw = existing.get("total_mv_raw")
+            if mv_raw:
                 try:
-                    pe_pct = compute_pe_percentile(ts_code, float(pe_val), years=5)
-                    if pe_pct:
-                        existing["pe_percentile"] = (
-                            f"近5年PE分位: {pe_pct['percentile']}%, "
-                            f"最低{pe_pct['min_pe']:.1f}, 中位{pe_pct['median_pe']:.1f}, "
-                            f"最高{pe_pct['max_pe']:.1f}"
+                    ev_result = compute_ev_ebitda(ts_code, float(mv_raw) * 1e4)
+                    if ev_result:
+                        existing["ev_ebitda"] = (
+                            f"EV={ev_result['ev']}亿, EBITDA={ev_result['ebitda']}亿, "
+                            f"EV/EBITDA={ev_result['ev_ebitda']}倍"
+                            + ("(估算)" if ev_result.get("ebitda_estimated") else "")
                         )
                 except Exception:
                     pass
 
-        # 3. 财务指标摘要
-        try:
-            fina = get_fina_indicator(ts_code, years=2)
-            if fina and isinstance(fina, list) and fina:
-                latest_f = fina[0]
-                existing["roe"] = str(latest_f.get("roe", ""))
-                existing["gross_margin"] = str(latest_f.get("grossprofit_margin", ""))
-                existing["net_margin"] = str(latest_f.get("netprofit_margin", ""))
-                existing["debt_ratio"] = str(latest_f.get("debt_to_assets", ""))
-                existing["revenue_growth"] = str(latest_f.get("or_yoy", ""))
-                existing["profit_growth"] = str(latest_f.get("profit_yoy", ""))
-        except Exception:
-            pass
-
-        # 4. 分红
-        try:
-            div = get_dividend(ts_code)
-            if div and isinstance(div, list) and div:
-                recent = [d for d in div if d.get("cash_div") and float(d["cash_div"]) > 0][:3]
-                if recent:
-                    existing["dividend_summary"] = "; ".join(
-                        f"{d['end_date'][:4]}年: {d['cash_div']}元/股" for d in recent
-                    )
-        except Exception:
-            pass
-
-        # 5. EV/EBITDA（daily_basic 的 total_mv 单位是万元，需转为元）
-        mv_raw = existing.get("total_mv_raw")
-        if mv_raw:
+        # ── ETF 专属数据补充 ──
+        if _is_etf:
+            # 2E. ETF基础信息
             try:
-                ev_result = compute_ev_ebitda(ts_code, float(mv_raw) * 1e4)
-                if ev_result:
-                    existing["ev_ebitda"] = (
-                        f"EV={ev_result['ev']}亿, EBITDA={ev_result['ebitda']}亿, "
-                        f"EV/EBITDA={ev_result['ev_ebitda']}倍"
-                        + ("(估算)" if ev_result.get("ebitda_estimated") else "")
+                fund_info = get_fund_basic(ts_code)
+                if fund_info:
+                    existing["industry"] = fund_info.get("index_name", "") or "ETF基金"
+                    existing["etf_info"] = (
+                        f"名称: {fund_info.get('name', '')}, "
+                        f"管理公司: {fund_info.get('management', '')}, "
+                        f"类型: {fund_info.get('fund_type', '')}, "
+                        f"成立日: {fund_info.get('setup_date', '')}, "
+                        f"跟踪指数: {fund_info.get('index_name', '') or fund_info.get('index_code', '')}"
                     )
+                    if fund_info.get("m_fee"):
+                        existing["etf_fee"] = f"管理费{fund_info['m_fee']}%, 托管费{fund_info.get('c_fee', '')}%"
             except Exception:
                 pass
+
+            # 3E. ETF历史行情（补充成交量、涨跌幅趋势）
+            try:
+                fund_kline = get_fund_daily(ts_code, days=120)
+                if fund_kline and isinstance(fund_kline, list) and len(fund_kline) >= 5:
+                    latest = fund_kline[0]
+                    # 近期涨跌幅汇总
+                    chg_5d = sum(float(d.get("pct_chg", 0) or 0) for d in fund_kline[:5])
+                    chg_20d = sum(float(d.get("pct_chg", 0) or 0) for d in fund_kline[:20]) if len(fund_kline) >= 20 else None
+                    chg_60d = sum(float(d.get("pct_chg", 0) or 0) for d in fund_kline[:60]) if len(fund_kline) >= 60 else None
+                    avg_vol_20d = sum(float(d.get("vol", 0) or 0) for d in fund_kline[:20]) / min(20, len(fund_kline))
+                    recent_high = max(float(d.get("high", 0) or 0) for d in fund_kline[:20])
+                    recent_low = min(float(d.get("low", 0) or 0) for d in fund_kline[:20])
+
+                    existing["etf_kline_summary"] = (
+                        f"最新收盘: {latest.get('close', '')}, "
+                        f"5日涨跌: {chg_5d:+.2f}%, "
+                        f"20日涨跌: {chg_20d:+.2f}%" if chg_20d is not None else f"最新收盘: {latest.get('close', '')}, 5日涨跌: {chg_5d:+.2f}%"
+                    )
+                    if chg_60d is not None:
+                        existing["etf_kline_summary"] += f", 60日涨跌: {chg_60d:+.2f}%"
+                    existing["etf_vol_summary"] = (
+                        f"20日均成交量: {avg_vol_20d/1e4:.0f}万手, "
+                        f"20日高: {recent_high:.3f}, 低: {recent_low:.3f}"
+                    )
+                    # 供LLM用的行情趋势描述
+                    existing["etf_trend"] = (
+                        f"近5日累计{chg_5d:+.2f}%, "
+                        f"近20日累计{chg_20d:+.2f}%" if chg_20d is not None else f"近5日累计{chg_5d:+.2f}%"
+                    )
+                    if chg_60d is not None:
+                        existing["etf_trend"] += f", 近60日累计{chg_60d:+.2f}%"
+            except Exception:
+                pass
+
+            # 4E. ETF复权因子（用于计算前复权价格趋势）
+            try:
+                fund_adj = get_fund_adj(ts_code, days=500)
+                if fund_adj and isinstance(fund_adj, list) and len(fund_adj) >= 10:
+                    # 用复权因子 * 收盘价 计算前复权价格趋势
+                    # 先从已有的fund_daily获取收盘价
+                    fund_kline_for_adj = get_fund_daily(ts_code, days=500)
+                    if fund_kline_for_adj and len(fund_kline_for_adj) >= 10:
+                        # 建立日期→复权因子映射
+                        adj_map = {d["trade_date"]: float(d.get("adj_factor", 1) or 1) for d in fund_adj}
+                        # 计算前复权价 = 收盘价 * 当日adj / 最新adj
+                        latest_adj_val = adj_map.get(fund_kline_for_adj[0]["trade_date"], 1)
+                        def _qfq_price(day_data):
+                            raw_close = float(day_data.get("close", 0) or 0)
+                            day_adj = adj_map.get(day_data["trade_date"], latest_adj_val)
+                            return raw_close * day_adj / latest_adj_val if latest_adj_val > 0 else raw_close
+                        qfq_latest = _qfq_price(fund_kline_for_adj[0])
+                        chg_60d = (qfq_latest / _qfq_price(fund_kline_for_adj[min(60, len(fund_kline_for_adj)-1)]) - 1) * 100 if len(fund_kline_for_adj) >= 2 else 0
+                        chg_120d = (qfq_latest / _qfq_price(fund_kline_for_adj[min(120, len(fund_kline_for_adj)-1)]) - 1) * 100 if len(fund_kline_for_adj) >= 2 else 0
+                        chg_250d = (qfq_latest / _qfq_price(fund_kline_for_adj[min(250, len(fund_kline_for_adj)-1)]) - 1) * 100 if len(fund_kline_for_adj) >= 2 else 0
+                        parts = [f"前复权收益 — 60日{chg_60d:+.1f}%"]
+                        if len(fund_kline_for_adj) >= 120:
+                            parts.append(f"120日{chg_120d:+.1f}%")
+                        if len(fund_kline_for_adj) >= 250:
+                            parts.append(f"250日{chg_250d:+.1f}%")
+                        existing["etf_adj_return"] = ", ".join(parts)
+            except Exception:
+                pass
+
+            # 标记为ETF，避免LLM误判缺少ROE/分红等字段为数据缺失
+            existing["_asset_type"] = "ETF"
 
         # 6. 近期新闻
         pure_code = stock_code.replace("sh.", "").replace("sz.", "")
@@ -717,12 +940,13 @@ async def fetch_stock_data(stock_code: str) -> Dict:
 async def quick_analysis_llm(stock_code: str, company_name: str, stock_data: Dict) -> Dict:
     """使用 LLM 对真实股票数据进行快速分析。
     核心原则：LLM 只做解读和判断，绝不编造/修改数据字段。使用 qwen3.6-flash 高速模型。"""
+    _base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_2")
     llm = OpenAICompatibleClient(
         api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_2"),
-        base_url=os.getenv("OPENAI_COMPATIBLE_BASE_URL_2"),
+        base_url=_base_url,
         model=os.getenv("OPENAI_COMPATIBLE_MODEL_2", "qwen3.6-flash"),
         env_prefix="",  # 使用显式参数，不从环境变量自动读取
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body=get_thinking_body(_base_url, False),
     )
 
     data_json = json.dumps(stock_data, ensure_ascii=False, indent=2) if stock_data else "无数据"
@@ -919,6 +1143,179 @@ async def generate_report_task(task_id: str, stock_code: str, company_name: str)
 
 
 # ──────────────────────────────────────────────
+# 基金分析流水线（后台异步）
+# ──────────────────────────────────────────────
+
+async def _run_fund_analysis_pipeline(task_id: str, fund_code: str, fund_name: str, mode: str):
+    """后台异步执行基金分析流水线。
+
+    mode="report": 7Agent分析 → merge → 报告生成
+    mode="score": 7Agent分析 → merge → 综合打分
+    """
+    try:
+        _fund_tasks[task_id]["status"] = "running"
+
+        # 1. 构建初始状态
+        now = datetime.now()
+        current_date = now.strftime("%Y-%m-%d")
+        current_date_cn = now.strftime("%Y年%m月%d日")
+        current_weekday_cn = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][now.weekday()]
+        current_time = now.strftime("%H:%M:%S")
+        current_time_info = f"{current_date_cn} ({current_date}) {current_weekday_cn} {current_time}"
+
+        initial_state = {
+            "messages": [],
+            "data": {
+                "fund_code": fund_code,
+                "fund_name": fund_name,
+                "query": f"分析基金{fund_name}",
+                "current_date": current_date,
+                "current_date_cn": current_date_cn,
+                "current_time": current_time,
+                "current_weekday_cn": current_weekday_cn,
+                "current_time_info": current_time_info,
+            },
+            "metadata": {},
+        }
+
+        # 2. 构建 LangGraph 工作流
+        from langgraph.graph import StateGraph, END
+        from src.agents.fund_product_doc_agent import fund_product_doc_agent
+        from src.agents.fund_perf_risk_agent import fund_perf_risk_agent
+        from src.agents.fund_holdings_agent import fund_holdings_analysis
+        from src.agents.fund_manager_agent import fund_manager_agent
+        from src.agents.fund_benchmark_agent import fund_benchmark_agent
+        from src.agents.fund_fee_agent import fund_fee_agent
+        from src.agents.fund_event_agent import fund_event_agent
+        from src.agents.fund_merge_node import fund_merge_node
+        from src.agents.fund_report_agent import fund_report_agent
+
+        workflow = StateGraph(AgentState)
+
+        # 7个并行分析Agent
+        fund_analyst_nodes = {
+            "fund_product_doc": fund_product_doc_agent,
+            "fund_perf_risk": fund_perf_risk_agent,
+            "fund_holdings": fund_holdings_analysis,
+            "fund_manager": fund_manager_agent,
+            "fund_benchmark": fund_benchmark_agent,
+            "fund_fee": fund_fee_agent,
+            "fund_event": fund_event_agent,
+        }
+
+        workflow.add_node("start_node", lambda state: state)
+        for node_name, agent_fn in fund_analyst_nodes.items():
+            workflow.add_node(node_name, agent_fn)
+        workflow.add_node("fund_merge", fund_merge_node)
+
+        # 根据 mode 选择最终节点
+        if mode == "report":
+            workflow.add_node("final_node", fund_report_agent)
+        else:
+            # score 模式：包装 fund_scoring_agent（签名不同，不接收 state）
+            async def fund_score_wrapper(state: AgentState) -> Dict[str, Any]:
+                from src.agents.fund_scoring_agent import fund_scoring_agent
+                pkg = state.get("data", {}).get("fund_analysis_package", {})
+                fc = state.get("data", {}).get("fund_code", "")
+                fn = state.get("data", {}).get("fund_name", "")
+                cd = state.get("data", {}).get("current_date", "")
+                ft = (pkg.get("fund_profile", {}) or {}).get("fund_type", "") or state.get("data", {}).get("fund_type", "") or "未知类型"
+                result = await fund_scoring_agent(
+                    fund_analysis_package=pkg,
+                    fund_code=fc, fund_name=fn, fund_type=ft,
+                    current_date=cd, thinking_enabled=True,
+                )
+                return {"data": {"fund_score": result}}
+            workflow.add_node("final_node", fund_score_wrapper)
+
+        # 连线：start → 7 parallel → merge → final
+        workflow.set_entry_point("start_node")
+        for node_name in fund_analyst_nodes:
+            workflow.add_edge("start_node", node_name)
+            workflow.add_edge(node_name, "fund_merge")
+        workflow.add_edge("fund_merge", "final_node")
+        workflow.add_edge("final_node", END)
+
+        app = workflow.compile()
+        logger.info(f"{WAIT_ICON} 基金分析Pipeline开始: {fund_name}({fund_code}), mode={mode}")
+
+        # 3. 执行并追踪进度
+        completed_nodes = set()
+        total_nodes = len(fund_analyst_nodes) + 3  # start + 7 agents + merge + final
+        final_state = None
+
+        async for chunk in app.astream(initial_state, config={"recursion_limit": 50}):
+            for node_name, node_state in chunk.items():
+                completed_nodes.add(node_name)
+                logger.info(
+                    f"基金Pipeline节点完成: {node_name} "
+                    f"({len(completed_nodes)}/{total_nodes})"
+                )
+                if node_name == "final_node":
+                    final_state = node_state
+
+        if final_state is None:
+            raise ValueError("基金Pipeline未返回final_node结果")
+
+        # 4. 提取结果
+        result_data = final_state.get("data", {})
+
+        if mode == "report":
+            report_content = result_data.get("fund_report", "")
+            report_path = result_data.get("fund_report_path", "")
+            _fund_tasks[task_id] = {
+                "status": "completed",
+                "mode": "report",
+                "fund_code": fund_code,
+                "fund_name": fund_name,
+                "report_content": report_content,
+                "report_path": report_path,
+                "report_pdf_path": result_data.get("fund_report_pdf_path", ""),
+                "generated_at": datetime.now().isoformat(),
+            }
+        else:
+            score_data = result_data.get("fund_score", {})
+            _fund_tasks[task_id] = {
+                "status": "completed",
+                "mode": "score",
+                "fund_code": fund_code,
+                "fund_name": fund_name,
+                "score": score_data,
+                "generated_at": datetime.now().isoformat(),
+            }
+
+            # 持久化评分到基金池
+            try:
+                mgr = _get_fund_pool_manager()
+                overall = score_data.get("overall_score", {})
+                holding = score_data.get("holding_period_suggestion", {})
+                highlights = score_data.get("highlights", {})
+                mgr.update_score(fund_code, {
+                    "score": overall.get("score"),
+                    "rating": overall.get("rating_label", ""),
+                    "investment_view": overall.get("investment_view", ""),
+                    "holding_period": holding.get("label", "") if isinstance(holding, dict) else "",
+                    "subscores": score_data.get("subscores", {}),
+                    "strengths": highlights.get("strengths", []),
+                    "risks": highlights.get("risks", []),
+                }, pool="scored")
+            except Exception as e:
+                logger.warning(f"持久化基金评分到池失败: {e}")
+
+        logger.info(f"{SUCCESS_ICON} 基金分析完成: {fund_name}({fund_code}), mode={mode}")
+
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 基金分析失败: {e}", exc_info=True)
+        _fund_tasks[task_id] = {
+            "status": "failed",
+            "error": str(e),
+            "fund_code": fund_code,
+            "fund_name": fund_name,
+            "mode": mode,
+        }
+
+
+# ──────────────────────────────────────────────
 # FastAPI 应用生命周期
 # ──────────────────────────────────────────────
 
@@ -964,40 +1361,77 @@ app.add_middleware(
 _name_code_cache: Optional[dict] = None  # name → code 映射
 
 
+_name_code_cache: Optional[dict] = None  # name → normalized_code 映射 (sh.xxxxxx / sz.xxxxxx)
+_etf_name_cache: Optional[dict] = None   # ETF name → sh.xxxxxx 映射
+
 def _ensure_name_cache():
-    """加载并缓存股票名称→代码映射（首次调用约13秒）"""
-    global _name_code_cache
+    """加载并缓存股票+ETF名称→代码映射（首次调用约15秒）"""
+    global _name_code_cache, _etf_name_cache
     if _name_code_cache is not None:
         return
+    _name_code_cache = {}
+    _etf_name_cache = {}
+
+    # 1. 加载A股股票名称
     try:
         ak = _get_akshare()
         df = ak.stock_info_a_code_name()
         if df is not None and not df.empty:
-            _name_code_cache = {}
             for _, row in df.iterrows():
                 n = str(row.get("name", "")).strip()
                 c = str(row.get("code", "")).strip()
                 if n and c:
-                    _name_code_cache[n] = c
-            logger.info(f"{SUCCESS_ICON} 名称缓存加载完成: {len(_name_code_cache)} 只股票")
+                    _name_code_cache[n] = normalize_code(c)
+        logger.info(f"{SUCCESS_ICON} 名称缓存加载完成: {len(_name_code_cache)} 只股票")
     except Exception as e:
-        logger.warning(f"名称缓存加载失败: {e}")
-        _name_code_cache = {}
+        logger.warning(f"名称缓存(股票)加载失败: {e}")
+
+    # 2. 加载ETF/基金名称（Tushare fund_basic）
+    try:
+        import requests as _req
+        resp = _req.post("https://api.tushare.pro", json={
+            "api_name": "fund_basic", "token": "fd4ff6e84626d2e63616ec08769f99110d626a91856036c30cb34818",
+            "params": {"market": "E"},
+            "fields": "ts_code,name"
+        }, timeout=15)
+        data = resp.json()
+        if data.get("code") == 0:
+            for item in data.get("data", {}).get("items", []):
+                ts_code = item[0]
+                name = item[1].strip() if len(item) > 1 else ""
+                if name and ts_code:
+                    clean = ts_code.replace(".SH", "").replace(".SZ", "")
+                    norm = f"sh.{clean}" if ts_code.endswith(".SH") else f"sz.{clean}"
+                    _etf_name_cache[name] = norm
+            logger.info(f"{SUCCESS_ICON} ETF名称缓存加载完成: {len(_etf_name_cache)} 只ETF")
+    except Exception as e:
+        logger.warning(f"ETF名称缓存加载失败: {e}")
 
 
 def _lookup_stock_code_by_name(name: str) -> Optional[str]:
-    """通过公司名查找股票代码（从缓存）"""
+    """通过公司名查找股票代码（股票+ETF缓存）"""
     _ensure_name_cache()
-    if not _name_code_cache:
-        return None
     # 精确匹配
     if name in _name_code_cache:
         return _name_code_cache[name]
+    if name in _etf_name_cache:
+        return _etf_name_cache[name]
     # 模糊匹配（名称包含输入）
     for n, c in _name_code_cache.items():
         if name in n:
             return c
+    for n, c in _etf_name_cache.items():
+        if name in n:
+            return c
     return None
+
+
+def _is_valid_stock_code(code: str) -> bool:
+    """检查是否是合法的股票/ETF代码格式"""
+    if not code:
+        return False
+    clean = code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+    return bool(re.match(r'^\d{5,6}$', clean))
 
 
 @app.post("/api/query")
@@ -1090,6 +1524,13 @@ async def trigger_report(query: StockQuery):
             stock_code = query.stock_input.strip()
         else:
             stock_code = normalize_code(stock_code)
+
+        # 验证代码合法性：拒绝非股票/ETF代码格式的输入
+        if not _is_valid_stock_code(stock_code):
+            raise HTTPException(
+                status_code=400,
+                detail=f"无法识别'{query.stock_input}'为有效的股票代码或名称。请使用6位数字代码（如512480）或完整公司名称。"
+            )
 
         if not company_name:
             company_name = query.stock_input.strip()
@@ -1381,12 +1822,13 @@ async def _direct_llm_score(
     term: str, stock_code: str, company_name: str, stock_data: Dict
 ) -> Dict[str, Any]:
     """绕过 MCP ReAct，直接 HTTP 数据 + LLM 打分（快筛专用）"""
+    _base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_2")
     llm = OpenAICompatibleClient(
         api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_2"),
-        base_url=os.getenv("OPENAI_COMPATIBLE_BASE_URL_2"),
+        base_url=_base_url,
         model=os.getenv("OPENAI_COMPATIBLE_MODEL_2", "qwen3.6-flash"),
         env_prefix="",
-        extra_body={"thinking": {"type": "enabled"}},
+        extra_body=get_thinking_body(_base_url, True),
     )
 
     # 构建数据摘要
@@ -1419,6 +1861,7 @@ async def _direct_llm_score(
     # 提取关键事实清单（可引用数字白名单）
     pc = stock_data.get("price_changes", {}) or {}
     facts = []
+    is_etf = stock_data.get("_asset_type") == "ETF"
     def _add(label, val, suffix=""):
         v = (val or "").strip()
         if v and v != "None" and v != "N/A":
@@ -1427,12 +1870,13 @@ async def _direct_llm_score(
     _add("PE", stock_data.get("pe"))
     _add("PB", stock_data.get("pb"))
     _add("PS", stock_data.get("ps"))
-    _add("ROE", stock_data.get("roe"))
-    _add("毛利率", stock_data.get("gross_margin"))
-    _add("净利率", stock_data.get("net_margin"))
-    _add("营收增速", stock_data.get("revenue_growth"))
-    _add("利润增速", stock_data.get("profit_growth"))
-    _add("负债率", stock_data.get("debt_ratio"))
+    if not is_etf:
+        _add("ROE", stock_data.get("roe"))
+        _add("毛利率", stock_data.get("gross_margin"))
+        _add("净利率", stock_data.get("net_margin"))
+        _add("营收增速", stock_data.get("revenue_growth"))
+        _add("利润增速", stock_data.get("profit_growth"))
+        _add("负债率", stock_data.get("debt_ratio"))
     _add("换手率", stock_data.get("turnover_rate"))
     _add("总市值", stock_data.get("market_cap"))
     _add("近1日涨跌", pc.get("1d"))
@@ -1449,6 +1893,14 @@ async def _direct_llm_score(
         facts.append(f"行业PE正常区间: {industry_pe_range}")
     if industry_pb_range:
         facts.append(f"行业PB正常区间: {industry_pb_range}")
+    # ETF 专属字段
+    if is_etf:
+        _add("ETF信息", stock_data.get("etf_info"))
+        _add("ETF费率", stock_data.get("etf_fee"))
+        _add("ETF行情摘要", stock_data.get("etf_kline_summary"))
+        _add("ETF成交摘要", stock_data.get("etf_vol_summary"))
+        _add("ETF趋势", stock_data.get("etf_trend"))
+        _add("ETF复权收益", stock_data.get("etf_adj_return"))
 
     fact_checklist = "\n".join(f"  - {f}" for f in facts) if facts else "（无可用数据）"
 
@@ -1466,6 +1918,23 @@ async def _direct_llm_score(
 - 违反以上规则等于向用户传播虚假信息"""
 
     prompt = _SCORING_PROMPTS[term]
+
+    # ETF 专属提示（替代不适合ETF的评分维度）
+    etf_guidance = ""
+    if is_etf:
+        etf_guidance = """
+## ⚠️ ETF打分特殊规则
+
+本标的为ETF/指数基金，不是个股。ETF没有ROE、毛利率、净利率、营收增速、利润增速、负债率、分红、EV/EBITDA等个股财务指标，这些字段缺失是正常现象，不代表"数据获取不足"。
+
+**ETF打分调整**:
+- 基本面质量 → 改为"跟踪指数质量"：评估跟踪指数的行业代表性、流动性、成分股集中度
+- 成长性 → 改为"板块景气度"：基于ETF趋势数据（近5/20/60日涨跌）和板块轮动判断
+- 估值水平 → 使用PE/PB（如有），若无则用价格相对20日高低点位置判断
+- 商业护城河 → 改为"板块优势"：ETF跟踪的板块是否有政策支持/产业趋势
+- 在reasoning中说明"本标的为ETF，无个股财务指标"，不要说"数据不足"
+"""
+
     user_message = f"""{citation_rules}
 
 ## 核心事实（reasoning/risk_warning 中只能引用以下数字）
@@ -1473,6 +1942,7 @@ async def _direct_llm_score(
 
 **股票**: {company_name} ({stock_code})
 **当前日期**: {datetime.now().strftime('%Y-%m-%d')}
+{etf_guidance}
 
 ## 真实股票数据
 {data_text}
@@ -2095,3 +2565,640 @@ async def qa_delete_session(session_id: str):
     if not deleted:
         raise HTTPException(status_code=404, detail="会话不存在或已过期")
     return {"status": "deleted", "session_id": session_id}
+
+
+# ══════════════════════════════════════════════════════════════
+# 基金分析端点 (Fund Analysis Endpoints)
+# ══════════════════════════════════════════════════════════════
+
+@app.post("/api/fund/query")
+async def fund_quick_query(req: FundSearchRequest):
+    """基金快速查询 — 返回基金关键指标 + 同类基准对比。
+    使用轻量模型(Qwen3.6-Flash)做数据解读，严格防幻觉：数值字段全由代码计算，LLM只写文字解读。"""
+    keyword = req.keyword.strip()
+    if not keyword or len(keyword) < 1:
+        raise HTTPException(status_code=400, detail="关键字不能为空")
+
+    # 1. 查找基金（优先代码精确查，再按名称搜索）
+    fund_code, fund_name, fund_basic_data = await _resolve_fund(keyword)
+    if not fund_code:
+        raise HTTPException(status_code=404, detail=f"未找到匹配'{keyword}'的基金，请检查代码或名称")
+
+    clean_code = fund_code.replace("sh.", "").replace("sz.", "").replace("of.", "").replace(".SH", "").replace(".SZ", "").replace(".OF", "").strip()
+
+    # 2. 获取基金关键数据（并行）— MCP client 已在 _resolve_fund 中初始化并缓存
+    from src.tools.mcp_client import get_mcp_tools
+    tools = await get_mcp_tools(tool_filter=["tushare_fund_basic", "tushare_fund_nav", "tushare_fund_manager"])
+    tool_map = {t.name: t for t in tools} if tools else {}
+    logger.info(f"基金查询: 可用工具={list(tool_map.keys())}, 请求=basic/nav/manager")
+
+    async def _call_tool(tool, kwargs, label=""):
+        try:
+            r = await asyncio.wait_for(tool.ainvoke(kwargs), timeout=20)
+            text = str(r).strip()
+            logger.info(f"基金查询: {label} 获取成功 ({len(text)} 字符)")
+            return text
+        except Exception as e:
+            logger.warning(f"基金查询: {label} 获取失败: {e}")
+            return ""
+
+    # 串行获取数据（MCP stdio 不支持并行多路复用，会导致部分调用返回空）
+    raw = {}
+    if "tushare_fund_basic" in tool_map:
+        raw["basic"] = await _call_tool(tool_map["tushare_fund_basic"], {"code": clean_code}, "basic")
+    if "tushare_fund_nav" in tool_map:
+        raw["nav"] = await _call_tool(tool_map["tushare_fund_nav"], {"code": clean_code, "days": 500}, "nav")
+    if "tushare_fund_manager" in tool_map:
+        raw["manager"] = await _call_tool(tool_map["tushare_fund_manager"], {"code": clean_code}, "manager")
+    logger.info(f"基金查询: raw keys={list(raw.keys())}, nav_len={len(raw.get('nav',''))}, basic_len={len(raw.get('basic',''))}")
+
+    # 3. 从原始数据中提取结构化指标（代码计算，不依赖LLM）
+    metrics = _compute_fund_metrics(clean_code, fund_basic_data, raw)
+    logger.info(f"基金查询: metrics keys={list(metrics.keys())}, return_1y={metrics.get('return_1y','N/A')}")
+
+    # 4. 获取同类基金基准
+    fund_type_str = fund_basic_data.get("fund_type", "") or metrics.get("fund_type", "")
+    from src.utils.fund_type_knowledge import get_fund_benchmark, identify_fund_type
+    matched_type = identify_fund_type(fund_type_str)
+    benchmark = get_fund_benchmark(fund_type_str)
+
+    # 5. 用轻量模型做文字解读（数值字段不经过LLM）
+    analysis_text = await _fund_quick_llm(fund_code, fund_name, metrics, benchmark, raw)
+
+    return {
+        "fund_code": fund_code,
+        "fund_name": fund_name,
+        "fund_type": fund_type_str or matched_type or "未知类型",
+        "metrics": metrics,
+        "fund_benchmark": {
+            "type_name": matched_type or fund_type_str or "未知",
+            "description": benchmark.get("description", ""),
+            **{k: v for k, v in benchmark.items() if k != "description"},
+        },
+        "analysis": analysis_text,
+    }
+
+
+async def _resolve_fund(keyword: str):
+    """解析基金关键字：优先精确代码查询，再名称搜索。返回 (fund_code, fund_name, basic_data)"""
+    from src.tools.mcp_client import get_mcp_tools
+
+    # 检测是否为基金代码格式
+    kw = keyword.strip()
+    is_code_like = bool(re.match(r'^(sh\.|sz\.|of\.)?\d{5,6}(\.(OF|SH|SZ))?$', kw, re.IGNORECASE))
+    clean_kw = kw.replace("sh.", "").replace("sz.", "").replace("of.", "").replace(".SH", "").replace(".SZ", "").replace(".OF", "").strip()
+
+    if is_code_like:
+        # 精确代码查询
+        try:
+            tools = await get_mcp_tools(tool_filter=["tushare_fund_basic"])
+            if tools:
+                result = await asyncio.wait_for(
+                    tools[0].ainvoke({"code": clean_kw}),
+                    timeout=15.0,
+                )
+                text = str(result).strip()
+                if text and "未找到" not in text and len(text) > 50:
+                    # 解析markdown表格提取基本信息
+                    basic = _parse_fund_basic_from_table(text)
+                    if basic:
+                        ts_code = basic.get("ts_code", "")
+                        name = basic.get("name", "")
+                        code = f"sz.{clean_kw}" if clean_kw.startswith(("0", "1", "3")) else f"sh.{clean_kw}"
+                        if ts_code and ts_code.endswith(".OF"):
+                            code = f"of.{clean_kw}" if not clean_kw.startswith(("51","58","15","16","18")) else code
+                        return code, name or kw, basic
+        except Exception:
+            pass
+
+    # 名称搜索
+    try:
+        tools = await get_mcp_tools(tool_filter=["tushare_fund_search"])
+        if tools:
+            result = await asyncio.wait_for(
+                tools[0].ainvoke({"keyword": kw}),
+                timeout=30.0,
+            )
+            text = str(result).strip()
+            if text and "未找到" not in text and len(text) > 50:
+                basic = _parse_fund_basic_from_table(text)
+                if basic:
+                    ts_code = basic.get("ts_code", "")
+                    name = basic.get("name", "") or kw
+                    clean_c = ts_code.replace(".OF", "").replace(".SH", "").replace(".SZ", "").strip()
+                    code = f"sz.{clean_c}" if clean_c.startswith(("0", "1", "3")) else f"sh.{clean_c}"
+                    if ts_code.endswith(".OF"):
+                        code = f"of.{clean_c}"
+                    return code, name, basic
+    except Exception:
+        pass
+
+    return None, None, {}
+
+
+def _parse_fund_basic_from_table(text: str) -> dict:
+    """从markdown表格中解析第一行基金基本信息（处理空单元格）。"""
+    lines = text.strip().split("\n")
+    if len(lines) < 3:
+        return {}
+    # 用 | 精确分割每行（保留空单元格）
+    def _split_row(line: str) -> list:
+        return [c.strip() for c in line.split("|")][1:-1]  # 去掉首尾空元素
+    headers = _split_row(lines[0])
+    values = _split_row(lines[2]) if len(lines) > 2 else []
+    if headers and values:
+        # 若 values < headers，补齐缺失的空值
+        while len(values) < len(headers):
+            values.append("")
+        return dict(zip(headers[:len(values)], values))
+    return {}
+
+
+def _compute_fund_metrics(clean_code: str, basic: dict, raw: dict) -> dict:
+    """从原始数据中提取计算基金关键指标（纯代码，无LLM参与）"""
+    import math
+    m = {
+        "fund_type": basic.get("fund_type", ""),
+        "management": basic.get("management", ""),
+        "found_date": basic.get("found_date", ""),
+        "benchmark": basic.get("benchmark", ""),
+        "m_fee": basic.get("m_fee", ""),
+        "c_fee": basic.get("c_fee", ""),
+        "invest_type": basic.get("invest_type", ""),
+        "status": basic.get("status", ""),
+    }
+
+    # 从NAV数据中计算收益/风险指标
+    nav_text = raw.get("nav", "")
+    nav_data = _parse_nav_from_table(nav_text)
+
+    if nav_data:
+        try:
+            # MCP 返回的 NAV 表是倒序（最新在前），反转为时间升序（最旧在前）
+            nav_data_chrono = list(reversed(nav_data))
+
+            # 同步提取 dates + adj_navs（同一行要么都保留，要么都丢弃，保证索引对齐）
+            dates = []
+            adj_navs = []
+            unit_navs = []
+            for d in nav_data_chrono:
+                try:
+                    u = float(d.get("unit_nav", 0))
+                    a = float(d.get("adj_nav", 0))
+                    dt = d.get("nav_date", "")
+                    if not dt or u == 0 or a == 0:
+                        continue
+                    unit_navs.append(u)
+                    adj_navs.append(a)
+                    dates.append(dt)
+                except (ValueError, TypeError):
+                    continue
+
+            if not adj_navs:
+                logger.warning("基金查询: NAV 解析后 adj_navs 为空")
+                m["data_days"] = "0"
+                return m
+
+            n = len(adj_navs)
+            m["latest_nav"] = f"{unit_navs[-1]:.4f}"
+            m["latest_adj_nav"] = f"{adj_navs[-1]:.4f}"
+            m["nav_date"] = dates[-1] if dates else ""
+            m["data_days"] = str(n)
+
+            if n < 2:
+                return m
+
+            # ---- 用实际日期找1年前位置 ----
+            from datetime import datetime as _dt, timedelta as _td
+            cutoff = (_dt.now() - _td(days=365)).strftime("%Y%m%d")
+            logger.info(f"基金查询: cutoff={cutoff}, n={n}, first_date={dates[0]}, last_date={dates[-1]}")
+
+            # 找 < cutoff 的最大日期（往前找最近交易日，跳过 cutoff 当天）
+            idx_1y = 0
+            for i in range(n-1, -1, -1):
+                if dates[i] < cutoff:
+                    idx_1y = i
+                    break
+
+            logger.info(f"基金查询: idx_1y={idx_1y}, date_1y={dates[idx_1y]}, nav_1y={adj_navs[idx_1y]:.4f}, nav_now={adj_navs[-1]:.4f}")
+
+            # ---- 计算指标 ----
+            start_nav = adj_navs[idx_1y]
+            end_nav = adj_navs[-1]
+            if start_nav > 0 and idx_1y < n - 1:
+                ret = (end_nav / start_nav - 1) * 100
+                m["return_1y"] = f"{ret:.2f}%"
+                logger.info(f"基金查询: return_1y={m['return_1y']}")
+
+            window = adj_navs[idx_1y:]
+            if len(window) >= 20:
+                daily_rets = []
+                for i in range(1, len(window)):
+                    if window[i-1] > 0:
+                        daily_rets.append(math.log(window[i] / window[i-1]))
+                if daily_rets:
+                    std_daily = _stddev(daily_rets)
+                    m["annual_volatility"] = f"{std_daily * math.sqrt(252) * 100:.2f}%"
+
+            if len(window) >= 20:
+                peak = window[0]
+                max_dd = 0.0
+                for nav_val in window:
+                    if nav_val > peak:
+                        peak = nav_val
+                    if peak > 0:
+                        dd = (nav_val / peak - 1) * 100
+                        if dd < max_dd:
+                            max_dd = dd
+                m["max_drawdown_1y"] = f"{max_dd:.2f}%"
+
+            # 夏普比率
+            if m.get("annual_volatility") and m.get("return_1y"):
+                try:
+                    vol = float(m["annual_volatility"].replace("%", "")) / 100
+                    ret_y = float(m["return_1y"].replace("%", "")) / 100
+                    if vol > 0:
+                        m["sharpe_ratio"] = f"{(ret_y - 0.02) / vol:.2f}"
+                except (ValueError, TypeError):
+                    pass
+
+        except Exception as e:
+            logger.error(f"基金查询: _compute_fund_metrics 异常: {e}", exc_info=True)
+
+    return m
+
+
+def _parse_nav_from_table(text: str) -> list:
+    """从markdown表格中解析NAV数据（处理空单元格）。"""
+    if not text or len(text) < 50:
+        return []
+    lines = text.strip().split("\n")
+    if len(lines) < 3:
+        return []
+    def _split_row(line: str) -> list:
+        return [c.strip() for c in line.split("|")][1:-1]
+    headers = _split_row(lines[0])
+    result = []
+    for line in lines[2:]:
+        vals = _split_row(line)
+        if not vals:
+            continue
+        while len(vals) < len(headers):
+            vals.append("")
+        result.append(dict(zip(headers[:len(vals)], vals)))
+    return result
+
+
+def _stddev(data: list) -> float:
+    import math
+    if len(data) < 2:
+        return 0.0
+    mean = sum(data) / len(data)
+    variance = sum((x - mean) ** 2 for x in data) / (len(data) - 1)
+    return math.sqrt(variance)
+
+
+async def _fund_quick_llm(fund_code: str, fund_name: str, metrics: dict, benchmark: dict, raw: dict) -> dict:
+    """使用轻量模型(Qwen3.6-Flash)做文字解读。只生成文字字段，数值全由代码预填。"""
+    import os as _os
+    base_url = _os.getenv("OPENAI_COMPATIBLE_BASE_URL_2")
+    llm = OpenAICompatibleClient(
+        api_key=_os.getenv("OPENAI_COMPATIBLE_API_KEY_2"),
+        base_url=base_url,
+        model=_os.getenv("OPENAI_COMPATIBLE_MODEL_2", "qwen3.6-flash"),
+        env_prefix="",
+        extra_body=get_thinking_body(base_url, False),
+    )
+
+    metrics_json = json.dumps(metrics, ensure_ascii=False, indent=2)
+    benchmark_json = json.dumps(benchmark, ensure_ascii=False, indent=2)
+
+    # 预填数据（数值字段不经过LLM）
+    factual = {
+        "fund_name": fund_name,
+        "fund_code": fund_code,
+        "fund_type": metrics.get("fund_type", "未知"),
+        "management": metrics.get("management", ""),
+        "found_date": metrics.get("found_date", ""),
+        "benchmark": metrics.get("benchmark", ""),
+        "m_fee": metrics.get("m_fee", ""),
+        "c_fee": metrics.get("c_fee", ""),
+        "latest_nav": metrics.get("latest_nav", ""),
+        "nav_date": metrics.get("nav_date", ""),
+        "return_1y": metrics.get("return_1y", ""),
+        "annual_volatility": metrics.get("annual_volatility", ""),
+        "max_drawdown_1y": metrics.get("max_drawdown_1y", ""),
+        "sharpe_ratio": metrics.get("sharpe_ratio", ""),
+        "invest_type": metrics.get("invest_type", ""),
+        "status": metrics.get("status", ""),
+    }
+
+    prompt = f"""请对以下公募基金做简洁文字解读。所有数值字段已由系统计算完毕，你只需要写 3 段文字解读（每段1-2句，总计≤200字）。
+
+基金: {fund_name} ({fund_code})
+
+## 系统计算指标
+{metrics_json}
+
+## 同类基准({benchmark.get('type_name', '')})
+{benchmark_json}
+
+请返回严格JSON（不要markdown标记）：
+{{
+  "fund_name": "已预填",
+  "fund_code": "已预填",
+  "fund_type": "已预填",
+  "management": "已预填",
+  "found_date": "已预填",
+  "benchmark": "已预填",
+  "m_fee": "已预填",
+  "c_fee": "已预填",
+  "latest_nav": "已预填",
+  "nav_date": "已预填",
+  "return_1y": "已预填",
+  "annual_volatility": "已预填",
+  "max_drawdown_1y": "已预填",
+  "sharpe_ratio": "已预填",
+  "invest_type": "已预填",
+  "status": "已预填",
+  "fund_intro": "1-2句基金介绍，基于基金名称、类型、管理人、投资策略推断",
+  "performance_comment": "1-2句业绩点评，基于return_1y/volatility/max_drawdown/sharpe与同类基准对比，若指标缺失则如实说明",
+  "suitability": "1句适配性建议，基于基金类型和风险指标，若指标缺失则如实说明"
+}}
+
+⛔ 幻觉控制（违反任一条即为错误）：
+1. 所有带"已预填"的字段必须原样输出"已预填"（由系统后处理替换），你不得修改、猜测、或补充任何数值
+2. fund_intro/performance_comment/suitability 三个文字字段基于实际数据撰写，数据缺失时如实说明"数据有限"
+3. 不得编造任何数字、日期、百分比或人名
+4. 不得提及"我"、"本人"、"分析师"等第一人称"""
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                _thread_pool,
+                lambda: llm.get_completion([
+                    {"role": "system", "content": "你是一个公募基金数据查询助手。严格遵循数据，不编造任何信息。输出纯JSON。"},
+                    {"role": "user", "content": prompt},
+                ], temperature=0.3, max_tokens=1024, response_format="json_object"),
+            ),
+            timeout=25.0,
+        )
+        text = response.strip() if isinstance(response, str) else str(response)
+        # 清理可能的markdown包裹
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        result = json.loads(text)
+    except Exception:
+        result = {}
+
+    # 将LLM输出的文字字段与预填的数值字段合并
+    return {
+        "fund_name": fund_name,
+        "fund_code": fund_code,
+        "fund_type": factual["fund_type"],
+        "management": factual["management"],
+        "found_date": factual["found_date"],
+        "benchmark": factual["benchmark"],
+        "m_fee": factual["m_fee"],
+        "c_fee": factual["c_fee"],
+        "latest_nav": factual["latest_nav"],
+        "nav_date": factual["nav_date"],
+        "return_1y": factual["return_1y"],
+        "annual_volatility": factual["annual_volatility"],
+        "max_drawdown_1y": factual["max_drawdown_1y"],
+        "sharpe_ratio": factual["sharpe_ratio"],
+        "invest_type": factual["invest_type"],
+        "status": factual["status"],
+        "fund_intro": result.get("fund_intro", "") or "",
+        "performance_comment": result.get("performance_comment", "") or "",
+        "suitability": result.get("suitability", "") or "",
+    }
+
+
+@app.post("/api/fund/search")
+async def search_funds(req: FundSearchRequest):
+    """搜索基金：通过关键字查找匹配的基金代码/名称。
+
+    Returns:
+        [{fund_code, fund_name, fund_type}, ...]
+    """
+    keyword = req.keyword.strip()
+    if not keyword or len(keyword) < 1:
+        raise HTTPException(status_code=400, detail="关键字不能为空")
+
+    try:
+        # 通过 MCP 工具 tushare_fund_search 搜索基金
+        from src.tools.mcp_client import get_mcp_tools
+        tools = await get_mcp_tools(tool_filter=["tushare_fund_search"])
+        if not tools:
+            raise HTTPException(status_code=503, detail="MCP 基金搜索工具不可用")
+
+        fund_search_tool = tools[0]
+        result = await asyncio.wait_for(
+            fund_search_tool.ainvoke({"keyword": keyword}),
+            timeout=30.0,
+        )
+        result_text = str(result).strip()
+
+        # 尝试解析 JSON 结果
+        results = []
+        try:
+            parsed = json.loads(result_text)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        results.append({
+                            "fund_code": item.get("ts_code", item.get("fund_code", "")),
+                            "fund_name": item.get("name", item.get("fund_name", "")),
+                            "fund_type": item.get("fund_type", item.get("type", "")),
+                        })
+            elif isinstance(parsed, dict):
+                # 可能是包含 items 的包装
+                items = parsed.get("items", parsed.get("data", []))
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, list) and len(item) >= 2:
+                            results.append({
+                                "fund_code": item[0] if len(item) > 0 else "",
+                                "fund_name": item[1] if len(item) > 1 else "",
+                                "fund_type": item[2] if len(item) > 2 else "",
+                            })
+                        elif isinstance(item, dict):
+                            results.append({
+                                "fund_code": item.get("ts_code", item.get("fund_code", "")),
+                                "fund_name": item.get("name", item.get("fund_name", "")),
+                                "fund_type": item.get("fund_type", item.get("type", "")),
+                            })
+        except json.JSONDecodeError:
+            # 如果不是 JSON，尝试从文本中提取基金代码/名称
+            import re as _re
+            # 匹配形如 "510050 华夏上证50ETF" 的行
+            for line in result_text.split("\n"):
+                match = _re.search(r'(\d{5,6})\s+([^\n]+)', line)
+                if match:
+                    results.append({
+                        "fund_code": match.group(1),
+                        "fund_name": match.group(2).strip(),
+                        "fund_type": "",
+                    })
+
+        return {"keyword": keyword, "results": results, "count": len(results)}
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="基金搜索超时（30秒）")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 基金搜索失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"搜索失败: {str(e)}")
+
+
+@app.post("/api/fund/report")
+async def generate_fund_report(req: FundReportRequest):
+    """启动基金分析流水线（异步），返回 task_id 供轮询。
+
+    mode: "report" — 生成完整13模块基金报告
+    mode: "score"  — 仅生成7维度综合评分卡
+    """
+    fund_code = req.fund_code.strip()
+    fund_name = req.fund_name.strip()
+    mode = req.mode.strip()
+
+    if not fund_code:
+        raise HTTPException(status_code=400, detail="基金代码不能为空")
+    if mode not in ("report", "score"):
+        raise HTTPException(status_code=400, detail="mode 必须为 report 或 score")
+
+    # 规范化基金代码（支持 sh.510050 格式）
+    if not fund_code.startswith(("sh.", "sz.", "of.")):
+        fund_code = normalize_code(fund_code)
+
+    if not fund_name:
+        fund_name = fund_code
+
+    task_id = str(uuid.uuid4())[:8]
+    _fund_tasks[task_id] = {
+        "status": "pending",
+        "mode": mode,
+        "fund_code": fund_code,
+        "fund_name": fund_name,
+    }
+
+    # 后台执行基金分析流水线（防刷新）
+    asyncio.create_task(_run_fund_analysis_pipeline(task_id, fund_code, fund_name, mode))
+
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "fund_code": fund_code,
+        "fund_name": fund_name,
+        "mode": mode,
+    }
+
+
+@app.get("/api/fund/report/{task_id}")
+async def get_fund_report(task_id: str):
+    """查询基金分析任务状态和结果（轮询用）。"""
+    if task_id not in _fund_tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    task = _fund_tasks[task_id]
+    return task
+
+
+# ── 基金池 CRUD ──
+
+@app.get("/api/fund/pool/{pool_name}")
+async def list_fund_pool(pool_name: str):
+    """列出指定基金池中的基金。
+
+    pool_name: scored / watchlist
+    """
+    if pool_name not in ("scored", "watchlist"):
+        raise HTTPException(status_code=400, detail="pool_name 必须为 scored 或 watchlist")
+
+    mgr = _get_fund_pool_manager()
+    funds = mgr.list_funds(pool=pool_name)
+    return {"pool": pool_name, "funds": funds, "count": len(funds)}
+
+
+@app.post("/api/fund/pool/{pool_name}")
+async def add_to_fund_pool(pool_name: str, req: FundPoolAddRequest):
+    """向基金池添加基金。"""
+    if pool_name not in ("scored", "watchlist"):
+        raise HTTPException(status_code=400, detail="pool_name 必须为 scored 或 watchlist")
+
+    fund_code = req.fund_code.strip() or req.stock_code.strip()
+    fund_name = req.fund_name.strip() or req.stock_name.strip()
+
+    if not fund_code:
+        raise HTTPException(status_code=400, detail="基金代码不能为空")
+
+    # 规范化基金代码
+    if not fund_code.startswith(("sh.", "sz.", "of.")):
+        fund_code = normalize_code(fund_code)
+
+    if not fund_name:
+        fund_name = fund_code
+
+    mgr = _get_fund_pool_manager()
+    mgr.add_fund(fund_code, fund_name, pool=pool_name)
+    return {"status": "ok", "fund_code": fund_code, "fund_name": fund_name, "pool": pool_name}
+
+
+@app.delete("/api/fund/pool/{pool_name}/{fund_code}")
+async def remove_from_fund_pool(pool_name: str, fund_code: str):
+    """从基金池中删除基金。"""
+    if pool_name not in ("scored", "watchlist"):
+        raise HTTPException(status_code=400, detail="pool_name 必须为 scored 或 watchlist")
+
+    mgr = _get_fund_pool_manager()
+    success = mgr.remove_fund(fund_code, pool=pool_name)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"基金 {fund_code} 不在{pool_name}池中")
+    return {"status": "ok"}
+
+
+# ── 基金快速打分 ──
+
+@app.post("/api/fund/score/{fund_code}")
+async def trigger_fund_score(fund_code: str):
+    """触发基金快速打分（后台异步），返回 task_id 供轮询。
+
+    只做打分，不生成完整报告。结果通过 GET /api/fund/report/{task_id} 轮询。
+    """
+    fund_code = fund_code.strip()
+    if not fund_code:
+        raise HTTPException(status_code=400, detail="基金代码不能为空")
+
+    if not fund_code.startswith(("sh.", "sz.", "of.")):
+        fund_code = normalize_code(fund_code)
+
+    task_id = str(uuid.uuid4())[:8]
+    _fund_tasks[task_id] = {
+        "status": "pending",
+        "mode": "score",
+        "fund_code": fund_code,
+        "fund_name": fund_code,  # 名称由流水线解析获取
+    }
+
+    asyncio.create_task(_run_fund_analysis_pipeline(task_id, fund_code, fund_code, "score"))
+
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "fund_code": fund_code,
+    }
+
+
+# ── 基金缓存状态 ──
+
+@app.get("/api/fund/cache/{fund_code}")
+async def fund_cache_status(fund_code: str):
+    """查看某只基金的中间产物缓存状态。"""
+    if not fund_code.startswith(("sh.", "sz.", "of.")):
+        fund_code = normalize_code(fund_code)
+    return get_fund_cache_status(fund_code)

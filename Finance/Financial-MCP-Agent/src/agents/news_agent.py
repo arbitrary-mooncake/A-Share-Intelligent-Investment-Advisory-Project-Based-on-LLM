@@ -1,12 +1,14 @@
 """
 NewsAnalysis Agent: 新闻分析 Agent — 并行多源采集 + 深度分析
 
-架构（200s预算）：
+架构（≤140s预算）：
   Phase 1 (≤70s): asyncio.gather 并行调用 2 路新闻源
     - crawl_news(clean_stock_code) → 主要数据源（akshare东方财富）
     - crawl_news(company_name)    → 名称备选查询
   Phase 2 (<1s): 数据聚合
-  Phase 3 (≤130s): LLM 深度分析（直接调用 openai，不由 langchain 代理）
+  Phase 3 (≤60s): LLM 深度分析（Qwen3.7-Plus, thinking=enabled, 直接调用 openai）
+
+模型: Qwen3.7-Plus (M3) — 2026-06 从 Kimi K2.6 迁移。开启 thinking 提升情感分析深度，关闭温度降低幻觉。
 """
 import asyncio
 import os
@@ -20,7 +22,7 @@ from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
-from src.utils.model_config import get_model_config_for_agent
+from src.utils.model_config import get_model_config_for_agent, get_thinking_body
 from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 from dotenv import load_dotenv
 
@@ -29,14 +31,14 @@ load_dotenv(override=True)
 logger = setup_logger(__name__)
 
 # 工具超时（秒）—— 并行调用，总工具阶段 ≤ TOOL_TIMEOUT
-TOOL_TIMEOUT = 70
-# LLM 阶段超时预算（httpx read 超时；asyncio.wait_for 在此基础上 +10s）
-LLM_TIMEOUT = 120
+TOOL_TIMEOUT = 30
+# LLM 阶段超时预算（Qwen3.7-Plus + thinking 通常在 30-50s，90s 留足余量）
+LLM_TIMEOUT = 90
 
 
 def _extract_code(stock_code: str) -> str:
     """提取纯数字股票代码，去除交易所前缀"""
-    return stock_code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+    return stock_code.replace("sh.", "").replace("sz.", "").replace("bj.", "").replace(".SH", "").replace(".SZ", "").replace(".BJ", "").strip()
 
 
 def _deduplicate_news(news_items: list) -> list:
@@ -150,7 +152,7 @@ async def news_agent(state: AgentState) -> AgentState:
     phase1_start = time.time()
 
     try:
-        news_tools = await get_mcp_tools(tool_filter=["crawl_news", "get_st_risk_data", "tushare_news", "tushare_st_status"])
+        news_tools = await get_mcp_tools(tool_filter=["crawl_news", "get_st_risk_data", "tushare_st_status"])
     except Exception as e:
         logger.error(f"{ERROR_ICON} NewsAgent: 获取MCP工具失败: {e}")
         news_tools = []
@@ -180,16 +182,18 @@ async def news_agent(state: AgentState) -> AgentState:
             task_labels.append(f"crawl_news(name)")
             news_tool_infos.append((tool, kw2))
 
-        elif tool.name == "tushare_news":
-            if clean_code:
-                kw = {"code": clean_code}
-                tasks.append(_call_tool_with_timeout(tool, kw, TOOL_TIMEOUT, f"tushare_news(code={clean_code})"))
-                task_labels.append(f"tushare_news")
-                news_tool_infos.append((tool, kw))
-
         elif tool.name == "get_st_risk_data":
             if clean_code:
-                sh_code = f"sh.{clean_code}" if clean_code.startswith(("6", "688", "5", "8")) else f"sz.{clean_code}"
+                _is_bse = (clean_code.startswith(("430", "431", "920")) or
+                           (len(clean_code) >= 3 and clean_code[:3] in
+                            ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+                             "870", "871", "872", "873")))
+                if _is_bse:
+                    sh_code = f"bj.{clean_code}"
+                elif clean_code.startswith(("6", "688", "5")):
+                    sh_code = f"sh.{clean_code}"
+                else:
+                    sh_code = f"sz.{clean_code}"
                 kw = {"code": sh_code}
                 tasks.append(_call_tool_with_timeout(tool, kw, 5.0, f"st_risk(code={sh_code})"))
                 task_labels.append(f"st_risk")
@@ -307,11 +311,11 @@ async def news_agent(state: AgentState) -> AgentState:
             _client.chat.completions.create(
                 model=model_name,
                 messages=_messages,
-                temperature=1.0,
-                max_tokens=32000,
-                extra_body={"thinking": {"type": "enabled"}},  # Kimi K2.6 OpenAI 兼容 thinking 格式
+                temperature=0.6,
+                max_tokens=16000,
+                extra_body=get_thinking_body(base_url, True),
             ),
-            timeout=float(LLM_TIMEOUT + 10)  # 130s：略大于HTTP read超时(120s)
+            timeout=float(LLM_TIMEOUT + 10)  # Qwen3.7-Plus thinking 通常在 20-30s，60s 余量充足
         )
         phase2_elapsed = time.time() - phase2_start
         final_output = response.choices[0].message.content if response.choices else "No analysis generated."
@@ -334,9 +338,9 @@ async def news_agent(state: AgentState) -> AgentState:
     # 记录LLM交互
     model_config_log = {
         "model": model_name,
-        "temperature": 1.0,
-        "max_tokens": 32000,
-        "thinking": "enabled (thinking.type=enabled)",
+        "temperature": 0.6,
+        "max_tokens": 16000,
+        "thinking": "enabled",
         "api_base": base_url
     }
     try:

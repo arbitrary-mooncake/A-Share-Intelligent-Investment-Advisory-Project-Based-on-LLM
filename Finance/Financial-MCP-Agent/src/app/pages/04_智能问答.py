@@ -229,12 +229,16 @@ def _process_pending():
                         edata = {}
                     level = edata.get("complexity", "")
                     stock = edata.get("company_name", "")
+                    upgraded = edata.get("upgraded", False)
                     level_label = _complexity_label(level)
                     meta_info = f"{level_label}"
+                    if upgraded:
+                        meta_info += " ⚡"
                     if stock:
                         meta_info += f" · {stock}"
                     # 立刻更新状态行显示复杂度
-                    status_el.caption(f"⏳ {meta_info} · 分析中...")
+                    prefix = "🔄 " if upgraded else "⏳ "
+                    status_el.caption(f"{prefix}{meta_info} · 分析中...")
 
                 elif current_event == "status":
                     prefix = f"{meta_info} · " if meta_info else ""

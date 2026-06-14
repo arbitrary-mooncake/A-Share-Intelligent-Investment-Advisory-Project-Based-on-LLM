@@ -1,5 +1,5 @@
 """
-Streamlit 入口页 — 四大功能导航中心
+Streamlit 入口页 — 五大功能导航中心
 """
 import streamlit as st
 
@@ -14,7 +14,7 @@ st.caption("A股智能分析平台 — AI驱动，数据支撑，仅供参考")
 
 st.markdown("---")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 with col1:
     st.page_link("pages/01_股票查询.py", label="🔍 股票查询", icon="🔍",
@@ -33,6 +33,11 @@ with col2:
     st.page_link("pages/03_批量打分.py", label="📋 批量打分", icon="📋",
                  help="上传Excel批量打分，快速筛选标的池")
     st.caption("Excel批量上传 + 大规模初筛")
+
+with col3:
+    st.page_link("pages/05_基金专区.py", label="🏦 基金专区", icon="🏦",
+                 help="基金/ETF深度分析 + 7维度综合打分 + 持仓池管理")
+    st.caption("公募基金 & ETF多维分析 + 评分 + 报告")
 
 st.markdown("---")
 st.caption("提示：也可以使用左侧边栏 `〉` 直接切换页面")

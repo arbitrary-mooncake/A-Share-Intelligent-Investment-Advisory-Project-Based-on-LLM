@@ -17,10 +17,19 @@ os.makedirs(_CACHE_DIR, exist_ok=True)
 
 # 各 agent 缓存 TTL（天数）
 AGENT_CACHE_TTL = {
+    # Stock agents
     "fundamental_analysis": 15,
     "value_analysis": 7,
     "technical_analysis": 1,
     "news_analysis": 1,
+    # Fund agents
+    "fund_product_doc": 30,      # Fund basic info rarely changes
+    "fund_perf_risk": 3,         # NAV updates daily, analysis is heavy
+    "fund_holdings": 30,         # Portfolio disclosed quarterly
+    "fund_manager": 15,          # Manager changes infrequent
+    "fund_benchmark": 7,         # Benchmark consistency medium-term
+    "fund_fee": 15,              # Fee structure changes rarely
+    "fund_event": 1,             # Events/news need daily freshness
 }
 
 

@@ -38,21 +38,12 @@ from src.utils.industry_knowledge import (
     identify_industry,
     generate_industry_context_prompt,
 )
-from src.utils.model_config import get_model_config_for_agent
+from src.utils.model_config import get_model_config_for_agent, get_thinking_body
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
-
-
-def _build_extra_body(base_url: str, thinking_enabled: bool) -> dict:
-    """根据 API 提供商返回正确的 thinking 参数格式"""
-    if not thinking_enabled:
-        return {}
-    if "dashscope" in base_url:
-        return {"enable_thinking": True}
-    return {"thinking": {"type": "enabled"}}
 
 
 async def long_term_scorer(
@@ -116,10 +107,10 @@ async def long_term_scorer(
             model=resolved_model,
             api_key=api_key,
             base_url=base_url,
-            temperature=1.0,
+            temperature=0.6,
             request_timeout=360,
             max_tokens=16000,
-            extra_body=_build_extra_body(base_url, thinking_enabled)
+            extra_body=get_thinking_body(base_url, thinking_enabled)
         )
 
         # 生成行业上下文指引
@@ -347,7 +338,7 @@ async def long_term_scorer(
             interaction_type="long_term_scoring",
             input_messages=messages,
             output_content=json_mod.dumps(score_data, ensure_ascii=False),
-            model_config={"model": resolved_model, "temperature": 1.0, "max_tokens": 16000, "thinking": "enabled" if thinking_enabled else "disabled"},
+            model_config={"model": resolved_model, "temperature": 0.6, "max_tokens": 16000, "thinking": "enabled" if thinking_enabled else "disabled"},
             execution_time=llm_time
         )
 

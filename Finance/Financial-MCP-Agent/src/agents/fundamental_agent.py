@@ -18,7 +18,7 @@ from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
-from src.utils.model_config import get_model_config_for_agent
+from src.utils.model_config import get_model_config_for_agent, get_thinking_body
 from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 
 load_dotenv(override=True)
@@ -30,22 +30,27 @@ TOOL_TIMEOUT = 30
 # LLM 整体超时（秒）
 LLM_TIMEOUT = 300
 
-# 基本面分析白名单（与旧 ReAct 白名单完全一致，18 个工具）
+# 基本面分析白名单（2026-05 重构：全部切换为 Tushare 工具，移除 Baostock 依赖）
 FUNDAMENTAL_TOOL_NAMES = [
-    "get_stock_basic_info", "get_stock_industry",
-    "get_profit_data", "get_balance_data", "get_cash_flow_data",
-    "get_growth_data", "get_operation_data", "get_dupont_data",
-    "get_dividend_data", "get_adjust_factor_data",
-    "tushare_stock_info", "tushare_fina_indicator",
-    "tushare_dividend", "tushare_ev_ebitda", "tushare_daily_basic",
-    "tushare_top10_holders",
-    "tushare_st_status", "get_st_risk_data",
+    # 基本信息与行业
+    "tushare_stock_info", "get_stock_industry",
+    # 财务报表（Tushare 三大报表 + 财务指标）
+    "tushare_income", "tushare_balancesheet", "tushare_cashflow",
+    "tushare_fina_indicator",
+    # 估值与分红
+    "tushare_daily_basic", "tushare_dividend",
+    "tushare_ev_ebitda", "tushare_adj_factor",
+    # 股东与ST
+    "tushare_top10_holders", "tushare_st_status",
+    # 保留的 AkShare 工具（无 Tushare 平替）
+    "get_dupont_data", "get_operation_data", "get_growth_data",
+    "get_st_risk_data",
 ]
 
 
 def _extract_code(stock_code: str) -> str:
     """提取纯数字股票代码"""
-    return stock_code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+    return stock_code.replace("sh.", "").replace("sz.", "").replace("bj.", "").replace(".SH", "").replace(".SZ", "").replace(".BJ", "").strip()
 
 
 def _get_recent_quarters(date_str: str, count: int = 2) -> List[Dict[str, Any]]:
@@ -209,67 +214,77 @@ async def fundamental_agent(state: AgentState) -> AgentState:
         def _placeholder(label, msg):
             labels.append(label); tasks.append(_noop_result(msg)); tool_infos.append(None)
 
-        # --- 纯代码类工具 ---
-        if "get_stock_basic_info" in tool_map:
-            _add(_call_tool_safe(tool_map["get_stock_basic_info"], {"code": clean_code}, "基本信息"), "基本信息",
-                 (tool_map["get_stock_basic_info"], {"code": clean_code}))
-        else: _placeholder("基本信息", "[get_stock_basic_info] 工具不可用")
+        # --- 基本信息与行业 ---
+        if "tushare_stock_info" in tool_map:
+            _add(_call_tool_safe(tool_map["tushare_stock_info"], {"code": clean_code}, "Tushare基本信息"), "Tushare基本信息",
+                 (tool_map["tushare_stock_info"], {"code": clean_code}))
+        else: _placeholder("Tushare基本信息", "[tushare_stock_info] 工具不可用")
 
         if "get_stock_industry" in tool_map:
             _add(_call_tool_safe(tool_map["get_stock_industry"], {"code": clean_code, "date": current_date}, "行业分类"), "行业分类",
                  (tool_map["get_stock_industry"], {"code": clean_code, "date": current_date}))
         else: _placeholder("行业分类", "[get_stock_industry] 工具不可用")
 
-        if "tushare_stock_info" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_stock_info"], {"code": clean_code}, "Tushare基本信息"), "Tushare基本信息",
-                 (tool_map["tushare_stock_info"], {"code": clean_code}))
-        else: _placeholder("Tushare基本信息", "[tushare_stock_info] 工具不可用")
+        # --- 三大报表（Tushare，无需 quarter 参数） ---
+        for tname, label in [("tushare_income", "利润表"), ("tushare_balancesheet", "资产负债表"), ("tushare_cashflow", "现金流量表")]:
+            if tname in tool_map:
+                _add(_call_tool_safe(tool_map[tname], {"code": clean_code}, f"Tushare{label}"), f"Tushare{label}",
+                     (tool_map[tname], {"code": clean_code}))
+            else: _placeholder(f"Tushare{label}", f"[{tname}] 工具不可用")
 
+        # --- 财务指标 ---
         if "tushare_fina_indicator" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_fina_indicator"], {"code": clean_code}, "Tushare财务指标"), "Tushare财务指标",
-                 (tool_map["tushare_fina_indicator"], {"code": clean_code}))
+            _add(_call_tool_safe(tool_map["tushare_fina_indicator"], {"code": clean_code, "years": 4}, "Tushare财务指标"), "Tushare财务指标",
+                 (tool_map["tushare_fina_indicator"], {"code": clean_code, "years": 4}))
         else: _placeholder("Tushare财务指标", "[tushare_fina_indicator] 工具不可用")
 
+        # --- 估值数据 ---
         if "tushare_daily_basic" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_daily_basic"], {"code": clean_code}, "Tushare日线基础"), "Tushare日线基础",
-                 (tool_map["tushare_daily_basic"], {"code": clean_code}))
+            _add(_call_tool_safe(tool_map["tushare_daily_basic"], {"code": clean_code, "days": 250}, "Tushare日线基础"), "Tushare日线基础",
+                 (tool_map["tushare_daily_basic"], {"code": clean_code, "days": 250}))
         else: _placeholder("Tushare日线基础", "[tushare_daily_basic] 工具不可用")
-
-        if "tushare_top10_holders" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_top10_holders"], {"code": clean_code}, "Tushare十大股东"), "Tushare十大股东",
-                 (tool_map["tushare_top10_holders"], {"code": clean_code}))
-        else: _placeholder("Tushare十大股东", "[tushare_top10_holders] 工具不可用")
 
         if "tushare_ev_ebitda" in tool_map:
             _add(_call_tool_safe(tool_map["tushare_ev_ebitda"], {"code": clean_code}, "Tushare EV/EBITDA"), "Tushare EV/EBITDA",
                  (tool_map["tushare_ev_ebitda"], {"code": clean_code}))
         else: _placeholder("Tushare EV/EBITDA", "[tushare_ev_ebitda] 工具不可用")
 
-        if "tushare_st_status" in tool_map:
-            _add(_call_tool_safe(tool_map["tushare_st_status"], {"code": clean_code}, "Tushare ST状态"), "Tushare ST状态",
-                 (tool_map["tushare_st_status"], {"code": clean_code}))
-        else: _placeholder("Tushare ST状态", "[tushare_st_status] 工具不可用")
-
+        # --- 分红 ---
         if "tushare_dividend" in tool_map:
             _add(_call_tool_safe(tool_map["tushare_dividend"], {"code": clean_code}, "Tushare分红"), "Tushare分红",
                  (tool_map["tushare_dividend"], {"code": clean_code}))
         else: _placeholder("Tushare分红", "[tushare_dividend] 工具不可用")
+
+        # --- 复权因子 ---
+        if "tushare_adj_factor" in tool_map:
+            kw_adj = {"code": clean_code, "days": 500}
+            _add(_call_tool_safe(tool_map["tushare_adj_factor"], kw_adj, "Tushare复权因子"),
+                 "Tushare复权因子", (tool_map["tushare_adj_factor"], kw_adj))
+        else: _placeholder("Tushare复权因子", "[tushare_adj_factor] 工具不可用")
+
+        # --- 股东与ST ---
+        if "tushare_top10_holders" in tool_map:
+            _add(_call_tool_safe(tool_map["tushare_top10_holders"], {"code": clean_code}, "Tushare十大股东"), "Tushare十大股东",
+                 (tool_map["tushare_top10_holders"], {"code": clean_code}))
+        else: _placeholder("Tushare十大股东", "[tushare_top10_holders] 工具不可用")
+
+        if "tushare_st_status" in tool_map:
+            _add(_call_tool_safe(tool_map["tushare_st_status"], {"code": clean_code}, "Tushare ST状态"), "Tushare ST状态",
+                 (tool_map["tushare_st_status"], {"code": clean_code}))
+        else: _placeholder("Tushare ST状态", "[tushare_st_status] 工具不可用")
 
         if "get_st_risk_data" in tool_map:
             _add(_call_tool_safe(tool_map["get_st_risk_data"], {"code": stock_code}, "ST风险数据"), "ST风险数据",
                  (tool_map["get_st_risk_data"], {"code": stock_code}))
         else: _placeholder("ST风险数据", "[get_st_risk_data] 工具不可用")
 
-        # --- 财务报表类工具（需要 year + quarter） ---
-        fin_tools_params = [
-            ("get_profit_data", "利润表"),
-            ("get_balance_data", "资产负债表"),
-            ("get_cash_flow_data", "现金流量表"),
-            ("get_growth_data", "成长数据"),
-            ("get_operation_data", "运营数据"),
+        # --- 保留的 AkShare 工具（无 Tushare 平替：杜邦/运营/成长） ---
+        legacy_fin_tools = [
             ("get_dupont_data", "杜邦分析"),
+            ("get_operation_data", "运营数据"),
+            ("get_growth_data", "成长数据"),
         ]
-        for tool_name, label_base in fin_tools_params:
+        for tool_name, label_base in legacy_fin_tools:
             if tool_name in tool_map:
                 t = tool_map[tool_name]
                 kw_latest = {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]}
@@ -281,22 +296,6 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             else:
                 _placeholder(f"{label_base}(最新)", f"[{tool_name}] 工具不可用")
                 _placeholder(f"{label_base}(上期)", f"[{tool_name}] 工具不可用")
-
-        # --- 分红数据（需要 year + year_type） ---
-        if "get_dividend_data" in tool_map:
-            kw_div = {"code": clean_code, "year": q_latest["year"], "year_type": "report"}
-            _add(_call_tool_safe(tool_map["get_dividend_data"], kw_div, f"分红数据({q_latest['year']})"),
-                 "分红数据", (tool_map["get_dividend_data"], kw_div))
-        else:
-            _placeholder("分红数据", "[get_dividend_data] 工具不可用")
-
-        # --- 复权因子（需要 start_date, end_date） ---
-        if "get_adjust_factor_data" in tool_map:
-            kw_adj = {"code": clean_code, "start_date": "2023-01-01", "end_date": current_date}
-            _add(_call_tool_safe(tool_map["get_adjust_factor_data"], kw_adj, "复权因子"),
-                 "复权因子", (tool_map["get_adjust_factor_data"], kw_adj))
-        else:
-            _placeholder("复权因子", "[get_adjust_factor_data] 工具不可用")
 
         # 并行执行所有任务（第一轮）
         try:
@@ -338,10 +337,10 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            temperature=0.6,
+            temperature=1.0,
             request_timeout=LLM_TIMEOUT,
-            max_tokens=8000,
-            extra_body={"thinking": {"type": "enabled"}},
+            max_tokens=16000,
+            extra_body=get_thinking_body(base_url, True),
         )
 
         analysis_prompt = f"""请以券商分析师的标准，对{company_name}（股票代码：{stock_code}）进行基本面分析。
@@ -447,8 +446,8 @@ async def fundamental_agent(state: AgentState) -> AgentState:
         # 记录 LLM 交互
         model_config_log = {
             "model": model_name,
-            "temperature": 0.6,
-            "max_tokens": 8000,
+            "temperature": 1.0,
+            "max_tokens": 16000,
             "thinking": "enabled",
             "api_base": base_url,
             "architecture": "two-phase",

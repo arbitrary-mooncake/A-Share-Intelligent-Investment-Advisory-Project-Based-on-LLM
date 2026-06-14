@@ -11,7 +11,7 @@ import re
 from src.utils.state_definition import AgentState
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
-from src.utils.model_config import get_model_config_for_agent
+from src.utils.model_config import get_model_config_for_agent, get_thinking_body
 from src.utils.pdf_generator import markdown_to_pdf
 from dotenv import load_dotenv
 
@@ -359,7 +359,7 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         # 记录模型配置信息
         model_config = {
             "model": model_name,
-            "temperature": 1.0,
+            "temperature": 0.6,
             "max_tokens": 32000,
             "thinking": "enabled",
             "api_base": base_url
@@ -377,10 +377,10 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            temperature=1.0,
+            temperature=0.6,
             request_timeout=720,
             max_tokens=32000,
-            extra_body={"thinking": {"type": "enabled"}}  # 大上下文+深度思考，需要充足时间
+            extra_body=get_thinking_body(base_url, True)
         )
 
         # 记录LLM交互开始时间

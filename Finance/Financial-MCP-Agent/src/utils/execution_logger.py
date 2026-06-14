@@ -136,8 +136,9 @@ class ExecutionLogger:
         self._save_json(interaction_log, interaction_file)
 
         # 同时保存输入输出的纯文本版本，方便查看
+        safe_messages = self._safe_serialize(input_messages)
         self._save_text(
-            f"=== INPUT MESSAGES ===\n{json.dumps(input_messages, ensure_ascii=False, indent=2)}\n\n"
+            f"=== INPUT MESSAGES ===\n{json.dumps(safe_messages, ensure_ascii=False, indent=2)}\n\n"
             f"=== OUTPUT CONTENT ===\n{output_content}",
             f"llm_interactions/{agent_name}_{interaction_type}_{interaction_id}.txt"
         )
@@ -297,13 +298,27 @@ class ExecutionLogger:
 
         self._save_text(summary_text, "EXECUTION_SUMMARY.md")
 
+    def _safe_serialize(self, obj):
+        """将不可序列化的对象转换为可序列化形式"""
+        try:
+            json.dumps(obj, ensure_ascii=False)
+            return obj
+        except (TypeError, ValueError):
+            if isinstance(obj, dict):
+                return {k: self._safe_serialize(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [self._safe_serialize(v) for v in obj]
+            else:
+                return repr(obj)
+
     def _save_json(self, data: Dict[str, Any], filename: str):
         """保存JSON数据"""
         file_path = self.execution_dir / filename
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
+        safe_data = self._safe_serialize(data)
         with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(safe_data, f, ensure_ascii=False, indent=2)
 
     def _load_json(self, filename: str) -> Optional[Dict[str, Any]]:
         """加载JSON数据"""
@@ -322,8 +337,9 @@ class ExecutionLogger:
         file_path = self.execution_dir / filename
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
+        safe_data = self._safe_serialize(data)
         with open(file_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(data, ensure_ascii=False) + '\n')
+            f.write(json.dumps(safe_data, ensure_ascii=False) + '\n')
 
     def _save_text(self, content: str, filename: str):
         """保存文本内容"""

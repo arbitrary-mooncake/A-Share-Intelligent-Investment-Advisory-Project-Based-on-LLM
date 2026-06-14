@@ -242,37 +242,34 @@ DATA_DOMAINS = {
     "行情": {
         "keywords": ["价格", "涨", "跌", "走势", "行情", "趋势", "K线", "均线",
                      "今天", "最近", "最高", "最低", "收盘", "开盘", "振幅", "换手"],
-        "tools": ["get_historical_k_data", "tushare_kline", "tushare_daily_basic",
-                  "get_stock_basic_info", "get_latest_trading_date"],
+        "tools": ["tushare_kline", "tushare_daily_basic", "tushare_stock_info",
+                  "tushare_adj_factor", "tushare_latest_trading_date"],
         "description": "价格、涨跌幅、K线、换手率等行情数据",
     },
     "估值": {
         "keywords": ["PE", "PB", "PS", "市盈", "市净", "市销", "估值", "贵", "便宜",
                      "分位", "EV/EBITDA", "股息", "分红"],
         "tools": ["tushare_daily_basic", "tushare_pe_percentile", "tushare_ev_ebitda",
-                  "tushare_dividend", "get_dividend_data", "get_stock_basic_info"],
+                  "tushare_dividend", "tushare_stock_info"],
         "description": "市盈率、市净率、估值分位、股息率等估值数据",
     },
     "财务": {
         "keywords": ["ROE", "ROA", "利润", "收入", "毛利", "净利", "现金", "负债",
                      "资产", "财报", "业绩", "盈利", "成长", "增速", "杜邦"],
-        "tools": ["get_profit_data", "get_balance_data", "get_cash_flow_data",
-                  "get_growth_data", "get_dupont_data", "get_operation_data",
-                  "tushare_fina_indicator", "tushare_stock_info"],
-        "description": "利润表、资产负债表、现金流量表、杜邦分析等财务数据",
+        "tools": ["tushare_fina_indicator", "tushare_income", "tushare_balancesheet",
+                  "tushare_cashflow", "tushare_stock_info"],
+        "description": "利润表、资产负债表、现金流量表、杜邦分析等财务数据（Tushare）",
     },
     "资金": {
         "keywords": ["资金", "主力", "北向", "融资", "融券", "流入", "流出",
                      "成交", "量比", "换手", "净买"],
-        "tools": ["tushare_moneyflow", "tushare_hsgt_flow",
-                  "get_market_analysis_timeframe", "tushare_daily_basic"],
+        "tools": ["tushare_moneyflow", "tushare_hsgt_flow", "tushare_daily_basic"],
         "description": "主力资金流、北向资金、融资融券等资金面数据",
     },
     "行业": {
         "keywords": ["行业", "板块", "赛道", "同行", "竞品", "龙头", "排名",
                      "行业地位", "市场份额", "行业对比"],
-        "tools": ["get_stock_industry", "get_stock_basic_info",
-                  "tushare_stock_info", "get_market_analysis_timeframe"],
+        "tools": ["tushare_stock_info"],
         "description": "行业分类、行业对比、板块强弱等行业数据",
     },
     "板块": {
@@ -284,8 +281,8 @@ DATA_DOMAINS = {
     "新闻": {
         "keywords": ["新闻", "公告", "消息", "事件", "发布", "披露", "分红方案",
                      "回购", "减持", "增持", "业绩预告", "ST", "风险警示"],
-        "tools": ["crawl_news", "tushare_news", "get_st_risk_data", "tushare_st_status"],
-        "description": "新闻公告、ST风险、重大事件等舆情数据（多源）",
+        "tools": ["tushare_news", "tushare_st_status"],
+        "description": "新闻公告、ST风险、重大事件等舆情数据（Tushare+东方财富）",
     },
     "宏观": {
         "keywords": ["利率", "汇率", "CPI", "PPI", "GDP", "PMI", "通胀", "货币",
@@ -295,7 +292,7 @@ DATA_DOMAINS = {
                      "价格指数", "采购经理", "M0", "M1", "M2", "SHIBOR"],
         "tools": ["tushare_cn_cpi", "tushare_cn_gdp", "tushare_cn_pmi",
                   "tushare_cn_ppi", "tushare_cn_m", "tushare_shibor",
-                  "tushare_fx_daily", "tushare_eco_cal"],
+                  "tushare_fx_daily", "tushare_eco_cal", "tushare_stock_info"],
         "description": "CPI、GDP、PMI、PPI、M2、SHIBOR、汇率等宏观经济指标（Tushare）",
     },
 }
@@ -440,23 +437,35 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
         name = session_company_name
 
     # 纯公司名称提取（无代码时的兜底）：问题开头/整体为中文名称
-    # 排除以通用疑问词/时间词开头的搜索性问题
-    _GENERIC_STARTS = r'^(?:现在|哪些|什么|怎么|如何|为什么|最近|当前|目前|哪只|哪个|哪家|哪类|怎样|何时|多少|有没有|是否)'
+    # 排除以通用疑问词/时间词/礼貌用语开头的搜索性问题
+    _GENERIC_STARTS = r'^(?:现在|哪些|什么|怎么|如何|为什么|最近|当前|目前|哪只|哪个|哪家|哪类|怎样|何时|多少|有没有|是否|请|帮|麻烦|能否|可否|能否)'
     if not code and not name and not re.match(_GENERIC_STARTS, question):
         # ② 先尝试前缀匹配："中际旭创最近..." → 提取开头的公司名（{2,8}?非贪婪）
         name_match = re.match(
             r'^([一-鿿·]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|能|该|值得|可以|是不是|表现|业绩|价格|涨|跌)',
             question)
+        # 过滤：提取结果不能是动词/副词组合（如"请深入"、"帮我看"等误匹配）
+        _FALSE_NAME_PATTERN = re.compile(r'^[请帮麻烦能否可否深入详细全面简单大概大致快速仔细认真简单具体综合系统全面]')
         if name_match:
-            name = name_match.group(1)
+            candidate = name_match.group(1)
+            if _FALSE_NAME_PATTERN.match(candidate):
+                name = None  # 误匹配：如"请深入"→跳过，交给主题匹配
+            else:
+                name = candidate
         # ① 兜底：整个输入就是2-4个纯中文字符 → 公司名
         elif re.match(r'^[一-鿿·]{2,4}$', question):
             name = question
 
-    # 标准化代码格式（仅限合法A股前缀: 6=沪市, 0/3=深市, 688=科创板, 8=北交所）
+    # 标准化代码格式（仅限合法A股前缀: 6=沪市, 0/3=深市, 688=科创板, BSE=北交所）
     if code:
-        if not code.startswith(("sh.", "sz.")):
-            if code.startswith(("6", "688", "5", "8")):
+        if not code.startswith(("sh.", "sz.", "bj.")):
+            _is_bse = (code.startswith(("430", "431", "920")) or
+                       (len(code) >= 3 and code[:3] in
+                        ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+                         "870", "871", "872", "873")))
+            if _is_bse:
+                code = f"bj.{code}"
+            elif code.startswith(("6", "688", "5")):
                 code = f"sh.{code}"
             elif code.startswith(("0", "3", "1", "4")):
                 code = f"sz.{code}"

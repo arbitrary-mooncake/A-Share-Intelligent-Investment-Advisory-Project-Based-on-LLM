@@ -3,12 +3,18 @@ from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAI
 from src.tools.mcp_config import SERVER_CONFIGS
 import asyncio
 import json
+import time
 from typing import List, Optional
 
 logger = setup_logger(__name__)
 
 _mcp_client_instance = None
 _mcp_tools = None
+_mcp_connection_failures = 0
+_mcp_last_failure_time = 0.0
+# Circuit breaker: 连续3次失败后进入冷却期30秒
+_MCP_CIRCUIT_THRESHOLD = 3
+_MCP_COOLDOWN_SECONDS = 30
 
 
 def print_tool_details(tools):
@@ -37,6 +43,7 @@ async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
 
     全量工具列表只加载一次并全局缓存。不同 Agent 通过 tool_filter
     从缓存中过滤所需工具，不会重复创建 MCP 客户端或子进程。
+    集成熔断器：连续3次连接失败后进入30s冷却期。
 
     Args:
         tool_filter: 可选工具名白名单，只返回列表中指定的工具
@@ -46,29 +53,38 @@ async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
     """
     global _mcp_client_instance, _mcp_tools
 
+    # 熔断器检查
+    if _mcp_tools is not None and not _check_circuit_breaker():
+        # 已缓存工具且熔断器开启：返回缓存工具（仍可尝试调用）
+        pass
+    elif _mcp_tools is None and not _check_circuit_breaker():
+        logger.error(f"{ERROR_ICON} MCP 熔断器开启，拒绝连接请求")
+        return []
+
     # 首次加载：创建 MCP 客户端，加载全量工具，全局缓存
     if _mcp_tools is None:
-        logger.info(
-            f"{WAIT_ICON} Initializing MultiServerMCPClient with config: {SERVER_CONFIGS}")
-        try:
-            _mcp_client_instance = MultiServerMCPClient(SERVER_CONFIGS)
-
+        for attempt in range(3):
             logger.info(
-                f"{WAIT_ICON} Fetching tools from MCP server 'a_share_mcp_v2'...")
-            loaded_tools = await _mcp_client_instance.get_tools()
-
-            if not loaded_tools:
+                f"{WAIT_ICON} Initializing MultiServerMCPClient (attempt {attempt+1}/3)")
+            try:
+                _mcp_client_instance = MultiServerMCPClient(SERVER_CONFIGS)
+                loaded_tools = await _mcp_client_instance.get_tools()
+                if loaded_tools:
+                    _mcp_tools = loaded_tools
+                    _record_mcp_success()
+                    logger.info(
+                        f"{SUCCESS_ICON} Successfully loaded {len(_mcp_tools)} tools (cached).")
+                    break
                 logger.warning(
-                    f"{ERROR_ICON} No tools loaded from MCP server.")
-                _mcp_tools = []
-                return []
+                    f"{ERROR_ICON} MCP 返回空工具列表 (attempt {attempt+1}/3)")
+            except Exception as e:
+                logger.error(
+                    f"{ERROR_ICON} MCP 初始化失败 (attempt {attempt+1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(2 * (attempt + 1))
 
-            _mcp_tools = loaded_tools
-            logger.info(
-                f"{SUCCESS_ICON} Successfully loaded {len(_mcp_tools)} tools (cached).")
-        except Exception as e:
-            logger.error(
-                f"{ERROR_ICON} Failed to initialize MCP client: {e}", exc_info=True)
+        if _mcp_tools is None:
+            _record_mcp_failure()
             _mcp_tools = []
             return []
 
@@ -81,6 +97,53 @@ async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
 
     logger.info(f"{SUCCESS_ICON} Returning all {len(_mcp_tools)} cached MCP tools.")
     return _mcp_tools
+
+
+async def reconnect_mcp() -> bool:
+    """重置并重新建立 MCP 连接。返回是否成功。"""
+    global _mcp_client_instance, _mcp_tools, _mcp_connection_failures, _mcp_last_failure_time
+    logger.info(f"{WAIT_ICON} 正在重置 MCP 连接...")
+    # 关闭旧连接
+    if _mcp_client_instance:
+        try:
+            await _mcp_client_instance.__aexit__(None, None, None)
+        except Exception:
+            pass
+    _mcp_client_instance = None
+    _mcp_tools = None
+    _mcp_connection_failures = 0
+    _mcp_last_failure_time = 0.0
+    # 重新加载
+    tools = await get_mcp_tools()
+    return len(tools) > 0 if tools else False
+
+
+def _check_circuit_breaker() -> bool:
+    """检查熔断器状态。返回 True 表示电路关闭（可正常请求）。"""
+    global _mcp_connection_failures, _mcp_last_failure_time
+    if _mcp_connection_failures < _MCP_CIRCUIT_THRESHOLD:
+        return True
+    since_last = time.time() - _mcp_last_failure_time
+    if since_last > _MCP_COOLDOWN_SECONDS:
+        # 冷却期结束，半开状态：允许一次尝试
+        logger.info(f"{WAIT_ICON} MCP 熔断器冷却期结束 ({since_last:.0f}s)，进入半开状态")
+        _mcp_connection_failures = 0
+        return True
+    logger.warning(f"⚠ MCP 熔断器开启（{_mcp_connection_failures}次连续失败，{_MCP_COOLDOWN_SECONDS - since_last:.0f}s后重试）")
+    return False
+
+
+def _record_mcp_failure():
+    """记录一次 MCP 连接失败。"""
+    global _mcp_connection_failures, _mcp_last_failure_time
+    _mcp_connection_failures += 1
+    _mcp_last_failure_time = time.time()
+
+
+def _record_mcp_success():
+    """重置 MCP 失败计数器。"""
+    global _mcp_connection_failures
+    _mcp_connection_failures = 0
 
 
 async def close_mcp_client_sessions():

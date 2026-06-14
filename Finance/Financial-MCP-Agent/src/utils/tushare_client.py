@@ -3,6 +3,7 @@ Tushare HTTP API 客户端 — 轻量封装，支持 200次/分钟 调用频率
 提供: 历史PE/PB分位、PS/PCF、财务指标、行业分类、资金流向、分红历史
 """
 import time
+import threading
 import requests
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
@@ -13,14 +14,16 @@ TUSHARE_URL = "https://api.tushare.pro"
 # 速率控制: 200次/分钟 → 最小间隔 0.3s
 _last_call_time = 0.0
 _MIN_INTERVAL = 0.35
+_rate_lock = threading.Lock()
 
 
 def _rate_limit():
     global _last_call_time
-    elapsed = time.time() - _last_call_time
-    if elapsed < _MIN_INTERVAL:
-        time.sleep(_MIN_INTERVAL - elapsed)
-    _last_call_time = time.time()
+    with _rate_lock:
+        elapsed = time.time() - _last_call_time
+        if elapsed < _MIN_INTERVAL:
+            time.sleep(_MIN_INTERVAL - elapsed)
+        _last_call_time = time.time()
 
 
 def _call(api_name: str, params: dict = None, fields: str = "",
@@ -241,7 +244,7 @@ def compute_pe_percentile(ts_code: str, current_pe: float, years: int = 5) -> Op
     if not pe_list:
         return None
     pe_list_sorted = sorted(pe_list)
-    rank = sum(1 for p in pe_list_sorted if p < current_pe)
+    rank = sum(1 for p in pe_list_sorted if p <= current_pe)
     percentile = rank / len(pe_list_sorted) * 100 if pe_list_sorted else 0
     return {
         "current_pe": current_pe,
@@ -373,14 +376,14 @@ def get_fund_holders(ts_code: str, period: str = None) -> List[Dict]:
         return []
     items = _items_to_dicts(r)
     # Filter: symbol is the stock held by the fund
-    pure = ts_code.replace(".SH", "").replace(".SZ", "")
+    pure = ts_code.replace(".SH", "").replace(".SZ", "").replace(".BJ", "")
     return [{
         "fund_code": d["ts_code"],
-        "fund_name": "",  # would need fund_basic lookup
+        "fund_name": "",
         "ann_date": d.get("ann_date", ""),
         "shares": d.get("amount", ""),
         "market_val": d.get("market_val", ""),
-    } for d in items if d.get("symbol") == f"{pure}.SH" or d.get("symbol") == f"{pure}.SZ" or d.get("symbol") == pure]
+    } for d in items if d.get("symbol") == f"{pure}.SH" or d.get("symbol") == f"{pure}.SZ" or d.get("symbol") == f"{pure}.BJ" or d.get("symbol") == pure]
 
 
 def get_stk_holdertrade(ts_code: str, years: int = 3) -> List[Dict]:
@@ -390,6 +393,40 @@ def get_stk_holdertrade(ts_code: str, years: int = 3) -> List[Dict]:
     r = _call("stk_holdertrade", {"ts_code": ts_code, "start_date": start, "end_date": end},
               "ts_code,ann_date,holder_name,holder_type,in_de,change_vol,"
               "change_ratio,after_share,after_ratio,avg_price,total_share")
+    return _items_to_dicts(r)
+
+
+def get_fund_basic(ts_code: str) -> Optional[Dict]:
+    """基金/ETF基本信息: 名称、管理公司、类型、成立日期、跟踪指数"""
+    r = _call("fund_basic", {"ts_code": ts_code},
+              "ts_code,name,management,fund_type,setup_date,found_date,list_date,"
+              "m_fee,c_fee,index_code,index_name")
+    items = _items_to_dicts(r)
+    info = items[0] if items else None
+    if info:
+        # Tushare 返回 found_date 而非 setup_date，统一映射
+        if not info.get("setup_date") and info.get("found_date"):
+            info["setup_date"] = info["found_date"]
+    return info
+
+
+def get_fund_daily(ts_code: str, days: int = 500) -> List[Dict]:
+    """基金/ETF日K线: 开高低收、成交量、成交额、涨跌幅"""
+    start_date = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
+    end_date = datetime.now().strftime("%Y%m%d")
+    r = _call("fund_daily", {
+        "ts_code": ts_code, "start_date": start_date, "end_date": end_date
+    }, "trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount")
+    return _items_to_dicts(r)
+
+
+def get_fund_adj(ts_code: str, days: int = 500) -> List[Dict]:
+    """基金/ETF复权因子"""
+    start_date = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
+    end_date = datetime.now().strftime("%Y%m%d")
+    r = _call("fund_adj", {
+        "ts_code": ts_code, "start_date": start_date, "end_date": end_date
+    }, "trade_date,adj_factor")
     return _items_to_dicts(r)
 
 

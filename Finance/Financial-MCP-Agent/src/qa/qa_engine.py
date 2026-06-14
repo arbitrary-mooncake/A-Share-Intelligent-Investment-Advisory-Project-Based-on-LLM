@@ -74,10 +74,13 @@ async def process_question(
     )
 
     # 无股票代码时尝试主题匹配
+    # 当 company_name 实际上是主题关键词（如"半导体板块"→提取出"半导体"）时，
+    # 优先走主题匹配路径，因为主题匹配能提供ETF+代表股，比纯公司名搜索更有效
     topic_context = ""
     matched_topic_name = ""
     topic_rep_stocks: list = []  # [(code, name), ...] 代表性个股供并行拉取数据
-    if not stock_code and not company_name:
+    _should_try_topic = not stock_code and (not company_name or _is_topic_keyword(company_name))
+    if _should_try_topic:
         topic_info = match_topic(question)
         if topic_info:
             matched_topic_name, topic_data = topic_info
@@ -94,6 +97,10 @@ async def process_question(
                 f"请优先使用已获取的ETF行情数据和板块成分股数据进行客观分析，"
                 f"辅以行业常识，避免仅凭旧知识即兴发挥。"
                 f"如板块成分股数据已获取，请从中选取龙头标的重点分析。"
+                f"\n⚠️ ETF特殊说明：{stock_code}是ETF/指数基金，不是个股。"
+                f"ETF没有ROE、毛利率、净利率、营收增速、负债率、分红、EV/EBITDA等个股财务指标。"
+                f"这些字段缺失是正常现象，不代表'数据获取不足'。"
+                f"请基于ETF的行情走势、成交量、资金流向、板块景气度进行分析。"
             )
             logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")
 
@@ -179,6 +186,14 @@ async def process_question(
             f"{'深度推理' if complexity.recommended_thinking else '标准'}模式）"
         )
         yield _sse_event("status", {"message": upgrade_msg})
+        # 更新前端显示的复杂度等级
+        yield _sse_event("meta", {
+            "session_id": actual_session_id,
+            "complexity": complexity.level,
+            "stock_code": stock_code,
+            "company_name": company_name,
+            "upgraded": True,
+        })
 
     # ── 降级：数据完全缺失 ──
     if not evidence.raw_text or evidence.raw_text == "(无数据)":
@@ -268,6 +283,22 @@ async def process_question(
 
 
 # ── 辅助函数 ──────────────────────────────────────
+
+def _is_topic_keyword(name: str) -> bool:
+    """检查提取的公司名是否实际是已知的投资主题关键词或其扩展（如'半导体板块'以'半导体'开头）。
+    仅当前缀匹配时才认为是主题扩展（避免'贵州茅台'被'茅台'误匹配为白酒主题）。"""
+    from src.qa.task_planner import TOPIC_STOCK_MAP
+    name_lower = name.lower()
+    for topic, info in TOPIC_STOCK_MAP.items():
+        for kw in info["keywords"]:
+            kw_lower = kw.lower()
+            # 精确匹配
+            if kw_lower == name_lower:
+                return True
+            # 前缀匹配：提取名以主题关键词开头（如"半导体板块"以"半导体"开头）
+            if len(kw_lower) >= 2 and name_lower.startswith(kw_lower):
+                return True
+    return False
 
 async def _assemble_with_fallback(
     task_plan, complexity, stock_code, company_name,

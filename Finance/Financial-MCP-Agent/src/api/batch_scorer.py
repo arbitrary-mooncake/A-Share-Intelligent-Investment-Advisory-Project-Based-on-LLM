@@ -156,9 +156,21 @@ def _prefetch_tushare_batch(
 # 工具函数（本地副本，避免从 app.py 导入产生副作用）
 # ──────────────────────────────────────────────
 
+def _is_bse_code(pure_code: str) -> bool:
+    """检测是否为北交所(BSE)代码: 430xxx, 431xxx, 830-839xxx, 870-873xxx, 920xxx"""
+    if len(pure_code) < 3:
+        return False
+    return (pure_code.startswith(("430", "431", "920")) or
+            (len(pure_code) >= 3 and pure_code[:3] in
+             ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+              "870", "871", "872", "873")))
+
+
 def _get_exchange_prefix(pure_code: str) -> str:
-    """返回交易所前缀 (sh/sz)，基于 A 股编码规则"""
-    if pure_code.startswith(("6", "688", "5", "8", "9")):
+    """返回交易所前缀 (sh/sz/bj)，基于 A 股编码规则"""
+    if _is_bse_code(pure_code):
+        return "bj"
+    if pure_code.startswith(("6", "688", "5")):
         return "sh"
     elif pure_code.startswith(("0", "3", "1", "4", "2")):
         return "sz"
@@ -187,8 +199,8 @@ def normalize_code(code: str) -> str:
     if paren:
         code = paren.group(1)
 
-    # 2. 剥离所有已知后缀 (.SZ/.SH/.sz/.sh/.XSHG/.XSHE)
-    code = re.sub(r'\.(SZ|SH|sz|sh|XSHG|XSHE)$', '', code)
+    # 2. 剥离所有已知后缀 (.SZ/.SH/.BJ/.sz/.sh/.bj/.XSHG/.XSHE)
+    code = re.sub(r'\.(SZ|SH|BJ|sz|sh|bj|XSHG|XSHE)$', '', code)
 
     # 3. 提取纯数字部分（应对 "sh.603871" / "stock603871" / Excel数值截断 "1" 等）
     digit_match = re.search(r'(\d{1,6})$', code)
@@ -200,8 +212,8 @@ def normalize_code(code: str) -> str:
         prefix = _get_exchange_prefix(pure)
         return f"{prefix}.{pure}"
 
-    # 4. 已有 sh./sz. 前缀的情况（带非标准后缀已在上方剥离）
-    if code.startswith("sh.") or code.startswith("sz."):
+    # 4. 已有 sh./sz./bj. 前缀的情况（带非标准后缀已在上方剥离）
+    if code.startswith("sh.") or code.startswith("sz.") or code.startswith("bj."):
         inner = code[3:]
         if inner.isdigit() and len(inner) >= 5:
             return code
@@ -218,16 +230,18 @@ def _to_tushare_code(stock_code: str) -> str:
     """
     # 剥离所有后缀和前缀，得到纯数字
     pure = stock_code
-    pure = re.sub(r'\.(SH|SZ|sh|sz|XSHG|XSHE)$', '', pure)
-    pure = pure.replace("sh.", "").replace("sz.", "")
+    pure = re.sub(r'\.(SH|SZ|BJ|sh|sz|bj|XSHG|XSHE)$', '', pure)
+    pure = pure.replace("sh.", "").replace("sz.", "").replace("bj.", "")
     # 剥离可能的残留
-    pure = re.sub(r'\.(SH|SZ|sh|sz)$', '', pure)
+    pure = re.sub(r'\.(SH|SZ|BJ|sh|sz|bj)$', '', pure)
 
     # 零补齐（纯数字不足6位时）
     if pure.isdigit() and len(pure) < 6:
         pure = pure.zfill(6)
 
-    if pure.startswith(("6", "688", "5", "8", "9")):
+    if _is_bse_code(pure):
+        return f"{pure}.BJ"
+    if pure.startswith(("6", "688", "5")):
         return f"{pure}.SH"
     return f"{pure}.SZ"
 

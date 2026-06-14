@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 from typing import Dict, Any, List
 
+from openai import AsyncOpenAI
+import httpx
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from dotenv import load_dotenv
@@ -18,7 +20,7 @@ from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
-from src.utils.model_config import get_model_config_for_agent
+from src.utils.model_config import get_model_config_for_agent, get_thinking_body
 from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 
 load_dotenv(override=True)
@@ -28,20 +30,44 @@ logger = setup_logger(__name__)
 TOOL_TIMEOUT = 30
 LLM_TIMEOUT = 300
 
-# 估值分析白名单（与旧 ReAct 白名单完全一致，16 个工具）
+# 估值分析白名单（2026-05 重构：全部切换为 Tushare 工具，移除 Baostock 依赖）
 VALUE_TOOL_NAMES = [
-    "get_stock_basic_info", "get_stock_industry",
-    "get_profit_data", "get_balance_data", "get_cash_flow_data",
-    "get_growth_data", "get_operation_data", "get_dividend_data",
-    "tushare_stock_info", "tushare_fina_indicator",
-    "tushare_dividend", "tushare_ev_ebitda",
-    "tushare_daily_basic", "tushare_pe_percentile",
-    "tushare_top10_holders", "tushare_holder_num",
+    # 基本信息与行业
+    "tushare_stock_info", "get_stock_industry",
+    # 三大报表 + 财务指标
+    "tushare_income", "tushare_balancesheet", "tushare_cashflow",
+    "tushare_fina_indicator",
+    # 估值核心
+    "tushare_daily_basic", "tushare_pe_percentile", "tushare_ev_ebitda",
+    # 分红与股东
+    "tushare_dividend", "tushare_top10_holders", "tushare_holder_num",
+    # 保留的 AkShare 工具（无 Tushare 平替）
+    "get_dupont_data", "get_operation_data", "get_growth_data",
 ]
 
 
 def _extract_code(stock_code: str) -> str:
-    return stock_code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
+    return stock_code.replace("sh.", "").replace("sz.", "").replace("bj.", "").replace(".SH", "").replace(".SZ", "").replace(".BJ", "").strip()
+
+
+def _build_etf_fallback(company_name: str, stock_code: str,
+                         etf_info: str, etf_price: str) -> str:
+    """ETF估值数据不足时的降级输出"""
+    parts = []
+    parts.append(f"## ETF估值分析\n")
+    if etf_info:
+        parts.append(f"### 基本信息\n{etf_info}\n")
+        parts.append(f"\n**[数据]** 以上为{company_name}({stock_code})的ETF基本信息。\n")
+    if etf_price:
+        parts.append(f"### 行情数据\n{etf_price}\n")
+        parts.append(f"\n**[数据]** 以上为近期行情数据（含市价与累计净值acc_close）。\n")
+        parts.append(f"\n**[判断]** 请关注市价(close)与累计净值(acc_close)的差值以计算折溢价率：")
+        parts.append(f"折溢价率 = (市价 - 累计净值) / 累计净值 × 100%。正值为溢价，负值为折价。\n")
+    if not etf_info and not etf_price:
+        parts.append(f"\n**[数据]** {company_name}({stock_code})的ETF估值数据暂时不可用。\n")
+        parts.append(f"\n**[判断]** ETF估值应关注：基金净值(NAV)、市价折溢价率、跟踪指数的历史PE/PB分位、管理费率与跟踪误差。\n")
+    parts.append(f"\n**估值评分：不适用（数据不足）**\n")
+    return "".join(parts)
 
 
 def _get_recent_quarters(date_str: str, count: int = 2) -> List[Dict[str, Any]]:
@@ -121,12 +147,124 @@ async def value_agent(state: AgentState) -> AgentState:
                     "metadata": current_metadata}
 
     if current_data.get("is_etf", False):
-        logger.info(f"{SUCCESS_ICON} ValueAgent: ETF标的，跳过估值分析")
-        current_data["value_analysis"] = "该标的为ETF产品，估值分析参考基金净值和折溢价率，不适用个股估值框架。"
-        current_metadata["value_agent_executed"] = True
-        return {"data": current_data,
-                "messages": current_messages + [{"role": "assistant", "content": "ETF标的，已跳过估值分析"}],
-                "metadata": current_metadata}
+        logger.info(f"{SUCCESS_ICON} ValueAgent: ETF标的，执行ETF专用估值分析")
+        try:
+            # 加载 ETF 估值相关工具
+            etf_tool_names = ["tushare_stock_info", "tushare_daily_basic", "tushare_kline"]
+            etf_tools = await get_mcp_tools(tool_filter=etf_tool_names)
+            tool_map = {t.name: t for t in etf_tools}
+
+            stock_code = current_data.get("stock_code", "Unknown")
+            company_name = current_data.get("company_name", "Unknown")
+            current_time_info = current_data.get("current_time_info", "未知时间")
+            current_date = current_data.get("current_date", "未知日期")
+            clean_code = _extract_code(stock_code)
+
+            # ETF 估值数据预取
+            etf_info_text = ""
+            etf_price_text = ""
+
+            if "tushare_stock_info" in tool_map:
+                try:
+                    r = await asyncio.wait_for(
+                        tool_map["tushare_stock_info"].ainvoke({"code": clean_code}), timeout=15)
+                    etf_info_text = str(r).strip()
+                except Exception as e:
+                    logger.warning(f"ETF信息获取失败: {e}")
+
+            if "tushare_daily_basic" in tool_map:
+                try:
+                    r = await asyncio.wait_for(
+                        tool_map["tushare_daily_basic"].ainvoke({"code": clean_code, "days": 120}), timeout=15)
+                    etf_price_text = str(r).strip()
+                except Exception as e:
+                    logger.warning(f"ETF行情数据获取失败: {e}")
+
+            # 使用 LLM 生成 ETF 估值分析
+            model_cfg = get_model_config_for_agent("value_agent", current_data)
+            api_key = model_cfg["api_key"]
+            base_url = model_cfg["base_url"]
+            model_name = model_cfg["model_name"]
+
+            if all([api_key, base_url, model_name, etf_price_text or etf_info_text]):
+                _client = AsyncOpenAI(
+                    api_key=api_key, base_url=base_url,
+                    timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=10.0),
+                    max_retries=1,
+                )
+                etf_prompt = f"""你是一位资深ETF分析师，请对以下ETF产品进行估值分析。
+
+ETF名称：{company_name}（代码：{stock_code}）
+当前时间：{current_time_info}
+当前日期：{current_date}
+
+ETF基本信息：
+{etf_info_text if etf_info_text else "数据不可用"}
+
+近期行情数据（来自fund_daily，close=市价，acc_close=累计净值）：
+{etf_price_text if etf_price_text else "数据不可用"}
+
+请严格按以下格式输出 ## ETF估值分析 内容：
+
+## 📊 数据事实区
+1. ETF基本信息：名称、代码、管理公司、成立时间、跟踪指数
+2. 近期市价与净值数据：最新收盘价、最新累计净值(acc_close)、5日/20日净值趋势
+3. 折溢价分析：计算最新折溢价率 = (市价 - 累计净值) / 累计净值 × 100
+4. 成交量与流动性：近期日均成交量、换手率
+5. 跟踪指数信息：所跟踪指数的名称及近期表现
+
+## 🔍 分析判断区
+1. 折溢价状态评估：当前折溢价是否处于合理范围（ETF正常±2%以内）
+2. 净值趋势分析：近期净值走势的技术性判断
+3. 流动性评估：该ETF的日均成交量和流动性状况
+4. 估值综合判断：基于以上数据的ETF估值综合评分(0-100分)
+5. 投资建议：针对当前折溢价水平和净值趋势的配置建议
+
+评分规则：
+- 折溢价在±1%以内 +30分，±1-2% +20分，±2-3% +10分，超过±3% +0分
+- 净值处于20日均线上方 +20分，处于60日均线上方 +15分，处于120日均线上方 +10分
+- 日均成交额>1亿 +20分，>5000万 +10分，否则+0分
+- 跟踪指数走势健康 +20分
+- 管理费率合理(<0.5%) +10分
+
+最终评分和投资建议请明确给出，不要含糊。"""
+
+                try:
+                    response = await asyncio.wait_for(
+                        _client.chat.completions.create(
+                            model=model_name,
+                            messages=[
+                                {"role": "system", "content": "你是专业的ETF分析师，所有分析必须基于提供的实际数据。使用[数据]标记数据事实，[判断]标记分析推断。评分必须为0-100的整数。"},
+                                {"role": "user", "content": etf_prompt},
+                            ],
+                            temperature=1.0,
+                            max_tokens=16000,
+                        ),
+                        timeout=130.0,
+                    )
+                    etf_analysis = response.choices[0].message.content if response.choices else ""
+                    logger.info(f"ETF估值分析完成 ({len(etf_analysis)} 字符)")
+                except Exception as llm_err:
+                    logger.warning(f"ETF估值 LLM 失败: {llm_err}")
+                    etf_analysis = _build_etf_fallback(company_name, stock_code, etf_info_text, etf_price_text)
+            else:
+                etf_analysis = _build_etf_fallback(company_name, stock_code, etf_info_text, etf_price_text)
+
+            current_data["value_analysis"] = etf_analysis
+            current_metadata["value_agent_executed"] = True
+            if not skip_cache and cache_date and cache_code:
+                write_cache("value_analysis", cache_code, cache_date, etf_analysis)
+            return {"data": current_data,
+                    "messages": current_messages + [{"role": "assistant", "content": "ETF估值分析已完成"}],
+                    "metadata": current_metadata}
+        except Exception as e:
+            logger.error(f"{ERROR_ICON} ValueAgent: ETF估值分析失败: {e}", exc_info=True)
+            current_data["value_analysis_error"] = f"ETF估值分析失败: {e}"
+            current_data["value_analysis"] = _build_etf_fallback(
+                current_data.get("company_name", ""),
+                current_data.get("stock_code", ""), "", "")
+            current_metadata["value_agent_executed"] = True
+            return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
 
     execution_logger.log_agent_start(agent_name, {
         "user_query": user_query,
@@ -197,18 +335,10 @@ async def value_agent(state: AgentState) -> AgentState:
         def _placeholder(label, msg):
             labels.append(label); tasks.append(_noop_result(msg)); tool_infos.append(None)
 
-        # --- 纯代码类工具 ---
+        # --- 基本信息与行业 ---
         code_tools = [
-            ("get_stock_basic_info", "基本信息"),
-            ("get_stock_industry", "行业分类"),
             ("tushare_stock_info", "Tushare基本信息"),
-            ("tushare_fina_indicator", "Tushare财务指标"),
-            ("tushare_daily_basic", "Tushare日线基础"),
-            ("tushare_pe_percentile", "Tushare PE分位"),
-            ("tushare_top10_holders", "Tushare十大股东"),
-            ("tushare_holder_num", "Tushare股东人数"),
-            ("tushare_ev_ebitda", "Tushare EV/EBITDA"),
-            ("tushare_dividend", "Tushare分红"),
+            ("get_stock_industry", "行业分类"),
         ]
         for tname, label in code_tools:
             if tname in tool_map:
@@ -219,15 +349,44 @@ async def value_agent(state: AgentState) -> AgentState:
             else:
                 _placeholder(label, f"[{tname}] 工具不可用")
 
-        # --- 财务报表类工具 ---
-        fin_tools_params = [
-            ("get_profit_data", "利润表"),
-            ("get_balance_data", "资产负债表"),
-            ("get_cash_flow_data", "现金流量表"),
-            ("get_growth_data", "成长数据"),
-            ("get_operation_data", "运营数据"),
+        # --- 三大报表（Tushare） ---
+        for tname, label in [("tushare_income", "Tushare利润表"), ("tushare_balancesheet", "Tushare资产负债表"), ("tushare_cashflow", "Tushare现金流量表")]:
+            if tname in tool_map:
+                _add(_call_tool_safe(tool_map[tname], {"code": clean_code}, label), label, (tool_map[tname], {"code": clean_code}))
+            else: _placeholder(label, f"[{tname}] 工具不可用")
+
+        # --- 财务指标与估值 ---
+        valuation_tools = [
+            ("tushare_fina_indicator", "Tushare财务指标"),
+            ("tushare_daily_basic", "Tushare日线基础"),
+            ("tushare_pe_percentile", "Tushare PE分位"),
+            ("tushare_ev_ebitda", "Tushare EV/EBITDA"),
         ]
-        for tool_name, label_base in fin_tools_params:
+        for tname, label in valuation_tools:
+            if tname in tool_map:
+                _add(_call_tool_safe(tool_map[tname], {"code": clean_code}, label), label, (tool_map[tname], {"code": clean_code}))
+            else:
+                _placeholder(label, f"[{tname}] 工具不可用")
+
+        # --- 分红与股东 ---
+        shareholder_tools = [
+            ("tushare_dividend", "Tushare分红"),
+            ("tushare_top10_holders", "Tushare十大股东"),
+            ("tushare_holder_num", "Tushare股东人数"),
+        ]
+        for tname, label in shareholder_tools:
+            if tname in tool_map:
+                _add(_call_tool_safe(tool_map[tname], {"code": clean_code}, label), label, (tool_map[tname], {"code": clean_code}))
+            else:
+                _placeholder(label, f"[{tname}] 工具不可用")
+
+        # --- 保留的 AkShare 工具（无 Tushare 平替：杜邦/运营/成长） ---
+        legacy_fin_tools = [
+            ("get_dupont_data", "杜邦分析"),
+            ("get_operation_data", "运营数据"),
+            ("get_growth_data", "成长数据"),
+        ]
+        for tool_name, label_base in legacy_fin_tools:
             if tool_name in tool_map:
                 t = tool_map[tool_name]
                 kw_latest = {"code": clean_code, "year": q_latest["year"], "quarter": q_latest["quarter"]}
@@ -239,14 +398,6 @@ async def value_agent(state: AgentState) -> AgentState:
             else:
                 _placeholder(f"{label_base}(最新)", f"[{tool_name}] 工具不可用")
                 _placeholder(f"{label_base}(上期)", f"[{tool_name}] 工具不可用")
-
-        # --- 分红数据 ---
-        if "get_dividend_data" in tool_map:
-            kw_div = {"code": clean_code, "year": q_latest["year"], "year_type": "report"}
-            _add(_call_tool_safe(tool_map["get_dividend_data"], kw_div, f"分红数据({q_latest['year']})"),
-                 "分红数据", (tool_map["get_dividend_data"], kw_div))
-        else:
-            _placeholder("分红数据", "[get_dividend_data] 工具不可用")
 
         # 并行执行（第一轮）
         try:
@@ -286,10 +437,10 @@ async def value_agent(state: AgentState) -> AgentState:
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            temperature=0.6,
+            temperature=1.0,
             request_timeout=LLM_TIMEOUT,
-            max_tokens=8000,
-            extra_body={"thinking": {"type": "enabled"}},
+            max_tokens=16000,
+            extra_body=get_thinking_body(base_url, True),
         )
 
         analysis_prompt = f"""请以券商分析师的标准，对{company_name}（股票代码：{stock_code}）进行估值分析。
@@ -388,8 +539,8 @@ async def value_agent(state: AgentState) -> AgentState:
 
         model_config_log = {
             "model": model_name,
-            "temperature": 0.6,
-            "max_tokens": 8000,
+            "temperature": 1.0,
+            "max_tokens": 16000,
             "thinking": "enabled",
             "api_base": base_url,
             "architecture": "two-phase",

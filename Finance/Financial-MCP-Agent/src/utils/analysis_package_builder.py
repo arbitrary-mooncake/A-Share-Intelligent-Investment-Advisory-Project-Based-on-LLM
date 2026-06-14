@@ -98,6 +98,15 @@ def _parse_signal_pack(raw: Any, agent_name: str, as_of_date: str) -> Dict[str, 
         sp.setdefault("source_summary", "")
         sp.setdefault("as_of_date", as_of_date)
         sp.setdefault("analysis_text", "")
+        # Normalize numeric fields — LLM may output strings
+        try:
+            sp["confidence"] = float(sp.get("confidence", 0.5))
+        except (ValueError, TypeError):
+            sp["confidence"] = 0.5
+        try:
+            sp["data_quality_score"] = float(sp.get("data_quality_score", 0.5))
+        except (ValueError, TypeError):
+            sp["data_quality_score"] = 0.5
         return sp
 
     if isinstance(raw, str) and raw.strip():
@@ -275,7 +284,11 @@ def _build_compact_context(
     bias_map = {"bullish": "看多", "neutral": "中性", "bearish": "看空"}
     for agent_name, sp in signal_packs.items():
         bias_cn = bias_map.get(sp.get("bias", ""), "中性")
-        lines.append(f"- **{agent_name}**: {bias_cn} (置信度={sp.get('confidence', 0):.0%})")
+        try:
+            conf = float(sp.get('confidence', 0))
+        except (ValueError, TypeError):
+            conf = 0.0
+        lines.append(f"- **{agent_name}**: {bias_cn} (置信度={conf:.0%})")
         for kp in sp.get("key_points", [])[:3]:
             lines.append(f"  - {kp}")
     lines.append("")

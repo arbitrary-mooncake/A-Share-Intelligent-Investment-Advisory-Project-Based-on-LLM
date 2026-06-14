@@ -3,13 +3,16 @@ ScoringEngine: 完整Pipeline评分引擎
 
 工作流架构:
     start_node
-      ├── fundamental_analyst ─────┐
-      ├── technical_analyst ───────┤
-      ├── value_analyst ───────────┤  4个分析Agent并行
-      ├── news_analyst ────────────┘
-      ├── short_term_scorer ───────→ state.data.short_term_score
-      ├── medium_term_scorer ──────→ state.data.medium_term_score
-      └── long_term_scorer ────────→ state.data.long_term_score
+      ├── fundamental_analyst ──────┐
+      ├── technical_analyst ────────┤
+      ├── value_analyst ────────────┤
+      ├── news_analyst ─────────────┤  7个分析Agent并行
+      ├── event_analyst ────────────┤
+      ├── quality_risk_analyst ─────┤
+      ├── moneyflow_analyst ────────┘
+      ├── short_term_scorer ────────→ state.data.short_term_score
+      ├── medium_term_scorer ───────→ state.data.medium_term_score
+      └── long_term_scorer ─────────→ state.data.long_term_score
 
 评分直接来自专用打分Agent，不再从Markdown报告提取。
 """
@@ -38,6 +41,9 @@ from src.agents.fundamental_agent import fundamental_agent
 from src.agents.technical_agent import technical_agent
 from src.agents.value_agent import value_agent
 from src.agents.news_agent import news_agent
+from src.agents.event_analyst_agent import event_analyst_agent
+from src.agents.quality_risk_analyst_agent import quality_risk_analyst_agent
+from src.agents.moneyflow_analyst_agent import moneyflow_analyst_agent
 from src.agents.scoring_nodes import (
     short_term_scorer_node,
     medium_term_scorer_node,
@@ -53,7 +59,7 @@ class ScoringEngine:
     评分引擎：运行完整分析+打分Pipeline为股票评分
 
     工作流:
-    start_node → [fundamental, technical, value, news] → [short_term, medium_term, long_term] → END
+    start_node → [fundamental, technical, value, news, event, quality_risk, moneyflow] → [short_term, medium_term, long_term] → END
 
     评分直接来自3个打分Agent，以中线评分为主评分写入股票池。
     """
@@ -67,12 +73,15 @@ class ScoringEngine:
         if self._workflow is None:
             workflow = StateGraph(AgentState)
 
-            # 分析节点（4个并行）
+            # 分析节点（7个并行）
             workflow.add_node("start_node", lambda state: state)
             workflow.add_node("fundamental_analyst", fundamental_agent)
             workflow.add_node("technical_analyst", technical_agent)
             workflow.add_node("value_analyst", value_agent)
             workflow.add_node("news_analyst", news_agent)
+            workflow.add_node("event_analyst", event_analyst_agent)
+            workflow.add_node("quality_risk_analyst", quality_risk_analyst_agent)
+            workflow.add_node("moneyflow_analyst", moneyflow_analyst_agent)
 
             # 打分节点（3个并行）
             workflow.add_node("short_term_scorer", short_term_scorer_node)
@@ -87,23 +96,34 @@ class ScoringEngine:
             workflow.add_edge("start_node", "technical_analyst")
             workflow.add_edge("start_node", "value_analyst")
             workflow.add_edge("start_node", "news_analyst")
+            workflow.add_edge("start_node", "event_analyst")
+            workflow.add_edge("start_node", "quality_risk_analyst")
+            workflow.add_edge("start_node", "moneyflow_analyst")
 
             # 分析节点 → 打分节点
             # short_term 只需要 technical + news
             workflow.add_edge("technical_analyst", "short_term_scorer")
             workflow.add_edge("news_analyst", "short_term_scorer")
+            workflow.add_edge("event_analyst", "short_term_scorer")
+            workflow.add_edge("moneyflow_analyst", "short_term_scorer")
 
-            # medium_term 需要全部4个
+            # medium_term 需要全部7个
             workflow.add_edge("fundamental_analyst", "medium_term_scorer")
             workflow.add_edge("technical_analyst", "medium_term_scorer")
             workflow.add_edge("value_analyst", "medium_term_scorer")
             workflow.add_edge("news_analyst", "medium_term_scorer")
+            workflow.add_edge("event_analyst", "medium_term_scorer")
+            workflow.add_edge("quality_risk_analyst", "medium_term_scorer")
+            workflow.add_edge("moneyflow_analyst", "medium_term_scorer")
 
-            # long_term 需要全部4个
+            # long_term 需要全部7个
             workflow.add_edge("fundamental_analyst", "long_term_scorer")
             workflow.add_edge("technical_analyst", "long_term_scorer")
             workflow.add_edge("value_analyst", "long_term_scorer")
             workflow.add_edge("news_analyst", "long_term_scorer")
+            workflow.add_edge("event_analyst", "long_term_scorer")
+            workflow.add_edge("quality_risk_analyst", "long_term_scorer")
+            workflow.add_edge("moneyflow_analyst", "long_term_scorer")
 
             # 打分节点 → END
             workflow.add_edge("short_term_scorer", END)
@@ -150,6 +170,7 @@ class ScoringEngine:
             "skip_cache": skip_cache,
             "thinking_enabled": thinking_enabled,
             "is_etf": ScoringEngine._is_etf(stock_code),
+            "analysis_version": "a_share_v2",
         }
         # 注入模型覆盖配置（快筛模式使用不同模型）
         if model_config:
@@ -194,7 +215,7 @@ class ScoringEngine:
             # 2. 构建初始状态
             initial_state = self._build_initial_state(stock_code, company_name)
 
-            # 3. 执行Pipeline: 4个分析Agent并行 → 3个打分Agent并行
+            # 3. 执行Pipeline: 7个分析Agent并行 → 3个打分Agent并行
             logger.info(f"{WAIT_ICON} 正在运行分析+打分Pipeline...")
             final_state = await asyncio.wait_for(
                 app.ainvoke(initial_state), timeout=2400.0

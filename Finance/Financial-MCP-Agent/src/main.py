@@ -10,7 +10,7 @@
 5. 报告生成：生成综合性的金融分析报告
 
 工作流程：
-start_node → [fundamental_analyst, technical_analyst, value_analyst] → summarizer → END
+start_node → [fundamental_analyst, technical_analyst, value_analyst, news_analyst, event_analyst, quality_risk_analyst, moneyflow_analyst] → summarizer → END
 """
 
 # ============================================================================
@@ -52,12 +52,15 @@ from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAI
 from src.utils.state_definition import AgentState
 from src.utils.execution_logger import initialize_execution_logger, finalize_execution_logger, get_execution_logger
 
-# 智能体模块导入 - 五个核心分析智能体
+# 智能体模块导入 - 八个核心智能体（七个分析 + 一个总结）
 from src.agents.summary_agent import summary_agent      # 总结智能体：整合所有分析结果
 from src.agents.value_agent import value_agent          # 估值智能体：分析股票估值水平
 from src.agents.technical_agent import technical_agent  # 技术分析智能体：分析价格趋势和技术指标
 from src.agents.fundamental_agent import fundamental_agent  # 基本面智能体：分析财务状况和盈利能力
 from src.agents.news_agent import news_agent            # 新闻分析智能体：分析新闻情感和风险
+from src.agents.event_analyst_agent import event_analyst_agent          # 事件驱动分析智能体
+from src.agents.quality_risk_analyst_agent import quality_risk_analyst_agent  # 质量风险评估智能体
+from src.agents.moneyflow_analyst_agent import moneyflow_analyst_agent  # 资金面分析智能体
 
 # LangGraph工作流框架导入
 from langgraph.graph import StateGraph, END
@@ -125,21 +128,27 @@ async def main():
         # 添加起始节点 - 作为并行分支的清晰起点
         workflow.add_node("start_node", lambda state: state)
 
-        # 添加五个核心智能体节点
+        # 添加七个核心分析智能体节点
         workflow.add_node("fundamental_analyst", fundamental_agent)  # 基本面分析智能体
         workflow.add_node("technical_analyst", technical_agent)      # 技术分析智能体
         workflow.add_node("value_analyst", value_agent)             # 估值分析智能体
         workflow.add_node("news_analyst", news_agent)               # 新闻分析智能体
+        workflow.add_node("event_analyst", event_analyst_agent)          # 事件驱动分析智能体
+        workflow.add_node("quality_risk_analyst", quality_risk_analyst_agent)  # 质量风险评估智能体
+        workflow.add_node("moneyflow_analyst", moneyflow_analyst_agent)  # 资金面分析智能体
         workflow.add_node("summarizer", summary_agent)              # 总结智能体
 
         # 设置工作流入口点
         workflow.set_entry_point("start_node")
 
-        # 添加并行执行边 - 四个分析智能体并行执行
+        # 添加并行执行边 - 七个分析智能体并行执行
         workflow.add_edge("start_node", "fundamental_analyst")
         workflow.add_edge("start_node", "technical_analyst")
         workflow.add_edge("start_node", "value_analyst")
         workflow.add_edge("start_node", "news_analyst")
+        workflow.add_edge("start_node", "event_analyst")
+        workflow.add_edge("start_node", "quality_risk_analyst")
+        workflow.add_edge("start_node", "moneyflow_analyst")
 
         # 添加汇聚边 - 所有分析结果汇聚到总结智能体
         # LangGraph确保"summarizer"等待所有直接前驱节点完成
@@ -147,6 +156,9 @@ async def main():
         workflow.add_edge("technical_analyst", "summarizer")
         workflow.add_edge("value_analyst", "summarizer")
         workflow.add_edge("news_analyst", "summarizer")
+        workflow.add_edge("event_analyst", "summarizer")
+        workflow.add_edge("quality_risk_analyst", "summarizer")
+        workflow.add_edge("moneyflow_analyst", "summarizer")
 
         # 添加结束边 - 总结智能体完成后结束工作流
         workflow.add_edge("summarizer", END)
@@ -213,10 +225,10 @@ async def main():
             print(
                 "║                                                                              ║")
             print(
-                "║    ┌─────────────────────────────────────────────────────────────────┐     ║")
-            print("║    │  📊 基本面分析  │  📈 技术分析  │  💰 估值分析  │  📰 新闻分析  │  🤖 智能总结  │    ║")
+                "║    ┌───────────────────────────────────────────────────────────────────────────────────────────┐     ║")
+            print("║    │  📊 基本面  │  📈 技术面  │  💰 估值  │  📰 新闻  │  ⚡ 事件  │  🛡️ 质控  │  💵 资金面  │  🤖 总结  │    ║")
             print(
-                "║    └─────────────────────────────────────────────────────────────────┘     ║")
+                "║    └───────────────────────────────────────────────────────────────────────────────────────────┘     ║")
             print(
                 "║                                                                              ║")
             print(
@@ -226,6 +238,9 @@ async def main():
             print("  • 技术面分析 - 价格趋势、交易量和技术指标")
             print("  • 估值分析 - 市盈率、市净率等估值水平")
             print("  • 新闻分析 - 新闻情感分析和风险评估")
+            print("  • 事件驱动分析 - 重大事件、公告和催化剂影响")
+            print("  • 质量风险评估 - 财务质量、治理和风险排查")
+            print("  • 资金面分析 - 资金流向、主力动向和筹码分布")
             print("\n🔹 支持多种自然语言查询方式：")
             print("  • 分析嘉友国际")
             print("  • 帮我看看比亚迪这只股票怎么样")
@@ -488,6 +503,9 @@ async def main():
         print(f"{WAIT_ICON} 正在执行技术面分析...")
         print(f"{WAIT_ICON} 正在执行估值分析...")
         print(f"{WAIT_ICON} 正在执行新闻分析...")
+        print(f"{WAIT_ICON} 正在执行事件驱动分析...")
+        print(f"{WAIT_ICON} 正在执行质量风险评估...")
+        print(f"{WAIT_ICON} 正在执行资金面分析...")
         print(f"{WAIT_ICON} 这可能需要几分钟时间，请耐心等待...\n")
 
         # 调用工作流 - 这是阻塞调用，会等待所有智能体完成

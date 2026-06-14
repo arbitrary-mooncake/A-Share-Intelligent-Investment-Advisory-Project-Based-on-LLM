@@ -408,7 +408,35 @@ async def technical_agent(state: AgentState) -> AgentState:
 1. 引用数据事实区的具体数值
 2. 使用「【基于数据的推断】」或「【行业知识补充】」标注推断性质
 3. 如果某个结论无法从数据中直接得出，必须声明「此为分析师推断」
-4. 不得在任何地方编造数据事实区没有的数值"""
+4. 不得在任何地方编造数据事实区没有的数值
+
+⛔ 结构化输出要求：
+在完成上述分析的「🔍 分析判断区」之后，请额外输出一个 JSON block：
+
+<SIGNAL_PACK>
+{{
+    "bias": "bullish"|"neutral"|"bearish",
+    "confidence": 0.0-1.0,
+    "key_points": ["关键结论1", "关键结论2"] (最多5条),
+    "signals": [
+        {{
+            "factor": "因子名(如:均线多头排列/MACD金叉/量价背离)",
+            "direction": 1|-1|0,
+            "strength": 0-100,
+            "time_horizon": ["short","medium"],
+            "source_level": "structured",
+            "risk_flags": [],
+            "freshness": "daily",
+            "note": "一句话说明"
+        }}
+    ] (最多5条),
+    "risk_flags": ["liquidity_risk"],
+    "missing_data": ["未获取到某些指标"],
+    "source_summary": "Tushare行情+预计算技术指标(MACD/RSI/均线/量价)"
+}}
+</SIGNAL_PACK>
+
+请确保SIGNAL_PACK内的JSON完全有效。"""
 
             logger.info(f"Agent input: {agent_input}")
 
@@ -455,6 +483,27 @@ async def technical_agent(state: AgentState) -> AgentState:
 
             logger.info(f"Final extracted analysis length: {len(final_output)} characters")
             print(f"TECHNICALAGENT: {final_output}")
+
+            # ═══ signal_pack 提取 ═══
+            import json as _json_sp
+            import re as _re_sp
+            from src.utils.analysis_package_builder import text_to_signal_pack
+
+            sp = None
+            tag_match = _re_sp.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', final_output)
+            if tag_match:
+                try:
+                    sp = _json_sp.loads(tag_match.group(1))
+                    sp["agent_name"] = "technical"
+                    sp["as_of_date"] = current_date
+                    sp.setdefault("analysis_text", final_output[:500])
+                    sp.setdefault("data_quality_score", 0.7)
+                except Exception:
+                    pass
+            if sp is None:
+                sp = text_to_signal_pack(final_output, "technical", current_date)
+            current_data["technical_signal_pack"] = sp
+
             # 7. 记录LLM交互，用于后续分析和优化
             model_config = {
                 "model": model_name,

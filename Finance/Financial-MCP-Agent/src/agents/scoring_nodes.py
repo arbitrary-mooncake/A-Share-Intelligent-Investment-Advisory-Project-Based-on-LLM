@@ -1,14 +1,10 @@
 """
-Scoring Nodes: LangGraph wrapper functions for the 3 scoring agents
+Scoring Nodes: LangGraph wrapper for 3 scoring agents (v2 — structured evidence)
 
-3个打分 Agent 的函数签名是 scorer(stock_code, company_name, ...)，
-不接受 AgentState。这个模块提供 wrapper 函数，
-使它们能作为 LangGraph 节点使用。
-
-工作流数据流：
-    4个分析 Agent 并行 → state.data.{fundamental,technical,value,news}_analysis
-    ↓
-    打分 Agent 节点从 state 中提取中间产物 → 写入 state.data.{period}_term_score
+架构升级:
+  - short_term: technical + news + event + moneyflow
+  - medium_term + long_term: all 7 analysis agents
+  - 每个node先构建AnalysisPackage → 传给scorer → apply risk_gate
 """
 from typing import Dict, Any
 
@@ -19,28 +15,29 @@ logger = setup_logger(__name__)
 
 
 async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
-    """
-    短线打分 LangGraph 节点
-
-    依赖：technical_analysis, news_analysis
-    输出：state.data.short_term_score
-    """
     from src.agents.short_term_scorer import short_term_scorer
+    from src.utils.analysis_package_builder import build_analysis_package
+    from src.utils.risk_gate import apply_risk_gate
 
     data = state.get("data", {})
     stock_code = data.get("stock_code", "")
     company_name = data.get("company_name", "")
+    as_of_date = data.get("current_date", "")
 
-    logger.info(f"{WAIT_ICON} ShortTermScorerNode: 开始对 {company_name}({stock_code}) 进行短线打分")
+    logger.info(f"{WAIT_ICON} ShortTermScorerNode: {company_name}({stock_code}) 短线打分")
 
     try:
+        pkg = build_analysis_package(data, as_of_date)
+
         result = await short_term_scorer(
-            stock_code=stock_code,
-            company_name=company_name,
+            stock_code=stock_code, company_name=company_name,
             technical_analysis=data.get("technical_analysis", ""),
             news_analysis=data.get("news_analysis", ""),
+            event_analysis=data.get("event_analysis", ""),
+            moneyflow_analysis=data.get("moneyflow_analysis", ""),
+            analysis_package=pkg,
             current_time_info=data.get("current_time_info", ""),
-            current_date=data.get("current_date", ""),
+            current_date=as_of_date,
             query=data.get("query", ""),
             model_name=data.get("model_name", ""),
             model_api_key=data.get("model_api_key", ""),
@@ -48,40 +45,50 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             thinking_enabled=data.get("thinking_enabled", True),
         )
 
-        logger.info(f"{SUCCESS_ICON} ShortTermScorerNode: {company_name} 短线评分={result['score']} ({result['recommendation']})")
+        gate = apply_risk_gate(pkg, "short", result["score"])
+        result["risk_gate"] = {
+            "risk_level": gate.risk_level,
+            "risk_flags": gate.risk_flags_found,
+            "score_cap": gate.score_cap,
+            "abstain": gate.abstain,
+            "data_quality_score": gate.data_quality_score,
+        }
 
+        logger.info(f"{SUCCESS_ICON} ShortTermScorerNode: {company_name} 短线={result['score']} (gate={gate.risk_level})")
         return {"data": {"short_term_score": result}}
 
     except Exception as e:
-        logger.error(f"{ERROR_ICON} ShortTermScorerNode 打分失败: {e}", exc_info=True)
+        logger.error(f"{ERROR_ICON} ShortTermScorerNode 失败: {e}", exc_info=True)
         raise
 
 
 async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
-    """
-    中线打分 LangGraph 节点（核心产品）
-
-    依赖：fundamental_analysis, technical_analysis, value_analysis, news_analysis
-    输出：state.data.medium_term_score
-    """
     from src.agents.medium_term_scorer import medium_term_scorer
+    from src.utils.analysis_package_builder import build_analysis_package
+    from src.utils.risk_gate import apply_risk_gate
 
     data = state.get("data", {})
     stock_code = data.get("stock_code", "")
     company_name = data.get("company_name", "")
+    as_of_date = data.get("current_date", "")
 
-    logger.info(f"{WAIT_ICON} MediumTermScorerNode: 开始对 {company_name}({stock_code}) 进行中线打分")
+    logger.info(f"{WAIT_ICON} MediumTermScorerNode: {company_name}({stock_code}) 中线打分")
 
     try:
+        pkg = build_analysis_package(data, as_of_date)
+
         result = await medium_term_scorer(
-            stock_code=stock_code,
-            company_name=company_name,
+            stock_code=stock_code, company_name=company_name,
             fundamental_analysis=data.get("fundamental_analysis", ""),
             technical_analysis=data.get("technical_analysis", ""),
             value_analysis=data.get("value_analysis", ""),
             news_analysis=data.get("news_analysis", ""),
+            event_analysis=data.get("event_analysis", ""),
+            quality_risk_analysis=data.get("quality_risk_analysis", ""),
+            moneyflow_analysis=data.get("moneyflow_analysis", ""),
+            analysis_package=pkg,
             current_time_info=data.get("current_time_info", ""),
-            current_date=data.get("current_date", ""),
+            current_date=as_of_date,
             query=data.get("query", ""),
             model_name=data.get("model_name", ""),
             model_api_key=data.get("model_api_key", ""),
@@ -89,40 +96,50 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             thinking_enabled=data.get("thinking_enabled", True),
         )
 
-        logger.info(f"{SUCCESS_ICON} MediumTermScorerNode: {company_name} 中线评分={result['score']} ({result['rating']})")
+        gate = apply_risk_gate(pkg, "medium", result["score"])
+        result["risk_gate"] = {
+            "risk_level": gate.risk_level,
+            "risk_flags": gate.risk_flags_found,
+            "score_cap": gate.score_cap,
+            "abstain": gate.abstain,
+            "data_quality_score": gate.data_quality_score,
+        }
 
+        logger.info(f"{SUCCESS_ICON} MediumTermScorerNode: {company_name} 中线={result['score']} (gate={gate.risk_level})")
         return {"data": {"medium_term_score": result}}
 
     except Exception as e:
-        logger.error(f"{ERROR_ICON} MediumTermScorerNode 打分失败: {e}", exc_info=True)
+        logger.error(f"{ERROR_ICON} MediumTermScorerNode 失败: {e}", exc_info=True)
         raise
 
 
 async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
-    """
-    长线打分 LangGraph 节点
-
-    依赖：fundamental_analysis, technical_analysis, value_analysis, news_analysis
-    输出：state.data.long_term_score
-    """
     from src.agents.long_term_scorer import long_term_scorer
+    from src.utils.analysis_package_builder import build_analysis_package
+    from src.utils.risk_gate import apply_risk_gate
 
     data = state.get("data", {})
     stock_code = data.get("stock_code", "")
     company_name = data.get("company_name", "")
+    as_of_date = data.get("current_date", "")
 
-    logger.info(f"{WAIT_ICON} LongTermScorerNode: 开始对 {company_name}({stock_code}) 进行长线打分")
+    logger.info(f"{WAIT_ICON} LongTermScorerNode: {company_name}({stock_code}) 长线打分")
 
     try:
+        pkg = build_analysis_package(data, as_of_date)
+
         result = await long_term_scorer(
-            stock_code=stock_code,
-            company_name=company_name,
+            stock_code=stock_code, company_name=company_name,
             fundamental_analysis=data.get("fundamental_analysis", ""),
             technical_analysis=data.get("technical_analysis", ""),
             value_analysis=data.get("value_analysis", ""),
             news_analysis=data.get("news_analysis", ""),
+            event_analysis=data.get("event_analysis", ""),
+            quality_risk_analysis=data.get("quality_risk_analysis", ""),
+            moneyflow_analysis=data.get("moneyflow_analysis", ""),
+            analysis_package=pkg,
             current_time_info=data.get("current_time_info", ""),
-            current_date=data.get("current_date", ""),
+            current_date=as_of_date,
             query=data.get("query", ""),
             model_name=data.get("model_name", ""),
             model_api_key=data.get("model_api_key", ""),
@@ -130,10 +147,18 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             thinking_enabled=data.get("thinking_enabled", True),
         )
 
-        logger.info(f"{SUCCESS_ICON} LongTermScorerNode: {company_name} 长线评分={result['score']} ({result['rating']}) 护城河={result.get('moat_type', 'N/A')}")
+        gate = apply_risk_gate(pkg, "long", result["score"])
+        result["risk_gate"] = {
+            "risk_level": gate.risk_level,
+            "risk_flags": gate.risk_flags_found,
+            "score_cap": gate.score_cap,
+            "abstain": gate.abstain,
+            "data_quality_score": gate.data_quality_score,
+        }
 
+        logger.info(f"{SUCCESS_ICON} LongTermScorerNode: {company_name} 长线={result['score']} (gate={gate.risk_level})")
         return {"data": {"long_term_score": result}}
 
     except Exception as e:
-        logger.error(f"{ERROR_ICON} LongTermScorerNode 打分失败: {e}", exc_info=True)
+        logger.error(f"{ERROR_ICON} LongTermScorerNode 失败: {e}", exc_info=True)
         raise

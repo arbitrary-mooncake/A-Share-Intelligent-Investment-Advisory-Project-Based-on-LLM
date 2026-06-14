@@ -173,7 +173,12 @@ def build_analysis_package(
     for agent_name, sp in signal_packs.items():
         md = sp.get("missing_data", [])
         has_fatal_missing = any("Agent未执行" in str(x) for x in md)
-        if has_fatal_missing and sp.get("data_quality_score", 0) <= 0.3:
+        dqs = sp.get("data_quality_score", 0)
+        try:
+            dqs = float(dqs)
+        except (ValueError, TypeError):
+            dqs = 0.3
+        if has_fatal_missing and dqs <= 0.3:
             missing.append(agent_name)
         else:
             available.append(agent_name)
@@ -185,15 +190,26 @@ def build_analysis_package(
             if isinstance(sig, dict):
                 sig["_agent"] = agent_name
                 sig.setdefault("source_level", SourceLevel.PROXY)
-                sig.setdefault("strength", 50)
-                sig.setdefault("direction", 0)
+                # Normalize numeric fields — LLM may output strings for int/float values
+                try:
+                    sig["strength"] = int(sig.get("strength", 50))
+                except (ValueError, TypeError):
+                    sig["strength"] = 50
+                try:
+                    sig["direction"] = int(sig.get("direction", 0))
+                except (ValueError, TypeError):
+                    sig["direction"] = 0
+                try:
+                    sig["confidence"] = float(sig.get("confidence", 0.5))
+                except (ValueError, TypeError):
+                    sig["confidence"] = 0.5
                 all_signals.append(sig)
 
     # 按 source priority + strength 排降序
     all_signals.sort(
         key=lambda s: (
             SOURCE_PRIORITY.get(s.get("source_level", SourceLevel.PROXY), 0),
-            abs(s.get("strength", 0)),
+            abs(int(s.get("strength", 0)) if not isinstance(s.get("strength"), int) else s.get("strength", 0)),
         ),
         reverse=True,
     )

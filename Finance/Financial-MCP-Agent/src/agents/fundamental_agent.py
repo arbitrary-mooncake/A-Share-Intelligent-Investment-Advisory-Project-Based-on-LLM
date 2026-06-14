@@ -464,7 +464,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
     ] (最多6条),
     "risk_flags": ["cashflow_mismatch", "earnings_quality_concern"],
     "missing_data": ["未获取到质押数据"],
-    "source_summary": "Tushare财报+AkShare杜邦/运营/成长数据"
+    "source_summary": "Tushare财务指标(三大报表+估值+分红+股东)"
 }}
 </SIGNAL_PACK>
 

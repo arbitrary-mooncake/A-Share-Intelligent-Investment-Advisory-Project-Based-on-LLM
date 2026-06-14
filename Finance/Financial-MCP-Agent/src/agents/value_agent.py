@@ -4,7 +4,6 @@ Phase 1: asyncio.gather 并行获取白名单全部 16 个工具的数据
 Phase 2: 将所有原始数据喂给 LLM 一次性完成估值分析（thinking 开启）
 """
 import asyncio
-import os
 import time
 from datetime import datetime
 from typing import Dict, Any, List
@@ -315,6 +314,10 @@ ETF基本信息：
                     etf_analysis = _build_etf_fallback(company_name, stock_code, etf_info_text, etf_price_text)
             else:
                 etf_analysis = _build_etf_fallback(company_name, stock_code, etf_info_text, etf_price_text)
+
+            # Extract signal_pack for ETF path
+            sp = _extract_signal_pack_from_llm(etf_analysis, "value", current_date)
+            current_data["value_signal_pack"] = sp
 
             current_data["value_analysis"] = etf_analysis
             current_metadata["value_agent_executed"] = True

@@ -4,10 +4,9 @@ Phase 1: asyncio.gather 并行获取基金经理/管理人/基金基本信息
 Phase 2: 将所有原始数据喂给 LLM 一次性完成经理质量评估（thinking 关闭）
 """
 import asyncio
-import os
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
@@ -101,6 +100,22 @@ async def fund_manager_agent(state: AgentState) -> AgentState:
             cached_sp = read_signal_pack_cache("fund_manager", fund_code, cache_date)
             if cached_sp:
                 current_data["fund_manager_signal_pack"] = cached_sp
+            else:
+                # Fallback: re-extract from cached LLM output text
+                import json as _json, re as _re
+                sp = None
+                tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', cached)
+                if tag_match:
+                    try:
+                        sp = _json.loads(tag_match.group(1))
+                        sp["agent_name"] = "fund_manager"
+                        sp["as_of_date"] = cache_date
+                    except Exception:
+                        pass
+                if sp is None:
+                    from src.utils.analysis_package_builder import text_to_signal_pack
+                    sp = text_to_signal_pack(cached, "fund_manager", cache_date)
+                current_data["fund_manager_signal_pack"] = sp
             current_metadata["fund_manager_executed"] = True
             current_metadata["fund_manager_cached"] = True
             return {"data": current_data,

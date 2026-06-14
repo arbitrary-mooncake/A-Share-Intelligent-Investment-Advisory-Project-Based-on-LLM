@@ -5,7 +5,6 @@ Phase 1: asyncio.gather 并行获取白名单全部 3 个基金数据工具
 Phase 2: 将所有原始数据喂给 LLM 一次性完成基金产品文档解析（thinking 关闭）
 """
 import asyncio
-import os
 import time
 from typing import Dict, Any, List
 
@@ -102,6 +101,22 @@ async def fund_product_doc_agent(state: AgentState) -> AgentState:
             cached_sp = read_signal_pack_cache("fund_product_doc", cache_code, cache_date)
             if cached_sp:
                 current_data["fund_product_doc_signal_pack"] = cached_sp
+            else:
+                # Fallback: re-extract from cached LLM output text
+                import json as _json, re as _re
+                sp = None
+                tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', cached)
+                if tag_match:
+                    try:
+                        sp = _json.loads(tag_match.group(1))
+                        sp["agent_name"] = "fund_product_doc"
+                        sp["as_of_date"] = cache_date
+                    except Exception:
+                        pass
+                if sp is None:
+                    from src.utils.analysis_package_builder import text_to_signal_pack
+                    sp = text_to_signal_pack(cached, "fund_product_doc", cache_date)
+                current_data["fund_product_doc_signal_pack"] = sp
             current_metadata["fund_product_doc_executed"] = True
             current_metadata["fund_product_doc_cached"] = True
             return {"data": current_data,

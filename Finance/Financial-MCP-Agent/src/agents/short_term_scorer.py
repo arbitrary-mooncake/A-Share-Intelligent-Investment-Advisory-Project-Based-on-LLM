@@ -7,7 +7,6 @@ ShortTermScorer: 短线投资打分Agent (以天为单位，1-5个交易日)
 - 核心权重集中在：量价关系、技术信号、趋势动量、情绪资金
 - 使用thinking模式(max_tokens=16000)保证打分准确性
 """
-import os
 import re
 import json as json_mod
 import time

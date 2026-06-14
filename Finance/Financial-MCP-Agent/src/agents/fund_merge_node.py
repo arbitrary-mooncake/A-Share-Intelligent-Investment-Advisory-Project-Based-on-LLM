@@ -760,12 +760,10 @@ async def fund_merge_node(state: AgentState) -> Dict[str, Any]:
                 biases.setdefault(bias, []).append(agent_key)
 
         if "bullish" in biases and "bearish" in biases:
-            conflicts.append({
-                "type": "bias_conflict",
-                "bullish_agents": biases.get("bullish", []),
-                "bearish_agents": biases.get("bearish", []),
-                "note": "看多和看空agent存在方向性冲突",
-            })
+            conflicts.append(
+                f"方向冲突: 看多agent=[{', '.join(biases.get('bullish', []))}], "
+                f"看空agent=[{', '.join(biases.get('bearish', []))}]"
+            )
 
         # ---- Step 6: Build holding period hints ----
         holding_hints = _build_holding_hints(agent_outputs)

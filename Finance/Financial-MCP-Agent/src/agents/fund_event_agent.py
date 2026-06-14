@@ -117,6 +117,22 @@ async def fund_event_agent(state: AgentState) -> AgentState:
             cached_sp = read_signal_pack_cache("fund_event", cache_code, cache_date)
             if cached_sp:
                 current_data["fund_event_signal_pack"] = cached_sp
+            else:
+                # Fallback: re-extract from cached LLM output text
+                import json as _json, re as _re
+                sp = None
+                tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', cached)
+                if tag_match:
+                    try:
+                        sp = _json.loads(tag_match.group(1))
+                        sp["agent_name"] = "fund_event"
+                        sp["as_of_date"] = cache_date
+                    except Exception:
+                        pass
+                if sp is None:
+                    from src.utils.analysis_package_builder import text_to_signal_pack
+                    sp = text_to_signal_pack(cached, "fund_event", cache_date)
+                current_data["fund_event_signal_pack"] = sp
             current_metadata["fund_event_executed"] = True
             current_metadata["fund_event_cached"] = True
             return {"data": current_data,

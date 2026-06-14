@@ -2,10 +2,10 @@
 模型配置工具：将各子Agent映射到其分配的LLM模型。
 
 .env 五模型架构：
-  Model 1 (OPENAI_COMPATIBLE):      MiMo-V2.5-Pro  → summary, medium/long scorer
+  Model 1 (OPENAI_COMPATIBLE):      MiMo-V2.5-Pro  → summary, medium/long scorer, fundamental, value, quality_risk
   Model 2 (OPENAI_COMPATIBLE_2):    Qwen3.6-Flash  → 快速查询 + 快筛股票池（不动）
-  Model 3 (OPENAI_COMPATIBLE_3):    Qwen3.7-Plus   → technical, news, short scorer
-  Model 4 (OPENAI_COMPATIBLE_4):    Kimi K2.6      → fundamental, value
+  Model 3 (OPENAI_COMPATIBLE_3):    Qwen3.7-Plus   → technical, news, short scorer, event, moneyflow
+  Model 4 (OPENAI_COMPATIBLE_4):    Kimi K2.6      → (已迁移至 M1，当前无 Agent 分配)
   Model 5 (OPENAI_COMPATIBLE_5):    MiMo-V2.5       → 智能问答主模型
 
 优化调整 (2026-06-02):
@@ -39,7 +39,7 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
     "news_agent": "_3",
     # ── 新增 Agent (2026-06 架构升级) ──
     "event_analyst": "_3",               # Model 3: Qwen3.7-Plus — 事件/公告分析
-    "quality_risk_analyst": "_4",        # Model 4: Kimi K2.6 — 财务质量/治理风险深度分析
+    "quality_risk_analyst": "",             # Model 1: MiMo-V2.5-Pro — 财务质量/治理风险深度分析
     "moneyflow_analyst": "_3",           # Model 3: Qwen3.7-Plus — 资金面/量价确认
     "short_term_scorer": "_3",
     "fund_manager_agent": "_3",
@@ -48,9 +48,9 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
     "fund_product_doc_agent": "_3",   # Qwen3.7-Plus — structured data parsing
     "fund_benchmark_agent": "_3",     # Qwen3.7-Plus + thinking=enabled — style drift analysis
 
-    # ── Model 4: Kimi K2.6 (深度分析：基本面、估值) ──
-    "fundamental_agent": "_4",
-    "value_agent": "_4",
+    # ── Model 4: Kimi K2.6 (已迁移至 Model 1，当前无 Agent 使用) ──
+    "fundamental_agent": "",
+    "value_agent": "",
 
     # ── Model 5: MiMo-V2.5 (智能问答主模型) ──
     "qa_engine": "_5",

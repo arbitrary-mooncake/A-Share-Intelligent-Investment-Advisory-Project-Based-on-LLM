@@ -18,6 +18,7 @@ from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAI
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
 from src.utils.model_config import get_model_config_for_agent, get_thinking_body
+from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 from src.utils.analysis_package_builder import text_to_signal_pack
 
 load_dotenv(override=True)
@@ -93,7 +94,12 @@ async def quality_risk_analyst_agent(state: AgentState) -> AgentState:
             current_data["quality_risk_analysis"] = cached
             current_metadata["quality_risk_agent_executed"] = True
             current_metadata["quality_risk_agent_cached"] = True
-            current_data["quality_risk_signal_pack"] = _extract_signal_pack(cached, "quality_risk", cache_date)
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("quality_risk_analysis", cache_code, cache_date)
+            if cached_sp:
+                current_data["quality_risk_signal_pack"] = cached_sp
+            else:
+                current_data["quality_risk_signal_pack"] = _extract_signal_pack(cached, "quality_risk", cache_date)
             return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "质量风险分析已完成（缓存）"}], "metadata": current_metadata}
 
     stock_code = current_data.get("stock_code", "")
@@ -122,14 +128,23 @@ async def quality_risk_analyst_agent(state: AgentState) -> AgentState:
         tool_map = {t.name: t for t in all_tools} if all_tools else {}
         tasks = []
         labels = []
+        tool_infos = []  # (tool, kwargs) for retry
 
         for tname in QUALITY_RISK_TOOL_NAMES:
             if tname in tool_map:
                 kwargs = {"code": clean_code}
                 tasks.append(_call_tool_safe(tool_map[tname], kwargs, tname))
                 labels.append(tname)
+                tool_infos.append((tool_map[tname], kwargs))
 
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+
+        # 空数据重试（最多额外3轮，并发递减8→4→2）
+        results = await retry_failed_fetches(
+            results, tool_infos, labels, _call_tool_safe,
+            agent_label="QualityRiskAnalyst",
+        )
+
         safe_results = []
         for i, r in enumerate(results):
             if isinstance(r, Exception):
@@ -171,6 +186,9 @@ JSON含: bias, confidence, key_points(≤5条), signals(≤8条,含factor/direct
 
         if not skip_cache and cache_date and cache_code:
             write_cache("quality_risk_analysis", cache_code, cache_date, final_output)
+            if "quality_risk_signal_pack" in current_data:
+                from src.utils.cache_utils import write_signal_pack_cache
+                write_signal_pack_cache("quality_risk_analysis", cache_code, cache_date, current_data["quality_risk_signal_pack"])
         current_metadata["quality_risk_agent_executed"] = True
 
         return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "质量风险分析已完成"}], "metadata": current_metadata}

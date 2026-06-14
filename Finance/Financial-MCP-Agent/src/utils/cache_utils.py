@@ -22,6 +22,9 @@ AGENT_CACHE_TTL = {
     "value_analysis": 7,
     "technical_analysis": 1,
     "news_analysis": 1,
+    "event_analysis": 1,            # Event/news data needs daily freshness
+    "quality_risk_analysis": 7,     # Financial quality data is quarterly, 7-day window
+    "moneyflow_analysis": 1,        # Daily market data
     # Fund agents
     "fund_product_doc": 30,      # Fund basic info rarely changes
     "fund_perf_risk": 3,         # NAV updates daily, analysis is heavy
@@ -112,3 +115,28 @@ def write_cache(agent_name: str, stock_code: str, date_str: str, content: str):
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         pass  # 缓存写入失败不应影响主流程
+
+
+def read_signal_pack_cache(agent_name: str, stock_code: str, date_str: str) -> dict | None:
+    """Read cached signal_pack JSON. Returns None if not found or expired."""
+    safe_code = stock_code.replace(".", "_").replace("/", "_")
+    cache_path = os.path.join(_CACHE_DIR, f"{agent_name}_signal_pack_{safe_code}_{date_str}.json")
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except Exception:
+        return None
+
+
+def write_signal_pack_cache(agent_name: str, stock_code: str, date_str: str, signal_pack: dict) -> None:
+    """Cache signal_pack as JSON."""
+    safe_code = stock_code.replace(".", "_").replace("/", "_")
+    cache_path = os.path.join(_CACHE_DIR, f"{agent_name}_signal_pack_{safe_code}_{date_str}.json")
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(signal_pack, f, ensure_ascii=False, default=str)
+    except Exception:
+        pass  # cache write failure is non-fatal

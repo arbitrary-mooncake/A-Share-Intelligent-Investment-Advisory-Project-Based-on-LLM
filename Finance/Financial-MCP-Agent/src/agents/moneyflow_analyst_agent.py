@@ -18,6 +18,7 @@ from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAI
 from src.utils.execution_logger import get_execution_logger
 from src.utils.cache_utils import read_cache, write_cache
 from src.utils.model_config import get_model_config_for_agent, get_thinking_body
+from src.utils.fetch_utils import retry_failed_fetches, is_empty_result
 from src.utils.analysis_package_builder import text_to_signal_pack
 
 load_dotenv(override=True)
@@ -92,7 +93,12 @@ async def moneyflow_analyst_agent(state: AgentState) -> AgentState:
             current_data["moneyflow_analysis"] = cached
             current_metadata["moneyflow_agent_executed"] = True
             current_metadata["moneyflow_agent_cached"] = True
-            current_data["moneyflow_signal_pack"] = _extract_signal_pack(cached, "moneyflow", cache_date)
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("moneyflow_analysis", cache_code, cache_date)
+            if cached_sp:
+                current_data["moneyflow_signal_pack"] = cached_sp
+            else:
+                current_data["moneyflow_signal_pack"] = _extract_signal_pack(cached, "moneyflow", cache_date)
             return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "资金面分析已完成（缓存）"}], "metadata": current_metadata}
 
     stock_code = current_data.get("stock_code", "")
@@ -121,6 +127,7 @@ async def moneyflow_analyst_agent(state: AgentState) -> AgentState:
         tool_map = {t.name: t for t in all_tools} if all_tools else {}
         tasks = []
         labels = []
+        tool_infos = []  # (tool, kwargs) for retry
 
         for tname in MONEYFLOW_TOOL_NAMES:
             if tname in tool_map:
@@ -141,8 +148,16 @@ async def moneyflow_analyst_agent(state: AgentState) -> AgentState:
                     kwargs["days"] = 250
                 tasks.append(_call_tool_safe(tool_map[tname], kwargs, tname))
                 labels.append(tname)
+                tool_infos.append((tool_map[tname], kwargs))
 
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+
+        # 空数据重试（最多额外3轮，并发递减8→4→2）
+        results = await retry_failed_fetches(
+            results, tool_infos, labels, _call_tool_safe,
+            agent_label="MoneyflowAnalyst",
+        )
+
         safe_results = []
         for i, r in enumerate(results):
             if isinstance(r, Exception):
@@ -185,6 +200,9 @@ signal中source_level优先使用structured(如moneyflow/top_list等数值工具
 
         if not skip_cache and cache_date and cache_code:
             write_cache("moneyflow_analysis", cache_code, cache_date, final_output)
+            if "moneyflow_signal_pack" in current_data:
+                from src.utils.cache_utils import write_signal_pack_cache
+                write_signal_pack_cache("moneyflow_analysis", cache_code, cache_date, current_data["moneyflow_signal_pack"])
         current_metadata["moneyflow_agent_executed"] = True
 
         return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "资金面分析已完成"}], "metadata": current_metadata}

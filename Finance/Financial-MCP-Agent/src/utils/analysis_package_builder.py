@@ -150,117 +150,132 @@ def build_analysis_package(
     从 state.data 提取所有 *_signal_pack（或 fallback from *_analysis），
     合并为统一 AnalysisPackage。
     """
-    agent_text_keys = {
-        "fundamental": "fundamental_analysis",
-        "technical": "technical_analysis",
-        "value": "value_analysis",
-        "news": "news_analysis",
-        "event": "event_analysis",
-        "quality_risk": "quality_risk_analysis",
-        "moneyflow": "moneyflow_analysis",
-    }
+    try:
+        agent_text_keys = {
+            "fundamental": "fundamental_analysis",
+            "technical": "technical_analysis",
+            "value": "value_analysis",
+            "news": "news_analysis",
+            "event": "event_analysis",
+            "quality_risk": "quality_risk_analysis",
+            "moneyflow": "moneyflow_analysis",
+        }
 
-    signal_packs: Dict[str, Dict[str, Any]] = {}
-    for agent_name, text_key in agent_text_keys.items():
-        sp_key = f"{agent_name}_signal_pack"
-        if sp_key in state_data and state_data[sp_key]:
-            signal_packs[agent_name] = _parse_signal_pack(state_data[sp_key], agent_name, as_of_date)
-        elif text_key in state_data and state_data[text_key]:
-            signal_packs[agent_name] = text_to_signal_pack(state_data[text_key], agent_name, as_of_date)
-        else:
-            sp = dict(FALLBACK_SIGNAL_PACK, agent_name=agent_name, as_of_date=as_of_date)
-            sp["missing_data"] = ["Agent未执行"]
-            signal_packs[agent_name] = sp
+        signal_packs: Dict[str, Dict[str, Any]] = {}
+        for agent_name, text_key in agent_text_keys.items():
+            sp_key = f"{agent_name}_signal_pack"
+            if sp_key in state_data and state_data[sp_key]:
+                signal_packs[agent_name] = _parse_signal_pack(state_data[sp_key], agent_name, as_of_date)
+            elif text_key in state_data and state_data[text_key]:
+                signal_packs[agent_name] = text_to_signal_pack(state_data[text_key], agent_name, as_of_date)
+            else:
+                sp = dict(FALLBACK_SIGNAL_PACK, agent_name=agent_name, as_of_date=as_of_date)
+                sp["missing_data"] = ["Agent未执行"]
+                signal_packs[agent_name] = sp
 
-    # 归并
-    all_signals = []
-    all_risk_flags = []
-    all_missing = []
-    available = []
-    missing = []
+        # 归并
+        all_signals = []
+        all_risk_flags = []
+        all_missing = []
+        available = []
+        missing = []
 
-    for agent_name, sp in signal_packs.items():
-        md = sp.get("missing_data", [])
-        has_fatal_missing = any("Agent未执行" in str(x) for x in md)
-        dqs = sp.get("data_quality_score", 0)
-        try:
-            dqs = float(dqs)
-        except (ValueError, TypeError):
-            dqs = 0.3
-        if has_fatal_missing and dqs <= 0.3:
-            missing.append(agent_name)
-        else:
-            available.append(agent_name)
+        for agent_name, sp in signal_packs.items():
+            md = sp.get("missing_data", [])
+            has_fatal_missing = any("Agent未执行" in str(x) for x in md)
+            dqs = sp.get("data_quality_score", 0)
+            try:
+                dqs = float(dqs)
+            except (ValueError, TypeError):
+                dqs = 0.3
+            if has_fatal_missing and dqs <= 0.3:
+                missing.append(agent_name)
+            else:
+                available.append(agent_name)
 
-        all_risk_flags.extend(sp.get("risk_flags", []))
-        all_missing.extend(md)
+            all_risk_flags.extend(sp.get("risk_flags", []))
+            all_missing.extend(md)
 
-        for sig in sp.get("signals", []):
-            if isinstance(sig, dict):
-                sig["_agent"] = agent_name
-                sig.setdefault("source_level", SourceLevel.PROXY)
-                # Normalize numeric fields — LLM may output strings for int/float values
-                try:
-                    sig["strength"] = int(sig.get("strength", 50))
-                except (ValueError, TypeError):
-                    sig["strength"] = 50
-                try:
-                    sig["direction"] = int(sig.get("direction", 0))
-                except (ValueError, TypeError):
-                    sig["direction"] = 0
-                try:
-                    sig["confidence"] = float(sig.get("confidence", 0.5))
-                except (ValueError, TypeError):
-                    sig["confidence"] = 0.5
-                all_signals.append(sig)
+            for sig in sp.get("signals", []):
+                if isinstance(sig, dict):
+                    sig["_agent"] = agent_name
+                    sig.setdefault("source_level", SourceLevel.PROXY)
+                    # Normalize numeric fields — LLM may output strings for int/float values
+                    try:
+                        sig["strength"] = int(sig.get("strength", 50))
+                    except (ValueError, TypeError):
+                        sig["strength"] = 50
+                    try:
+                        sig["direction"] = int(sig.get("direction", 0))
+                    except (ValueError, TypeError):
+                        sig["direction"] = 0
+                    try:
+                        sig["confidence"] = float(sig.get("confidence", 0.5))
+                    except (ValueError, TypeError):
+                        sig["confidence"] = 0.5
+                    all_signals.append(sig)
 
-    # 按 source priority + strength 排降序
-    all_signals.sort(
-        key=lambda s: (
-            SOURCE_PRIORITY.get(s.get("source_level", SourceLevel.PROXY), 0),
-            abs(int(s.get("strength", 0)) if not isinstance(s.get("strength"), int) else s.get("strength", 0)),
-        ),
-        reverse=True,
-    )
+        # 按 source priority + strength 排降序
+        all_signals.sort(
+            key=lambda s: (
+                SOURCE_PRIORITY.get(s.get("source_level", SourceLevel.PROXY), 0),
+                abs(int(s.get("strength", 0)) if not isinstance(s.get("strength"), int) else s.get("strength", 0)),
+            ),
+            reverse=True,
+        )
 
-    bullish = [s for s in all_signals if s.get("direction", 0) > 0]
-    bearish = [s for s in all_signals if s.get("direction", 0) < 0]
+        bullish = [s for s in all_signals if s.get("direction", 0) > 0]
+        bearish = [s for s in all_signals if s.get("direction", 0) < 0]
 
-    # 冲突检测
-    factor_map: Dict[str, List[dict]] = {}
-    for s in all_signals:
-        f = s.get("factor", "")
-        if f:
-            factor_map.setdefault(f, []).append(s)
-    conflicting = []
-    for factor, sigs in factor_map.items():
-        dirs = {s.get("direction", 0) for s in sigs}
-        if len(dirs) > 1:
-            conflicting.append({"factor": factor, "signals": sigs})
+        # 冲突检测
+        factor_map: Dict[str, List[dict]] = {}
+        for s in all_signals:
+            f = s.get("factor", "")
+            if f:
+                factor_map.setdefault(f, []).append(s)
+        conflicting = []
+        for factor, sigs in factor_map.items():
+            dirs = {s.get("direction", 0) for s in sigs}
+            if len(dirs) > 1:
+                conflicting.append({"factor": factor, "signals": sigs})
 
-    source_counts: Dict[str, int] = {}
-    for s in all_signals:
-        lv = s.get("source_level", SourceLevel.PROXY)
-        source_counts[lv] = source_counts.get(lv, 0) + 1
+        source_counts: Dict[str, int] = {}
+        for s in all_signals:
+            lv = s.get("source_level", SourceLevel.PROXY)
+            source_counts[lv] = source_counts.get(lv, 0) + 1
 
-    unique_risk = list(dict.fromkeys(all_risk_flags))
-    unique_missing = list(dict.fromkeys(all_missing))
+        unique_risk = list(dict.fromkeys(all_risk_flags))
+        unique_missing = list(dict.fromkeys(all_missing))
 
-    compact = _build_compact_context(available, missing, bullish, bearish, conflicting, unique_risk, unique_missing, signal_packs)
+        compact = _build_compact_context(available, missing, bullish, bearish, conflicting, unique_risk, unique_missing, signal_packs)
 
-    return AnalysisPackage(
-        as_of_date=as_of_date,
-        executed_agents=list(dict.fromkeys(available + missing)),
-        available_agents=available,
-        missing_agents=missing,
-        global_risk_flags=unique_risk,
-        global_missing_data=unique_missing,
-        bullish_signals=bullish,
-        bearish_signals=bearish,
-        conflicting_signals=conflicting,
-        source_priority_summary={"counts": source_counts},
-        compact_prompt_context=compact,
-    )
+        return AnalysisPackage(
+            as_of_date=as_of_date,
+            executed_agents=list(dict.fromkeys(available + missing)),
+            available_agents=available,
+            missing_agents=missing,
+            global_risk_flags=unique_risk,
+            global_missing_data=unique_missing,
+            bullish_signals=bullish,
+            bearish_signals=bearish,
+            conflicting_signals=conflicting,
+            source_priority_summary={"counts": source_counts},
+            compact_prompt_context=compact,
+        )
+    except Exception:
+        return AnalysisPackage(
+            as_of_date=as_of_date,
+            executed_agents=[],
+            available_agents=[],
+            missing_agents=["fundamental","technical","value","news","event","quality_risk","moneyflow"],
+            global_risk_flags=["builder_error"],
+            global_missing_data=["AnalysisPackage builder encountered an error"],
+            bullish_signals=[],
+            bearish_signals=[],
+            conflicting_signals=[],
+            source_priority_summary={"error": "builder failed"},
+            compact_prompt_context="## 分析产物构建失败\n分析数据合并过程中出现错误，请检查原始分析输出。",
+        )
 
 
 def _build_compact_context(

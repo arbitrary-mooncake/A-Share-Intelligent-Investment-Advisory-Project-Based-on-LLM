@@ -143,12 +143,26 @@ async def event_analyst_agent(state: AgentState) -> AgentState:
 
         for tname in EVENT_TOOL_NAMES:
             if tname in tool_map:
-                kwargs = {"code": clean_code}
-                if tname == "tushare_anns_d":
-                    kwargs["days"] = 90
-                tasks.append(_call_tool_safe(tool_map[tname], kwargs, tname))
-                labels.append(tname)
-                tool_infos.append((tool_map[tname], kwargs))
+                if tname == "crawl_news":
+                    # 主查询：股票代码（提高精准度）
+                    if clean_code:
+                        kw1 = {"query": clean_code, "top_k": 10}
+                        tasks.append(_call_tool_safe(tool_map[tname], kw1, f"crawl_news(code={clean_code})"))
+                        labels.append(f"crawl_news(code)")
+                        tool_infos.append((tool_map[tname], kw1))
+                    # 备选查询：公司名称（提高命中率，学习fund event agent模式）
+                    if company_name:
+                        kw2 = {"query": company_name, "top_k": 10}
+                        tasks.append(_call_tool_safe(tool_map[tname], kw2, f"crawl_news(name={company_name})"))
+                        labels.append(f"crawl_news(name)")
+                        tool_infos.append((tool_map[tname], kw2))
+                else:
+                    kwargs = {"code": clean_code}
+                    if tname == "tushare_anns_d":
+                        kwargs["days"] = 90
+                    tasks.append(_call_tool_safe(tool_map[tname], kwargs, tname))
+                    labels.append(tname)
+                    tool_infos.append((tool_map[tname], kwargs))
 
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
 

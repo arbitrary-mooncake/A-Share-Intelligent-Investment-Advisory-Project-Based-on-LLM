@@ -95,6 +95,7 @@ async def event_analyst_agent(state: AgentState) -> AgentState:
             current_data["event_analysis"] = cached
             current_metadata["event_agent_executed"] = True
             current_metadata["event_agent_cached"] = True
+            current_data["event_signal_pack"] = _extract_signal_pack(cached, "event", cache_date)
             return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "事件分析已完成（缓存）"}], "metadata": current_metadata}
 
     stock_code = current_data.get("stock_code", "")

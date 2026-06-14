@@ -247,6 +247,21 @@ async def technical_agent(state: AgentState) -> AgentState:
             current_data["technical_analysis"] = cached
             current_metadata["technical_agent_executed"] = True
             current_metadata["technical_agent_cached"] = True
+            from src.utils.analysis_package_builder import text_to_signal_pack
+            import re, json
+            # Try to re-extract SIGNAL_PACK from cached LLM output
+            sp = None
+            tag_match = re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', cached)
+            if tag_match:
+                try:
+                    sp = json.loads(tag_match.group(1))
+                    sp["agent_name"] = "technical"
+                    sp["as_of_date"] = cache_date
+                except Exception:
+                    pass
+            if sp is None:
+                sp = text_to_signal_pack(cached, "technical", cache_date)
+            current_data["technical_signal_pack"] = sp
             return {"data": current_data,
                     "messages": current_messages + [{"role": "assistant", "content": "技术分析已完成（缓存）"}],
                     "metadata": current_metadata}

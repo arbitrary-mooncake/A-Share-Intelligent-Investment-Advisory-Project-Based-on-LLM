@@ -93,6 +93,7 @@ async def quality_risk_analyst_agent(state: AgentState) -> AgentState:
             current_data["quality_risk_analysis"] = cached
             current_metadata["quality_risk_agent_executed"] = True
             current_metadata["quality_risk_agent_cached"] = True
+            current_data["quality_risk_signal_pack"] = _extract_signal_pack(cached, "quality_risk", cache_date)
             return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "质量风险分析已完成（缓存）"}], "metadata": current_metadata}
 
     stock_code = current_data.get("stock_code", "")

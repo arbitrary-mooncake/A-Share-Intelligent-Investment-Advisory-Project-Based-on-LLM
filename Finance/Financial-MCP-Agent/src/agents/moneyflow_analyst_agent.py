@@ -92,6 +92,7 @@ async def moneyflow_analyst_agent(state: AgentState) -> AgentState:
             current_data["moneyflow_analysis"] = cached
             current_metadata["moneyflow_agent_executed"] = True
             current_metadata["moneyflow_agent_cached"] = True
+            current_data["moneyflow_signal_pack"] = _extract_signal_pack(cached, "moneyflow", cache_date)
             return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "资金面分析已完成（缓存）"}], "metadata": current_metadata}
 
     stock_code = current_data.get("stock_code", "")

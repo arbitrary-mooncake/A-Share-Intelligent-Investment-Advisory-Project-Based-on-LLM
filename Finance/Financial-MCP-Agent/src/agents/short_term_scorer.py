@@ -33,6 +33,9 @@ async def short_term_scorer(
     company_name: str,
     technical_analysis: str = "",
     news_analysis: str = "",
+    event_analysis: str = "",
+    moneyflow_analysis: str = "",
+    analysis_package = None,
     current_time_info: str = "",
     current_date: str = "",
     query: str = "",
@@ -42,13 +45,14 @@ async def short_term_scorer(
     thinking_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
-    短线投资打分 (1-5个交易日持仓)
+    短线投资打分 (1-5个交易日持仓) — v2
 
     评分体系（总分100分）：
-    - 量价关系(30分)
-    - 技术信号(25分)
-    - 趋势动量(20分)
-    - 情绪资金(25分)
+    - 技术状态(25分)
+    - 量价/流动性(20分)
+    - 资金确认(20分)
+    - 事件催化(20分)
+    - 新闻叙事/情绪(15分)
     """
     agent_name = "short_term_scorer"
     logger.info(f"{WAIT_ICON} ShortTermScorer: 开始对 {company_name}({stock_code}) 进行短线打分")
@@ -131,59 +135,54 @@ async def short_term_scorer(
 
 ## 评分体系（总分100分）
 
-请严格按照以下4个维度进行打分，每个维度必须有具体数据支撑：
+请严格按照以下5个维度进行打分，每个维度必须有具体数据支撑：
 
-### 1. 量价关系（满分30分）
-评估标准：
-- 成交量异动：近期是否出现明显放量/缩量（对比5/10日均量）
-- 量价配合：上涨放量、下跌缩量为健康；量价背离为隐患
-- 换手率：是否处于异常水平
-- 主力资金流向：近期主力是净流入还是净流出
+### 1. 技术状态（满分25分）
+评估: 均线排列(5/10/20日)、MACD金叉/死叉、RSI超买/超卖、关键K线形态、支撑阻力位
 
 打分参考：
-- 25-30分：量价关系健康，放量上涨/缩量回调，主力资金持续净流入
-- 18-24分：量价关系尚可，偶有背离但不严重
-- 10-17分：量价关系一般，存在一定背离
-- 0-9分：量价关系恶化，放量下跌/缩量上涨，资金持续流出
-
-### 2. 技术信号（满分25分）
-评估标准：
-- MACD：金叉/死叉状态，红绿柱趋势，DIF/DEA数值关系
-- RSI：是否在超买(>70)或超卖(<30)区域，趋势方向
-- K线形态：是否出现关键K线形态（如吞没、锤子线、十字星、突破形态）
-- 布林带：股价在布林带中的位置，是否面临突破
-
-打分参考：
-- 22-25分：多个技术指标发出明确买入信号
-- 16-21分：技术指标偏多，但信号不够强烈
+- 22-25分：均线多头排列，MACD金叉且红柱放大，RSI健康区间，关键突破形态
+- 16-21分：技术指标偏多，但信号不够强烈或存在个别矛盾
 - 8-15分：技术指标中性或存在矛盾信号
 - 0-7分：技术指标发出明确卖出信号
 
-### 3. 趋势动量（满分20分）
-评估标准：
-- 均线排列：5日/10日/20日均线的排列方向（多头/空头）
-- 趋势方向：短期趋势是上升/下降/横盘
-- 动量强度：近3日/5日涨跌幅，是否加速/减速
-- 关键价位：是否突破关键支撑/阻力位
+### 2. 量价/流动性（满分20分）
+评估: 成交量异动(相对20日均量)、量价配合(放量上涨/缩量回调)、换手率水平、流动性是否支持短线执行
 
 打分参考：
-- 18-20分：明确上升趋势，均线多头排列，动量强劲
-- 13-17分：趋势偏多但不够强势
-- 7-12分：趋势不明确或横盘
-- 0-6分：下降趋势，均线空头排列
+- 17-20分：量价配合完美，放量上涨缩量回调，流动性充裕支持短线进出
+- 12-16分：量价关系基本健康，偶有背离
+- 6-11分：量价关系一般，存在明显背离
+- 0-5分：量价严重背离，流动性枯竭
 
-### 4. 情绪资金（满分25分）
-评估标准：
-- 新闻情绪：近期新闻是利好还是利空
-- 市场关注度：投资者情绪是否积极
-- 板块效应：所属板块整体表现如何
-- 短期催化剂：是否有即将到来的事件驱动（如业绩公告、政策发布）
+### 3. 资金确认（满分20分）
+评估: 主力资金流向(融资融券/龙虎榜/大宗交易)、资金是否在确认技术信号、是否存在资金与技术背离
 
 打分参考：
-- 22-25分：情绪极度乐观，资金大量流入，有明确催化剂
-- 16-21分：情绪偏多，有一定资金关注
-- 8-15分：情绪中性，资金进出平衡
-- 0-7分：情绪悲观，资金持续流出
+- 17-20分：主力资金持续净流入，龙虎榜机构加持，资金与技术方向一致
+- 12-16分：资金面偏多，但力度不够或存在分歧
+- 6-11分：资金进出平衡，方向不明确
+- 0-5分：主力资金持续流出，存在资金与技术背离
+
+### 4. 事件催化（满分20分）
+评估: 近期事件催化剂(业绩预告/回购/重大合同)、事件时效与影响力、是否已被市场price-in
+
+打分参考：
+- 17-20分：有明确且未被price-in的重大利好催化剂，短期内有业绩/回购/合同落地
+- 12-16分：有中等利好事件催化，但市场已有部分预期
+- 6-11分：事件偏中性或影响力有限
+- 0-5分：无明确事件催化，或存在利空事件落地的风险
+
+### 5. 新闻叙事/情绪（满分15分）
+评估: 媒体情绪(利好/利空)、题材热度、板块共振效应
+
+打分参考：
+- 13-15分：媒体情绪积极，题材热度高，板块共振明显
+- 9-12分：情绪偏暖，有一定关注度
+- 5-8分：情绪中性，无明显利好/利空
+- 0-4分：负面舆情，题材退潮，板块低迷
+
+风险扣分：由后处理模块统一执行
 
 ## 综合评级标准
 
@@ -202,20 +201,28 @@ async def short_term_scorer(
 {{
     "score": 总分(0-100的整数),
     "sub_scores": {{
-        "volume_price": 量价关系得分(0-30的整数),
-        "technical_signal": 技术信号得分(0-25的整数),
-        "trend_momentum": 趋势动量得分(0-20的整数),
-        "sentiment_flow": 情绪资金得分(0-25的整数)
+        "technical_state": 技术状态得分(0-25),
+        "volume_liquidity": 量价流动性得分(0-20),
+        "capital_confirmation": 资金确认得分(0-20),
+        "event_catalyst": 事件催化得分(0-20),
+        "sentiment_narrative": 新闻叙事得分(0-15)
     }},
     "recommendation": "短线建议（强烈买入/买入/谨慎买入/观望/谨慎卖出/卖出/强烈卖出）",
     "reasoning": "打分核心理由（2-3句话，指出最关键的1-2个因素）",
     "risk_warning": "短线风险提示（1句话，指出最大风险点）",
     "data_basis": {{
-        "volume_price": "列出本维度评分依据的具体数据点",
-        "technical_signal": "列出本维度评分依据的具体数据点",
-        "trend_momentum": "列出本维度评分依据的具体数据点",
-        "sentiment_flow": "列出本维度评分依据的具体数据点"
+        "technical_state": "列出本维度评分依据的具体数据点",
+        "volume_liquidity": "列出本维度评分依据的具体数据点",
+        "capital_confirmation": "列出本维度评分依据的具体数据点",
+        "event_catalyst": "列出本维度评分依据的具体数据点",
+        "sentiment_narrative": "列出本维度评分依据的具体数据点"
     }},
+    "key_drivers": [],
+    "risk_flags": [],
+    "abstain": false,
+    "abstain_reason": "",
+    "data_quality_score": 0.0,
+    "confidence": 0.0,
     "data_reliability": "数据可靠性(高/中/低)，注明哪些基于直接数据，哪些基于推断",
     "suggested_action": "具体操作建议（1-2句话，含止损价位参考）"
 }}
@@ -230,6 +237,12 @@ async def short_term_scorer(
 6. 输出必须是纯JSON，不要包含markdown代码块标记
 """
 
+        # 优先注入结构化分析上下文
+        if analysis_package and hasattr(analysis_package, 'compact_prompt_context'):
+            structured_context = analysis_package.compact_prompt_context
+        else:
+            structured_context = ""
+
         user_prompt = f"""请对以下股票进行短线投资打分：
 
 公司名称：{company_name}
@@ -237,6 +250,9 @@ async def short_term_scorer(
 {"行业：" + detected_industry if detected_industry else "（行业待识别）"}
 
 """
+        if structured_context:
+            user_prompt += f"## 结构化分析摘要（优先参考）\n{structured_context}\n\n"
+
         if technical_analysis:
             user_prompt += f"## 技术分析数据\n{technical_analysis}\n\n"
         else:
@@ -246,6 +262,12 @@ async def short_term_scorer(
             user_prompt += f"## 新闻分析数据\n{news_analysis}\n\n"
         else:
             user_prompt += "## 新闻分析数据\n（暂无数据）\n\n"
+
+        if event_analysis:
+            user_prompt += f"## 事件分析数据\n{event_analysis}\n\n"
+
+        if moneyflow_analysis:
+            user_prompt += f"## 资金面分析数据\n{moneyflow_analysis}\n\n"
 
         user_prompt += f"""
 请严格按照系统提示中的评分体系和JSON格式输出打分结果。

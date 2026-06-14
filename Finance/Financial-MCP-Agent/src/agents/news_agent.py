@@ -160,21 +160,26 @@ async def news_agent(state: AgentState) -> AgentState:
             current_data["news_analysis"] = cached
             current_metadata["news_agent_executed"] = True
             current_metadata["news_agent_cached"] = True
-            from src.utils.analysis_package_builder import text_to_signal_pack
-            import re, json
-            # Try to re-extract SIGNAL_PACK from cached LLM output
-            sp = None
-            tag_match = re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', cached)
-            if tag_match:
-                try:
-                    sp = json.loads(tag_match.group(1))
-                    sp["agent_name"] = "news"
-                    sp["as_of_date"] = cache_date
-                except Exception:
-                    pass
-            if sp is None:
-                sp = text_to_signal_pack(cached, "news", cache_date)
-            current_data["news_signal_pack"] = sp
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("news_analysis", cache_code, cache_date)
+            if cached_sp:
+                current_data["news_signal_pack"] = cached_sp
+            else:
+                from src.utils.analysis_package_builder import text_to_signal_pack
+                import re, json
+                # Try to re-extract SIGNAL_PACK from cached LLM output
+                sp = None
+                tag_match = re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', cached)
+                if tag_match:
+                    try:
+                        sp = json.loads(tag_match.group(1))
+                        sp["agent_name"] = "news"
+                        sp["as_of_date"] = cache_date
+                    except Exception:
+                        pass
+                if sp is None:
+                    sp = text_to_signal_pack(cached, "news", cache_date)
+                current_data["news_signal_pack"] = sp
             return {"data": current_data,
                     "messages": current_messages + [{"role": "assistant", "content": "新闻分析已完成（缓存）"}],
                     "metadata": current_metadata}
@@ -421,6 +426,9 @@ async def news_agent(state: AgentState) -> AgentState:
     current_data["news_analysis"] = final_output
     if not skip_cache and cache_date and cache_code:
         write_cache("news_analysis", cache_code, cache_date, final_output)
+        if "news_signal_pack" in current_data:
+            from src.utils.cache_utils import write_signal_pack_cache
+            write_signal_pack_cache("news_analysis", cache_code, cache_date, current_data["news_signal_pack"])
     current_metadata["news_agent_executed"] = True
     current_metadata["news_agent_timestamp"] = str(time.time())
 

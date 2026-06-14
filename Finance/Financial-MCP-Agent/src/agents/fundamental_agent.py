@@ -166,6 +166,12 @@ async def fundamental_agent(state: AgentState) -> AgentState:
         if cached:
             logger.info(f"{SUCCESS_ICON} FundamentalAgent: 命中缓存，跳过分析 ({cache_code})")
             current_data["fundamental_analysis"] = cached
+            from src.utils.cache_utils import read_signal_pack_cache
+            cached_sp = read_signal_pack_cache("fundamental_analysis", cache_code, cache_date)
+            if cached_sp:
+                current_data["fundamental_signal_pack"] = cached_sp
+            else:
+                current_data["fundamental_signal_pack"] = _extract_signal_pack_from_llm(cached, "fundamental", cache_date)
             current_metadata["fundamental_agent_executed"] = True
             current_metadata["fundamental_agent_cached"] = True
             return {"data": current_data,
@@ -544,6 +550,9 @@ async def fundamental_agent(state: AgentState) -> AgentState:
         current_data["fundamental_analysis"] = final_output
         if not skip_cache and cache_date and cache_code:
             write_cache("fundamental_analysis", cache_code, cache_date, final_output)
+            if "fundamental_signal_pack" in current_data:
+                from src.utils.cache_utils import write_signal_pack_cache
+                write_signal_pack_cache("fundamental_analysis", cache_code, cache_date, current_data["fundamental_signal_pack"])
         current_metadata["fundamental_agent_executed"] = True
         current_metadata["fundamental_agent_timestamp"] = str(time.time())
         current_metadata["fundamental_agent_execution_time"] = f"{total_time:.2f} seconds"

@@ -211,6 +211,24 @@ def _extract_risks(text: str) -> List[str]:
     return _extract_bullet_list(text, section_kw)
 
 
+def _extract_bias_from_text(text: str) -> str:
+    """Extract directional bias (bullish/bearish/neutral) from agent output text."""
+    if not text or not isinstance(text, str):
+        return "neutral"
+    t = text[:3000]
+    bullish_kw = ["看多", "利多", "利好", "买入", "增持", "推荐", "改善", "增长强劲", "超预期", "积极向好",
+                   "优秀", "优异", "突出", "领先", "稳健", "优质", "强劲"]
+    bearish_kw = ["看空", "利空", "利淡", "卖出", "减持", "恶化", "下滑", "风险较高", "谨慎", "质疑",
+                   "不佳", "平庸", "落后", "差", "波动大", "回撤"]
+    bull = sum(1 for kw in bullish_kw if kw in t)
+    bear = sum(1 for kw in bearish_kw if kw in t)
+    if bull > bear:
+        return "bullish"
+    elif bear > bull:
+        return "bearish"
+    return "neutral"
+
+
 def _extract_profile(text: str) -> Dict[str, str]:
     """Extract structured fund profile fields from fund_product_doc output.
 
@@ -649,6 +667,40 @@ async def fund_merge_node(state: AgentState) -> Dict[str, Any]:
             f"  FundMergeNode: {present_count}/{len(AGENT_KEYS)} 个基金分析Agent有实质输出"
         )
 
+        # ---- Step 1.5: Read signal_packs and build per-agent normalized data ----
+        # Prefer signal_pack structured data over regex extraction (F2)
+        signal_packs_all: Dict[str, dict] = {}
+        per_agent_analysis: Dict[str, Dict[str, Any]] = {}
+        for agent_key in AGENT_KEYS:
+            sp_key = f"{agent_key}_signal_pack"
+            sp = data.get(sp_key, None)
+            text = agent_outputs.get(agent_key, "")
+
+            agent_norm: Dict[str, Any] = {
+                "bias": "neutral",
+                "confidence": DEFAULT_CONFIDENCE,
+                "key_points": [],
+                "source_level": "derived",
+                "data_quality_score": 0.3,
+                "risk_flags": [],
+            }
+
+            if sp and isinstance(sp, dict) and sp:
+                signal_packs_all[agent_key] = sp
+                agent_norm["bias"] = sp.get("bias", _extract_bias_from_text(text))
+                agent_norm["confidence"] = float(sp.get("confidence", _extract_confidence(text)))
+                agent_norm["key_points"] = sp.get("key_points", [])
+                agent_norm["source_level"] = sp.get("source_level", "derived")
+                agent_norm["data_quality_score"] = float(sp.get("data_quality_score", 0.5))
+                agent_norm["risk_flags"] = sp.get("risk_flags", [])
+            else:
+                # Fallback: extract from raw text via regex
+                agent_norm["bias"] = _extract_bias_from_text(text)
+                agent_norm["confidence"] = _extract_confidence(text)
+                agent_norm["key_points"] = (_extract_strengths(text) + _extract_risks(text))[:5]
+
+            per_agent_analysis[agent_key] = agent_norm
+
         # ---- Step 2: Extract normalized sub-scores ----
         sub_scores: Dict[str, int] = {}
         score_key_map = {
@@ -700,6 +752,21 @@ async def fund_merge_node(state: AgentState) -> Dict[str, Any]:
         # ---- Step 5: Detect conflicts ----
         conflicts = _detect_conflicts(agent_outputs)
 
+        # ---- Step 5b: Bias-based conflict detection (F3) ----
+        biases: Dict[str, List[str]] = {}
+        for agent_key in AGENT_KEYS:
+            bias = per_agent_analysis.get(agent_key, {}).get("bias", "neutral")
+            if bias != "neutral":
+                biases.setdefault(bias, []).append(agent_key)
+
+        if "bullish" in biases and "bearish" in biases:
+            conflicts.append({
+                "type": "bias_conflict",
+                "bullish_agents": biases.get("bullish", []),
+                "bearish_agents": biases.get("bearish", []),
+                "note": "看多和看空agent存在方向性冲突",
+            })
+
         # ---- Step 6: Build holding period hints ----
         holding_hints = _build_holding_hints(agent_outputs)
 
@@ -714,6 +781,27 @@ async def fund_merge_node(state: AgentState) -> Dict[str, Any]:
             profile, strengths_pool, risks_pool, holding_hints
         )
 
+        # ---- Step 9.5: Source-level weighted confidence (F4) ----
+        source_weights: Dict[str, float] = {
+            "official_like": 1.0, "structured": 0.9, "news": 0.6,
+            "derived": 0.4, "proxy": 0.2,
+        }
+        weighted_scores: List[tuple] = []
+        for agent_key in ["fund_product_doc", "fund_perf_risk", "fund_holdings"]:
+            agent_norm = per_agent_analysis.get(agent_key, {})
+            confidence = agent_norm.get("confidence", 0.5)
+            bias = agent_norm.get("bias", "neutral")
+            bias_score = {"bullish": 100, "neutral": 50, "bearish": 0}.get(bias, 50)
+            source_level = agent_norm.get("source_level", "derived")
+            weight = source_weights.get(source_level, 0.5)
+            weighted_scores.append((bias_score, confidence * weight))
+
+        evidence_weighted_bias: float = 50.0
+        if weighted_scores:
+            total_weight = sum(w for _, w in weighted_scores)
+            if total_weight > 0:
+                evidence_weighted_bias = sum(s * w for s, w in weighted_scores) / total_weight
+
         # ---- Step 10: Assemble final package ----
         fund_analysis_package: Dict[str, Any] = {
             "fund_profile": profile,
@@ -726,6 +814,9 @@ async def fund_merge_node(state: AgentState) -> Dict[str, Any]:
             "missing_data_summary": missing_data_summary,
             "frontend_ready_tags": frontend_tags,
             "raw_agent_outputs": agent_outputs,  # Preserve original text for report agent
+            "signal_packs": signal_packs_all,  # F2: pass signal_packs to downstream (risk_gate, scorer)
+            "per_agent_analysis": per_agent_analysis,  # F2: normalized per-agent bias/confidence/key_points
+            "evidence_weighted_bias": evidence_weighted_bias,  # F4: source-weighted bias score
         }
 
         # ---- Step 11: Log summary ----

@@ -392,6 +392,29 @@ async def fund_scoring_agent(
         if "frontend_blocks" not in score_data or not score_data["frontend_blocks"]:
             score_data["frontend_blocks"] = _generate_frontend_blocks(score_data)
 
+        # ── 应用基金风控门（F1: fund risk gate）──
+        from src.utils.fund_risk_gate import apply_fund_risk_gate
+        signal_packs = fund_analysis_package.get("signal_packs", {})
+        overall_score = score_data.get("overall_score", {})
+        original_score = int(overall_score.get("score", 50))
+
+        gate = apply_fund_risk_gate(signal_packs, fund_analysis_package, original_score)
+        if gate.score_cap is not None:
+            capped = min(overall_score.get("score", 50), gate.score_cap)
+            score_data["overall_score"]["score"] = capped
+            # Downgrade rating label to match capped score
+            score_data["overall_score"]["rating_label"] = _score_to_label(capped)
+            score_data["overall_score"]["investment_view"] = _score_to_investment_view(capped)
+        score_data["risk_gate"] = {
+            "risk_level": gate.risk_level,
+            "risk_flags": gate.risk_flags_found,
+            "score_cap": gate.score_cap,
+            "action_downgrade": gate.action_downgrade,
+            "abstain": gate.abstain,
+            "abstain_reason": gate.abstain_reason,
+            "warnings": gate.warnings,
+        }
+
         total_time = time.time() - agent_start_time
 
         execution_logger.log_llm_interaction(

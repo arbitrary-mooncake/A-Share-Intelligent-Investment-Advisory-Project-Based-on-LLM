@@ -4,269 +4,223 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## Project Overview
 
-A stock investment advisor agent system for A-share (Chinese stock market) analysis. Uses LangGraph for multi-agent workflow orchestration, MCP (Model Context Protocol) for data access, and LLMs for analysis/scoring. Runs on Linux/WSL and Windows.
+A stock investment advisor agent system for A-share (Chinese stock market) and fund/ETF analysis. Uses LangGraph for multi-agent workflow orchestration, MCP (Model Context Protocol) for data access, and LLMs for analysis/scoring. Runs on Linux/WSL and Windows.
 
 ## Architecture
 
 ### Two-Layer Architecture
 
-**Layer 1: A-Share MCP Server** (`Finance/a-share-mcp-is-just-i-need/`)
-- FastMCP server over stdio; 8 tool categories for stock data
-- Composite data source: `BaostockDataSource` (primary) → `AkshareDataSource` (fallback)
-- Fallback triggered by `NoDataFoundError`, `DataSourceError`, or unexpected exceptions
-- Entry: `python mcp_server.py`
+**Layer 1: MCP Servers** (`Finance/a-share-mcp-server/`)
+- `tushare_mcp_server.py` — Tushare MCP server (primary data source, all agents use Tushare tools)
+- `mcp_server.py` — Legacy AKshare MCP server (minimal use, being phased out)
+- Both run over stdio via FastMCP; in-memory tool-level cache (5-min TTL)
 
 **Layer 2: Financial MCP Agent** (`Finance/Financial-MCP-Agent/`)
-- Consumes MCP server via `langchain-mcp-adapters` (`MultiServerMCPClient`)
-- LangGraph workflows orchestrate 4 analysis agents + 1 summarizer (single stock) or 3 scorers (stock pool)
-- LLM calls via OpenAI-compatible API configured in `.env`
+- Consumes MCP servers via `langchain-mcp-adapters` (`MultiServerMCPClient`)
+- LangGraph workflows orchestrate analysis → scoring/report pipelines
+- LLM calls via OpenAI-compatible API (5-model architecture in `.env`)
 
-### LangGraph Workflows
+### A-Stock Pipeline (v2 — 2026-06 upgrade)
 
 **Single-stock analysis** (`src/main.py`):
 ```
-start_node → [fundamental, technical, value, news] (4 parallel) → summarizer → END
+start_node → [fundamental, technical, value, news, event, quality_risk, moneyflow] (7 parallel)
+          → summarizer → Markdown + PDF report (9-section format)
 ```
 
 **Stock pool scoring** (`src/stock_pool/scoring_engine.py`):
 ```
-start_node → [fundamental, technical, value, news] (4 parallel) → [short, medium, long_term_scorer] (3 parallel after deps met) → END
+start_node → [7 agents parallel]
+  short_term_scorer  ← [technical, news, event, moneyflow] (4 agents only — streaming)
+  medium_term_scorer ← [all 7]
+  long_term_scorer   ← [all 7]
+          → risk_gate post-processing → stock_pool.json
 ```
 
-Scorer dependency rules built into edges:
-- `short_term_scorer`: waits for `technical_analyst` + `news_analyst` only
-- `medium_term_scorer` / `long_term_scorer`: wait for all 4 analysis agents
+### Fund Analysis Pipeline (v2 — 2026-06 upgrade)
+
+```
+start_node → [fund_product_doc, fund_perf_risk, fund_holdings, fund_manager,
+              fund_benchmark, fund_fee, fund_event] (7 parallel)
+          → fund_merge_node (non-LLM, reads signal_packs + regex fallback)
+              ├── fund_report_agent
+              └── fund_scoring_agent → fund_risk_gate
+```
+
+### Structured Evidence Architecture (shared by both pipelines)
+
+Each analysis agent outputs TWO artifacts into `state.data`:
+1. **Text analysis** (`{agent}_analysis`): Natural language, backward-compatible
+2. **Signal pack** (`{agent}_signal_pack`): Structured JSON with `bias`, `confidence`, `signals[]` (factor/direction/strength/source_level), `risk_flags[]`, `missing_data[]`
+
+A-stock agents merge via `analysis_package_builder.py` → `AnalysisPackage` (conflict detection, source priority, compact context). Fund agents merge via `fund_merge_node.py` (signal_pack preferred, regex fallback, bias conflict detection, source-weighted scoring).
 
 ### Agent State
 
-Defined in `src/utils/state_definition.py` as `AgentState` TypedDict with three keys:
-- `messages`: `Annotated[Sequence[BaseMessage], operator.add]` — LangChain message history
-- `data`: `Annotated[Dict[str, Any], merge_dicts]` — analysis outputs from each agent
-- `metadata`: `Annotated[Dict[str, Any], merge_dicts]` — execution metadata
+`src/utils/state_definition.py` defines `AgentState` TypedDict:
+- `messages`: `Annotated[Sequence[BaseMessage], operator.add]` — append-only
+- `data`: `Annotated[Dict[str, Any], merge_dicts]` — shallow merge (safe for parallel writes)
+- `metadata`: `Annotated[Dict[str, Any], merge_dicts]`
 
-Each analysis agent writes to `state.data.{fundamental_analysis, technical_analysis, value_analysis, news_analysis}`. Scorers read these and write to `state.data.{short_term_score, medium_term_score, long_term_score}`. The `merge_dicts` reducer ensures parallel writes don't clobber each other.
+Key data fields (v2): `{agent}_analysis` + `{agent}_signal_pack` (7 agents × 2), `analysis_package`, `short/medium/long_term_score` (each with embedded `risk_gate`).
 
-### State Data Flow for Scoring
+## A-Stock Agents (11 total)
 
-```
-initial state (stock_code, company_name, query, dates)
-  → 4 analysis agents write str outputs to data.{*}_analysis
-  → scoring_nodes.py wrappers extract analysis strings, call scorer functions
-  → scorers return Dict with: score, sub_scores, rating, reasoning, risk_warning, suggested_action, time_horizon
-  → wrappers write to data.{short,medium,long}_term_score
-  → ScoringEngine reads final state, updates StockPoolManager
-```
+| Agent | Model | Thinking | Mode | Role |
+|-------|-------|----------|------|------|
+| **fundamental** | M1 MiMo-V2.5-Pro | ✅ | Two-phase (fetch→LLM) | Profit quality, cash flow, balance sheet health, growth |
+| **technical** | M3 Qwen3.7-Plus | ❌ | ReAct Agent | Price trends, volume-price, indicators (MACD/RSI/MA) |
+| **value** | M1 MiMo-V2.5-Pro | ✅ | Two-phase | Industry-relative PE/PB, historical percentile, safety margin |
+| **news** | M3 Qwen3.7-Plus | ✅ | Multi-source→LLM | Media sentiment, narrative strength (NOT factual events) |
+| **event** | M3 Qwen3.7-Plus | ✅ | Two-phase | Catalysts: earnings, buybacks, M&A, penalties, pledges |
+| **quality_risk** | M1 MiMo-V2.5-Pro | ✅ | Two-phase | Cash flow quality, goodwill/impairment, governance, risk flags |
+| **moneyflow** | M3 Qwen3.7-Plus | ✅ | Two-phase | Margin trading, block trades, top list, volume confirmation |
+| **short_term_scorer** | M3 Qwen3.7-Plus | ✅ | Direct LLM | Depends on 4 agents; weights: tech(25), volume(20), capital(20), event(20), sentiment(15) |
+| **medium_term_scorer** | M1 MiMo-V2.5-Pro | ✅ | Direct LLM | Depends on all 7; weights: fundamental(20), valuation(15), quality(20), event(15), tech(10), industry(10), sentiment(10) |
+| **long_term_scorer** | M1 MiMo-V2.5-Pro | ✅ | Direct LLM | Depends on all 7; weights: returns(25), quality(20), valuation(15), moat(15), capital(10), policy(10), tech(5) |
+| **summary_agent** | M1 MiMo-V2.5-Pro | ✅ | Direct LLM | 9-section report: conclusion→signal overview→bullish→bearish→timeline→S/M/L judgment→risks→confidence→disclaimer |
 
-### Scorer Outputs
+### Scoring Risk Gate
 
-All 3 scorers return the same shape. Medium/long add `moat_type`:
-```python
-{"score": int, "sub_scores": {"fundamental_quality": int, ...}, "rating": str,
- "reasoning": str, "risk_warning": str, "suggested_action": str, "time_horizon": str}
-```
+`src/utils/risk_gate.py` applies 4 post-scoring rules:
+1. Critical risk flags → score cap + action downgrade (audit_risk=60, delist_risk=50, etc.)
+2. News-only narrative with no factual support → cap at 55 for medium/long
+3. ≥2 missing agents + data_quality < 0.4 → abstain
+4. Short-term liquidity issues → cap at 50
 
-### Scoring Frameworks (all out of 100)
+Score cap is enforced in `scoring_nodes.py` via `min(score, gate.score_cap)`.
 
-| | Short (1-5 days) | Medium (1-3 months) | Long (1-3 years) |
-|---|---|---|---|
-| **Depends on** | technical + news only | all 4 agents | all 4 agents |
-| **Top weights** | 量价关系 30, 情绪资金 25, 技术信号 25 | 基本面质量 25, 估值 20, 风险 15 | 商业护城河 30, 行业景气 15, 估值安全边际 12 |
-| **thinking mode** | enabled | enabled | enabled |
-| **max_tokens** | 16000 | 16000 | 16000 |
+### Evidence Priority (source_level)
 
-### Industry-Adaptive Scoring
+`official_like` (正式公告) > `structured` (数值工具) > `news` (媒体) > `derived` (推断) > `proxy` (代理).
+When `news` conflicts with `event`, `event` wins. Reports must surface conflicts.
 
-`src/utils/industry_knowledge.py` contains 32 Shenwan (申万) industry benchmarks. Each scorer calls `identify_industry()` to auto-detect the stock's industry from analysis text, then injects industry-specific PE/PB medians, typical ROE/growth rates, and scoring guidance into the LLM prompt. This ensures cross-industry fair scoring — e.g., bank stocks aren't penalized for naturally low PE.
+## Fund Agents (10 total)
 
-### Stock Pool Manager Data Architecture
+| Agent | Model | Thinking | Role |
+|-------|-------|----------|------|
+| fund_product_doc | M3 Qwen3.7-Plus | ✅ | Fund type, benchmark, strategy |
+| fund_perf_risk | M1 MiMo-V2.5-Pro | ✅ | NAV performance, drawdown, risk metrics |
+| fund_holdings | M1 MiMo-V2.5-Pro | ✅ | Portfolio composition, concentration |
+| fund_manager | M3 Qwen3.7-Plus | ✅ | Manager experience, style, stability |
+| fund_benchmark | M3 Qwen3.7-Plus | ✅ | Tracking error, style drift |
+| fund_fee | M3 Qwen3.7-Plus | ✅ | Fee structure vs peers |
+| fund_event | M3 Qwen3.7-Plus | ✅ | Fund news, manager changes, dividends |
+| fund_merge_node | — (non-LLM) | — | Merges 7 outputs into `fund_analysis_package` |
+| fund_scoring_agent | M1 MiMo-V2.5-Pro | ✅ | Scores on 6 dimensions; applies `fund_risk_gate` |
+| fund_report_agent | M1 MiMo-V2.5-Pro | ✅ | Generates markdown fund report |
 
-`src/stock_pool/stock_pool_manager.py` maintains three independent per-term pools in `stock_pool.json`:
-```json
-{"pools": {"short": {"stocks": {}}, "medium": {"stocks": {}}, "long": {"stocks": {}}}}
-```
-Each stock entry: `stock_code, company_name, score, recommendation, term_score, last_updated, status, score_history[]`. Status progresses: `pending → scoring → scored/failed`. The `list_stocks()` and `get_stock()` methods merge across pools for CLI backward compatibility.
+### Fund Risk Gate
+
+`src/utils/fund_risk_gate.py`: 10 fund-specific risk flags (manager_just_changed=55, frequent_manager_change=50, tiny_fund_size=55, etc.). Applied in `fund_scoring_agent.py`.
+
+## Shared Infrastructure
+
+### All agents have these capabilities:
+
+| Capability | Mechanism |
+|------------|-----------|
+| **Structured JSON output** | `<SIGNAL_PACK>` tag in LLM prompt → 3-layer extraction (tag→regex→text fallback) |
+| **MCP tool-level cache** | `src/utils/tool_cache.py`: 5-min in-memory cache, MD5 keys, asyncio.Lock, 500-entry cap |
+| **Data retry** | `src/utils/fetch_utils.py`: `retry_failed_fetches()` (3 rounds, 8→4→2 concurrency) with `alt_kwargs_list` for fallback queries |
+| **Signal pack cache persistence** | `cache_utils.py`: `read/write_signal_pack_cache()` alongside text cache |
+| **Anti-hallucination** | Two-zone output (📊数据事实区 / 🔍分析判断区), `[数据]`/`[判断]` tags, graded missing-data language |
+| **Industry knowledge** | `src/utils/industry_knowledge.py` (25 Shenwan industries), `src/utils/fund_type_knowledge.py` (ETF/MM/bond/hybrid/equity/QDII) |
+
+### Anti-Hallucination Patterns
+
+- Analysis agents: `📊 数据事实区` (only tool-returned data) + `🔍 分析判断区` (labeled as `【基于数据的推断】` or `【行业知识补充】`)
+- Scorers: Graded missing-data language — "无法评估" (core missing, ≤40pts), "基于不完整数据" (partial, ≤65pts), "存在数据缺口" (minor)
+- Summarizer: Every statement tagged `[数据]` or `[判断]`, must declare conflicts, must have counter-evidence
+
+### Cache TTL
+
+| Agent | TTL | Rationale |
+|-------|-----|-----------|
+| fundamental_analysis | 15 days | Quarterly data |
+| value_analysis | 7 days | Valuation framework stable |
+| quality_risk_analysis | 7 days | Quarterly financial quality |
+| technical_analysis | 1 day | Daily price changes |
+| news_analysis | 1 day | News timeliness |
+| event_analysis | 1 day | Event freshness |
+| moneyflow_analysis | 1 day | Daily market data |
+
+Cache hit restores both text AND structured signal_pack (via `read_signal_pack_cache` → fallback re-extraction from cached LLM text).
 
 ## Commands
 
 All commands run from `Finance/Financial-MCP-Agent/`.
 
 ### Setup
-
-**Windows first time**: `setup.bat` (creates venv, installs deps)
+**Windows first time**: `setup.bat`
 **Linux/WSL**: `cd Finance && pip install -r requirements.txt && cd Financial-MCP-Agent && cp .env.example .env`
 
 ### Web UI
 ```bash
-# Linux/WSL
-./run.sh start|stop|status|restart
-
-# Windows PowerShell
-.\run.ps1 start|stop|status|restart
-
-# Windows CMD
-run.bat start|stop|status|restart
-
-# Windows desktop shortcut (end-user launcher)
-# Shortcut runs: powershell -ExecutionPolicy Bypass -NoExit -File launch.ps1
-# Or double-click launch.bat
-# Press Enter to stop all services
-
-# Manual:
-uvicorn src.api.app:app --host 127.0.0.1 --port 8000
-streamlit run src/app/Home.py --server.port 8501
+./run.sh start|stop|status|restart   # Linux/WSL
+.\run.ps1 start|stop|status|restart  # Windows PowerShell
+run.bat start|stop|status|restart    # Windows CMD
 ```
 
-### CLI (Terminal Mode)
+### CLI
 ```bash
-python -m src.main                          # Single-stock analysis, interactive
-python -m src.main --command "分析嘉友国际"   # Single-stock, CLI arg
-python -m src.main_pool                     # Stock pool management, interactive
-python -m src.main_pool add 603871 嘉友国际  # Add stock (default: medium-term pool)
-python -m src.main_pool score 603871        # Score a stock (all 3 terms)
-python -m src.main_pool score-all           # Score all pending stocks
-python -m src.main_pool list                # List all stocks
-python -m src.main_pool report 603871       # View score details
+python -m src.main --command "分析嘉友国际"     # Single-stock analysis
+python -m src.main_pool add 603871 嘉友国际    # Add to pool (default: medium)
+python -m src.main_pool score 603871          # Score (all 3 terms)
+python -m src.main_pool report 603871         # View score details
+python -m src.fund_main --command "分析华夏上证50ETF"  # Fund analysis
 ```
 
-### Logs
+### Testing
 ```bash
-python -m src.utils.log_viewer --list            # List execution logs
-python -m src.utils.log_viewer --show <exec_id>  # Show detailed log
+python -m pytest tests/ -v                          # All tests
+python -m pytest tests/test_analysis_package.py -v  # Schema + builder
+python -m pytest tests/test_risk_gate.py -v         # Risk gate rules
 ```
 
 ## Environment Variables
 
-`.env` file (see `.env.example`). Four-model architecture managed by `src/utils/model_config.py`:
+`.env` file. Five-model architecture via `src/utils/model_config.py`:
 
-| Model | Env Var Suffix | Default Model | Used By |
-|-------|-----------|--------------|---------|
-| Model 1 | (none) | MiMo-V2.5-Pro | summary_agent, medium/long_term_scorer (thinking enabled) |
-| Model 2 | `_2` | Qwen3.6-Flash | Quick query, quick-screen pool, batch scoring (thinking disabled) |
-| Model 3 | `_3` | Qwen3.6-Plus | technical_agent, news_agent, short_term_scorer |
-| Model 4 | `_4` | Kimi K2.6 | fundamental_agent, value_agent |
+| Model | Suffix | Default Model | Used By |
+|-------|--------|---------------|---------|
+| M1 | (none) | MiMo-V2.5-Pro | summary, medium/long scorer, fund scorer/report/perf/holdings, fundamental, value, quality_risk |
+| M2 | `_2` | Qwen3.6-Flash | Quick query, quick-screen, batch scoring |
+| M3 | `_3` | Qwen3.7-Plus | technical, news, short scorer, event, moneyflow, fund manager/event/fee/doc/benchmark |
+| M4 | `_4` | (unused — migrated to M1) | Previously Kimi K2.6 for fundamental/value |
+| M5 | `_5` | MiMo-V2.5 | qa_engine; complex → M1 (qa_engine_pro) |
 
-Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}`, `OPENAI_COMPATIBLE_MODEL{_N}`. Model selection per agent is centralized in `src/utils/model_config.py`. Direct usage (like `app.py` quick-screen) passes env vars explicitly and sets `env_prefix=""`.
+Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}`, `OPENAI_COMPATIBLE_MODEL{_N}`.
+`get_thinking_body()` handles DashScope (`enable_thinking`) vs OpenAI-compatible (`thinking.type`) parameter formats.
 
-- `GEMINI_API_KEY` / `GEMINI_MODEL` — legacy fallback (GeminiClient)
-- `USE_LOCAL_MODEL` — set to `api`
+## Key Utility Modules
 
-The LLM client factory in `src/utils/llm_clients.py` auto-detects which client to use. `OpenAICompatibleClient` supports `extra_body` for thinking mode control and `env_prefix` for multi-key switching.
+- `src/utils/analysis_schema.py` — Signal, SignalPack, AnalysisPackage, RiskGateResult dataclasses; SourceLevel enum; FALLBACK_SIGNAL_PACK
+- `src/utils/analysis_package_builder.py` — Merges 7 signal_packs into AnalysisPackage: conflict detection, source priority sorting, compact_prompt_context generation
+- `src/utils/risk_gate.py` — 4-rule post-scoring risk gate for A-stock
+- `src/utils/fund_risk_gate.py` — 10-rule risk gate for fund scoring
+- `src/utils/tool_cache.py` — In-memory MCP tool result cache (5-min TTL, asyncio.Lock, 500-entry cap)
+- `src/utils/cache_utils.py` — File-based intermediate cache with per-agent TTL; `read/write_signal_pack_cache()`
+- `src/utils/fetch_utils.py` — `retry_failed_fetches()` with `alt_kwargs_list` support
+- `src/utils/model_config.py` — Centralized agent→model mapping; `get_model_config_for_agent()`, `get_thinking_body()`
+- `src/utils/industry_knowledge.py` — 25 Shenwan industry PE/PB/ROE benchmarks
+- `src/utils/fund_type_knowledge.py` — Fund-type-specific scoring guidance
+- `src/utils/tushare_client.py` — Tushare API wrappers (stock_info, daily_basic, fina_indicator, PE percentile, etc.)
+- `src/stock_pool/stock_pool_manager.py` — 5 per-term pools (short/medium/long/quick_screen/fine) in `stock_pool.json`
 
-## Frontend
+## Anti-Patterns to Avoid
 
-FastAPI (`src/api/app.py`) + Streamlit (`src/app/Home.py` → pages/). REST endpoints:
-- `POST /api/query` — quick stock lookup (Tencent/Sina HTTP data + LLM analysis, uses Model 2)
-- `POST /api/report`, `GET /api/report/{task_id}` — async deep report generation (full LangGraph pipeline, 35-min timeout)
-- `GET/POST/DELETE /api/pool/{term}` — CRUD per-term stock pool (term: short/medium/long/quick_screen)
-- `POST /api/score/{term}/{stock_code}` — trigger full pipeline scoring
-- `POST /api/quick-screen/score/{term}/{stock_code}` — quick-screen scoring (HTTP+LLM, bypasses MCP ReAct)
-- `POST /api/batch-score/upload` — upload Excel, start batch scoring
-- `GET /api/batch-score/{id}/progress`, `GET /api/batch-score/{id}/results` — batch job polling
-- `GET /api/cache/{stock_code}`, `GET /api/health`
-
-Intermediate cache at `data/intermediate_cache/` with 7-day sliding window.
-
-Streamlit pages (import `src/app/` into `sys.path`):
-- `src/app/Home.py` — navigation hub
-- `src/app/pages/01_股票查询.py` — quick stock lookup (real-time data + LLM analysis)
-- `src/app/pages/02_股票池.py` — stock pool management (add/remove/score across 4 pool terms)
-- `src/app/pages/03_批量打分.py` — batch scoring UI (Excel upload, progress, color-coded results table)
-- `src/app/config.py` — API URL, timeouts (including batch upload timeout ~900s)
-- `src/app/api_client.py` — async httpx wrappers
-- `src/app/components/` — reusable UI (query_form, result_card, pool_table, score_display, quick_screen_table, batch_progress)
-
-Per-tab `st.session_state` keys are scoped per-term: `_pool_action_result_{short,medium,long}` to prevent cross-tab contamination.
-
-## Batch Scoring (批量打分)
-
-Upload an Excel file (stock codes + names, up to 500-1000 stocks). Backend classifies all stocks into a 5-level recommendation tier in ~8 min for 500 stocks.
-
-### Architecture
-
-```
-Excel Upload → Parse → Stage 1: Parallel Data Fetch (Semaphore 6)
-  → Stage 2: Batched LLM Scoring (5 stocks/call, Semaphore 5, Model 2, no thinking)
-  → Results persistence → Frontend polling (2-3s interval)
-```
-
-Key files:
-- `src/api/batch_scorer.py` — orchestrator (parse_excel, lookup_names, fetch_batch, score_batch, chunk_stocks)
-- `src/app/pages/03_批量打分.py` — Streamlit upload page
-- `src/app/components/batch_progress.py` — progress display
-
-### Endpoints
-
-- `POST /api/batch-score/upload` — upload .xlsx, start job (horizon: short/medium/long/all)
-- `GET /api/batch-score/{id}/progress` — polling (fetched_count, scored_count, progress_pct)
-- `GET /api/batch-score/{id}/results` — live results (returns data as available, not just at completion)
-
-### 5-Level Output
-
-```json
-{"code": "sh.603871", "level": "强烈推荐", "confidence": "高",
- "reason": "低估值+高ROE+行业景气(30字内)", "risk": "原材料涨价风险(30字内)"}
-```
-
-Levels: 强烈推荐 → 推荐 → 中性 → 回避 → 卖出. Color mapping: green/teal/yellow/orange/red.
-
-### Three Scoring Paths (Summary)
-
-| Path | Latency | Purpose |
-|------|---------|---------|
-| Full Pipeline (LangGraph + MCP ReAct) | 10-40 min/stock | Definitive pool decisions |
-| Quick-Screen (HTTP + direct LLM) | 1-5 min/stock | Fast pool pre-screening |
-| Batch (parallel HTTP + batched LLM) | ~1s/stock amortized | Mass initial screening |
-
-### Excel Format
-
-| 股票代码 | 股票名称 |
-|---------|---------|
-| 603871 | 嘉友国际 |
-| 000858 | 五粮液 |
-
-Code normalization: 6-prefix → sh.*, 0/3-prefix → sz.*. Names auto-looked up via akshare cache if missing.
-
-### Performance Budget
-
-| Stage | 500 stocks | 1000 stocks |
-|-------|-----------|------------|
-| Data fetch (6 concurrent) | ~5 min | ~10 min |
-| LLM scoring (5 concurrent, 5/call) | ~3 min | ~6 min |
-| **Total** | **~8 min** | **~16 min** |
-
-## Testing
-
-```bash
-# Run all pytest tests
-python -m pytest tests/ -v
-
-# Run specific test file
-python -m pytest tests/test_batch_scorer.py -v
-python -m pytest tests/test_batch_frontend.py -v
-
-# Standalone extraction test (no pytest needed)
-python test_extraction.py
-```
-
-Test files:
-- `tests/test_batch_scorer.py` — prompt builder, response parser, chunking (TDD: Phase 2)
-- `tests/test_batch_frontend.py` — API protocol shapes, progress calculation, color mapping, data normalization (TDD: Phase 3)
-- `test_extraction.py` — stock code/name extraction from natural language queries (standalone, no deps)
-
-No pytest config file — defaults work. Tests add `src/` or `src/app/` to `sys.path` for imports.
-
-## Key Supporting Modules
-
-- `src/utils/model_config.py` — centralized model-to-agent assignment (4-model architecture); all agents call `get_model_for_agent(agent_name)` to get the right `OpenAICompatibleClient` instance
-- `src/utils/tushare_client.py` — Tushare API wrappers (get_stock_info, get_daily_basic, get_fina_indicator, get_dividend, compute_pe_percentile, compute_ev_ebitda, get_stock_news_em); used by `app.py`'s `_enrich_with_tushare()` for data enrichment and by batch scorer
-- `src/utils/logging_config.py` — unified logging with emoji icons (SUCCESS_ICON, ERROR_ICON, WAIT_ICON)
-- `src/utils/log_viewer.py` — CLI log viewer for execution history
+- **Do NOT add new agents without signal_pack output** — every analysis agent must produce `<SIGNAL_PACK>` JSON
+- **Do NOT skip tool_cache in _call_tool_safe** — all agents that call MCP tools must use tool-level cache
+- **Do NOT add new AkShare tool dependencies** — migrate to Tushare equivalents; AkShare tools are deprecated
+- **Do NOT assume LLM JSON is perfectly typed** — always normalize `strength→int`, `confidence→float`, `data_quality_score→float`
+- **Do NOT hardcode model names** — use `get_model_config_for_agent()` from `model_config.py`
+- **Do NOT skip the cache-hit signal_pack fallback** — every agent must restore signal_pack on cache hit (try `read_signal_pack_cache` → regex re-extraction → `text_to_signal_pack`)
+- **Do NOT remove the `merge_dicts` reducer** — parallel agent writes depend on it
 
 ## Windows-Specific Notes
 
-- All entry points set `WindowsSelectorEventLoopPolicy` — required for MCP stdio subprocess on Windows
-- `src/tools/mcp_config.py` uses `sys.executable` (not hardcoded `python`) and merges `PYTHONPATH` with `os.pathsep`
-- Console UTF-8 encoding configured in entry points (with try/except fallback)
-- WSL-created venvs (`venv/bin/python`) are incompatible; delete and recreate with `python -m venv venv`
-- `launch.ps1` uses `taskkill /f /t` for tree-kill to ensure uvicorn/streamlit child processes die on exit
-- The desktop shortcut calls `powershell.exe -ExecutionPolicy Bypass -NoExit -File launch.ps1`
+- All entry points set `WindowsSelectorEventLoopPolicy` — required for MCP stdio subprocess
+- `src/tools/mcp_config.py` uses `sys.executable` (not hardcoded `python`)
+- WSL-created venvs are incompatible; recreate with `python -m venv venv`
+- `launch.ps1` uses `taskkill /f /t` for tree-kill of uvicorn/streamlit

@@ -18,7 +18,7 @@ from src.eval.repositories import (
 from src.eval.schemas import EvalBatch
 from src.eval.line_manager import LineManager
 from src.eval.pool_manager import PoolManager
-from src.eval.market_simulator import MarketSimulator, MarketData
+from src.eval.market_simulator import MarketSimulator, MarketData, Order as SimOrder
 from src.eval.strategies.factory import get_strategy
 from src.eval.config import get_config
 
@@ -36,6 +36,7 @@ class EvalOrchestrator:
         self.pool_manager = PoolManager()
         self.market_simulator = MarketSimulator(config)
         self.current_batch_id = ""
+        self._strategy_cache = {}  # key: (line_id, term, strategy_type) -> strategy instance
 
     # ═══════════════════════════════════════════════
     # 阶段入口
@@ -64,6 +65,19 @@ class EvalOrchestrator:
             error_message=error,
             optimize_ready=int(success),
         )
+
+    def _get_or_create_strategy(self, line_id: str, term: str, strategy_type: str):
+        """Get cached strategy instance or create new one. Preserves state across days."""
+        cache_key = (line_id, term, strategy_type)
+        if cache_key not in self._strategy_cache:
+            self._strategy_cache[cache_key] = get_strategy(term, strategy_type, self.config)
+        return self._strategy_cache[cache_key]
+
+    def _cleanup_strategies(self, active_line_ids: set):
+        """Remove strategy cache entries for lines that no longer exist."""
+        stale = [k for k in self._strategy_cache if k[0] not in active_line_ids]
+        for k in stale:
+            del self._strategy_cache[k]
 
     # ═══════════════════════════════════════════════
     # 阶段1: 结算历史样本
@@ -116,9 +130,9 @@ class EvalOrchestrator:
             line_sim.reset_daily_state()
             
             try:
-                # 获取策略
+                # 获取策略（缓存实例以保留跨日状态如_high_water_marks、_low_score_days）
                 strategy_type = line.definition.get("strategy", "default")
-                strategy = get_strategy(term, strategy_type, self.config)
+                strategy = self._get_or_create_strategy(line.line_id, term, strategy_type)
 
                 # V1: 生成模拟评分（Phase 3接入真实scorer）
                 scores = self._get_simulated_scores(pool, term)
@@ -126,7 +140,8 @@ class EvalOrchestrator:
                 # 周一全量重评：消化周末消息面变化，强制重评池内所有股票
                 if term == "short" and EvalOrchestrator._get_schedule()["is_monday"]:
                     logger.info("Monday full run: scoring all short pool stocks (%d stocks)", len(pool))
-                    # Force re-score all pool stocks (not just top-N)
+                    # Monday: re-score all pool stocks to digest weekend news/macro changes
+                    scores = self._get_simulated_scores(pool, term)  # Re-score all stocks
 
                 # 策略选股
                 buy_orders = strategy.select_stocks(
@@ -149,7 +164,7 @@ class EvalOrchestrator:
                 )
 
                 # 执行订单（通过市场仿真层）
-                from src.eval.market_simulator import Order as SimOrder
+                # SimOrder imported at top of file
 
                 # 先执行卖出
                 for so in sell_orders:
@@ -390,11 +405,13 @@ class EvalOrchestrator:
         last_day = calendar.monthrange(today.year, today.month)[1]
         is_month_end = (day >= last_day - 2)  # Last 3 trading days of month
 
+        is_trading_day = weekday < 5  # Mon-Fri are trading days (simplified)
+
         return {
-            "short": True,           # Short-term: every trading day
-            "medium": weekday == 4,  # Medium-term: Friday only (weekly)
-            "long": is_month_end,    # Long-term: month-end only
-            "is_monday": weekday == 0,  # Monday full run flag
+            "short": is_trading_day,    # Only trade on weekdays
+            "medium": weekday == 4 and is_trading_day,
+            "long": is_month_end and is_trading_day,
+            "is_monday": weekday == 0 and is_trading_day,
             "weekday": weekday,
             "date": today.strftime("%Y-%m-%d"),
         }

@@ -1,0 +1,41 @@
+{
+  "description": "自动优化规则配置 — 控制哪些优化可以自动执行",
+  "auto_fix_rules": {
+    "param_tune": {
+      "enabled": true,
+      "max_delta_percent": 10,
+      "cooldown_days": 7,
+      "max_consecutive_failures": 3,
+      "allowed_params": [
+        "score_buy_threshold_short", "score_sell_hard_short",
+        "max_positions_short_ablation", "single_weight_limit_short_ablation"
+      ]
+    },
+    "prompt_patch": {
+      "enabled": true,
+      "require_approval": true,
+      "validation_anchors": 50,
+      "min_improvement_percent": 5
+    },
+    "logic_fix": {
+      "enabled": true,
+      "require_approval": true,
+      "auto_test_generation": true,
+      "backup_before_fix": true
+    }
+  },
+  "safety_net": {
+    "branch_isolation": true,
+    "cooldown_days_per_module": 7,
+    "max_consecutive_failures": 3,
+    "direction_consistency_check": true,
+    "pre_change_loss_baseline_days": 5,
+    "cumulative_monitoring_enabled": true
+  },
+  "anti_hallucination": {
+    "enabled": true,
+    "min_confidence_for_auto": "MEDIUM",
+    "require_consistency_check": true,
+    "consistency_runs": 2
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "description": "回测基准日期集 — 用于校准回测结果的标准化时间点",
+  "short_term": {
+    "anchors_per_week": 1,
+    "holding_days": 1,
+    "test_periods": [
+      {"name": "bull_market", "start": "2020-07-01", "end": "2020-12-31"},
+      {"name": "bear_market", "start": "2022-01-01", "end": "2022-04-30"},
+      {"name": "volatile", "start": "2023-06-01", "end": "2023-09-30"}
+    ]
+  },
+  "medium_term": {
+    "anchors_per_week": 1,
+    "holding_days": 20,
+    "train_split": "2023-12-31",
+    "validation_split": "2025-06-30",
+    "default_start": "2022-01-01",
+    "default_end": "2026-05-31"
+  },
+  "long_term": {
+    "anchors_per_month": 1,
+    "holding_days": 240,
+    "train_split": "2022-12-31",
+    "validation_split": "2024-12-31",
+    "default_start": "2020-01-01",
+    "default_end": "2025-06-30"
+  },
+  "calibration_quarters": [
+    "2024-03-31", "2024-06-30", "2024-09-30", "2024-12-31",
+    "2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31"
+  ]
+}

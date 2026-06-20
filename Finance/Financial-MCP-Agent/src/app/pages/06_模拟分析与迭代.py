@@ -42,6 +42,16 @@ with col_t:
         else:
             st.metric("最新批次", "暂无批次")
 
+col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+with col_s1:
+    st.metric("总Score", status.get("total_score", "N/A"))
+with col_s2:
+    st.metric("短线Score", status.get("short_score", "N/A"))
+with col_s3:
+    st.metric("中线Score", status.get("medium_score", "N/A"))
+with col_s4:
+    st.metric("长线Score", status.get("long_score", "N/A"))
+
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════
@@ -67,6 +77,20 @@ with col2:
             orch.run_daily_settlement({})
             st.success("已按最新收盘价更新所有持仓市值和收益")
     st.caption("👆 仅刷新市值和收益率，不做买卖。比如收盘后想再确认一下持仓市值，或你已通过CLI调仓过只需结算时使用。")
+
+col_reb1, col_reb2 = st.columns(2)
+with col_reb1:
+    if st.button("📊 仅收盘前调仓（不结算）", use_container_width=True):
+        if eval_ready:
+            with st.spinner("调仓运行中: 评分→选股→生成订单→执行..."):
+                import asyncio
+                async def _rebalance_all():
+                    current_date = datetime.now().strftime("%Y%m%d")
+                    for term in ["short", "medium", "long"]:
+                        await orch.run_daily_rebalance(term, current_date, {})
+                asyncio.run(_rebalance_all())
+                st.success("全部期限调仓完成！持仓已更新。")
+    st.caption("👆 根据最新数据重评分→选股→生成调仓订单→执行交易，但不结算当日收益。适合盘中调整持仓时使用。")
 
 st.markdown("---")
 col3, col4 = st.columns(2)
@@ -126,6 +150,20 @@ if eval_ready:
             st.metric(f"{label}池", f"{pool.get('size', 0)}只",
                       delta=f"目标{pool.get('target_size', '-')}只")
     st.caption("精筛池 = 模拟盘的选股范围。14条线只能从这些池子里选股。池子一段时间不变（控制变量），需要更新时点上面的'更新精筛股票池'按钮。")
+
+    # Show Top5 stocks for each pool
+    with st.expander("📋 精筛池 Top5 成分股", expanded=False):
+        for term, label in [("short", "短线"), ("medium", "中线"), ("long", "长线")]:
+            st.caption(f"**{label}精筛池 Top5:**")
+            pool_data = orch.pool_manager.get_pool_with_scores(term)[:5]
+            if pool_data:
+                for s in pool_data:
+                    code = s.get("code", "?") if isinstance(s, dict) else s
+                    name = s.get("name", "?") if isinstance(s, dict) else "?"
+                    score = s.get("score", "?") if isinstance(s, dict) else "?"
+                    st.text(f"  {code} ({name}) | {score}分")
+            else:
+                st.text("  暂无数据")
 else:
     st.warning("评测系统初始化中...")
 
@@ -158,6 +196,7 @@ if eval_ready:
                         "总市值(万)": round(l.get("total_value", 0) / 10000, 1),
                         "累计收益%": l.get("cumulative_return_pct", 0),
                         "最大回撤%": l.get("max_drawdown_pct", 0),
+                        "今日收益%": l.get("daily_return_pct", 0),
                     })
                 st.dataframe(pd.DataFrame(df_data), use_container_width=True)
             else:

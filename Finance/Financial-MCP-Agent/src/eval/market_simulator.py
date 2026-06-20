@@ -67,6 +67,19 @@ class MarketData:
     pb_ratio: float = 0.0          # PB ratio (from daily_basic)
     price_to_ma_ratio: float = 1.0 # Close / MA60, 1.0 = at MA
     risk_flags: list = None        # Risk flags from analysis (delist, audit, etc.)
+    # ── 策略扩展字段（v2, 用于实现总纲 §5.3-5.5 完整规则）──
+    industry: str = ""             # 申万一级行业名称
+    industry_sw_code: str = ""     # 申万行业代码
+    roe: float = 0.0              # ROE (from fina_indicator)
+    revenue_growth: float = 0.0   # 营收增速 YoY
+    dividend_yield: float = 0.0   # 股息率
+    profit_growth_3y: float = 0.0 # 连续3年净利润增长指标 (>0表示满足)
+    pe_percentile: float = -1.0   # PE历史分位数 (0-100, -1表示无数据)
+    industry_pe_75th: float = 0.0 # 行业PE 75分位值
+    industry_pe_90th: float = 0.0 # 行业PE 90分位值
+    industry_pe_median: float = 0.0 # 行业PE中位数
+    # 日内异常监控
+    close_30min_spike: float = 0.0 # 收盘前30分钟异常波动幅度 (0=无异常, >0.03触发)
 
 
 class MarketSimulator:

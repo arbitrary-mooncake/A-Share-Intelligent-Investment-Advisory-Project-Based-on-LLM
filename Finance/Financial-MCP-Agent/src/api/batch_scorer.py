@@ -864,16 +864,19 @@ _HORIZON_CONTEXT = {
 }
 
 
-def build_batch_prompt(stocks_data: list, horizon: str = "medium") -> dict:
+def build_batch_prompt(stocks_data: list, horizon: str = "medium", custom_levels: list = None) -> dict:
     """构建批量打分 prompt。
 
     Args:
         stocks_data: [{code, name, pe, pb, roe, ...}, ...] 最多 5 只
         horizon: 评分维度
+        custom_levels: 自定义5级分类(默认用batch_scorer内置的"强烈推荐/推荐/中性/回避/卖出")
 
     Returns:
         {"system": str, "user": str}
     """
+    # 自定义级别覆盖内置 LEVELS
+    _levels = custom_levels if custom_levels is not None else LEVELS
     if not stocks_data:
         raise ValueError("stocks_data 不能为空")
     if len(stocks_data) > 5:
@@ -957,18 +960,19 @@ def build_batch_prompt(stocks_data: list, horizon: str = "medium") -> dict:
 
 ## 输出要求
 对上述 {len(stocks_data)} 只股票，返回 JSON 数组（不要 markdown 代码块）。
-每只股票输出: code, level({"/".join(LEVELS)}), confidence(高/中/低), reason(30字内), risk(30字内)
+每只股票输出: code, level({'/'.join(_levels)}), confidence(高/中/低), reason(30字内), risk(30字内)
 
 只返回 JSON 数组:"""
 
     return {"system": _BATCH_SYSTEM_PROMPT, "user": user_message}
 
 
-def parse_batch_response(response_text: str) -> list:
+def parse_batch_response(response_text: str, custom_levels: list = None) -> list:
     """解析 LLM 批量打分响应，提取有效的 [{code, level, ...}] 列表。
 
     Args:
         response_text: LLM 原始响应文本
+        custom_levels: 自定义5级分类(默认用batch_scorer内置的"强烈推荐/推荐/中性/回避/卖出")
 
     Returns:
         [{code, level, confidence, reason, risk, ...}, ...]
@@ -1008,8 +1012,9 @@ def parse_batch_response(response_text: str) -> list:
             continue
 
         level = item.get("level", "中性").strip()
-        if level not in LEVELS:
-            level = "中性"
+        _valid_levels = custom_levels if custom_levels is not None else LEVELS
+        if level not in _valid_levels:
+            level = _valid_levels[-2] if len(_valid_levels) >= 2 else "中性"  # default to second-to-last (观望/回避)
 
         confidence = item.get("confidence", "中").strip()
         if confidence not in ("高", "中", "低"):
@@ -1034,6 +1039,8 @@ async def score_batch(
     horizon: str = "medium",
     semaphore: int = 8,
     on_progress: callable = None,
+    model_suffix: str = "_2",
+    custom_levels: list = None,
 ) -> list:
     """批量 LLM 打分编排器。
 
@@ -1042,6 +1049,8 @@ async def score_batch(
         horizon: 打分维度
         semaphore: LLM 调用并发数
         on_progress: 可选回调 on_progress(scored_count, total)
+        model_suffix: 模型后缀, ""=M1(MiMo-V2.5-Pro), "_2"=M2(Qwen3.6-Flash), "_3"=M3(Qwen3.7-Plus)
+        custom_levels: 自定义5级分类(默认用batch_scorer内置的"强烈推荐/推荐/中性/回避/卖出")
 
     Returns:
         stocks 列表中添加 "score" 字段
@@ -1060,20 +1069,38 @@ async def score_batch(
 
     logger.info(
         f"{WAIT_ICON} 批量LLM打分开始: {total_valid} 只股票, "
-        f"{total_chunks} 批次, 并发={semaphore}"
+        f"{total_chunks} 批次, 并发={semaphore}, 模型后缀={model_suffix}"
     )
 
     from src.utils.llm_clients import OpenAICompatibleClient
     import os
 
-    # 批量打分 LLM 客户端：加长超时（5 只股票生成较长 JSON），降低并发避免 API 限流
+    # 根据 model_suffix 选择模型配置
+    api_key = os.getenv(f"OPENAI_COMPATIBLE_API_KEY{model_suffix}", "")
+    base_url = os.getenv(f"OPENAI_COMPATIBLE_BASE_URL{model_suffix}", "")
+    model = os.getenv(f"OPENAI_COMPATIBLE_MODEL{model_suffix}", "")
+
+    # 回退: 如果指定模型未配置 → M1
+    if not all([api_key, base_url, model]):
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
+        model = os.getenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro")
+
+    # M1/M3 启用 thinking, M2 禁用
+    extra_body = {}
+    if model_suffix in ("_2",):
+        extra_body = {}
+    else:
+        from src.utils.model_config import get_thinking_body
+        extra_body = get_thinking_body(base_url, enabled=True)
+
     llm = OpenAICompatibleClient(
-        api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_2"),
-        base_url=os.getenv("OPENAI_COMPATIBLE_BASE_URL_2"),
-        model=os.getenv("OPENAI_COMPATIBLE_MODEL_2", "qwen3.6-flash"),
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
         env_prefix="",
-        extra_body={},  # thinking disabled
-        http_timeout=180,       # 读取超时 3 分钟（批量 5 只股票 JSON 较长）
+        extra_body=extra_body,
+        http_timeout=180,
         http_connect_timeout=10,
     )
 
@@ -1085,7 +1112,7 @@ async def score_batch(
         async with sem:
             try:
                 stocks_data = [s["data"] for s in chunk]
-                prompt = build_batch_prompt(stocks_data, horizon)
+                prompt = build_batch_prompt(stocks_data, horizon, custom_levels=custom_levels)
 
                 response = await asyncio.wait_for(
                     asyncio.get_running_loop().run_in_executor(
@@ -1102,7 +1129,7 @@ async def score_batch(
                 )
 
                 if response:
-                    results = parse_batch_response(response)
+                    results = parse_batch_response(response, custom_levels=custom_levels)
                     score_map = {r["code"]: r for r in results}
                     for s in chunk:
                         code = s.get("code", "")

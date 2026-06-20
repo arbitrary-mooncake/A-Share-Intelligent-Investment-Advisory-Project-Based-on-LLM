@@ -9,6 +9,20 @@ st.set_page_config(page_title="模拟分析与迭代", page_icon="📈", layout=
 st.title("📈 模拟分析与迭代")
 st.caption("评分智能体 — 模拟盘评估、消融实验、回测、自动优化。所有结果仅供参考，使用评测模型(MiMo-V2.5)，目的是优化Agent系统。")
 
+
+def _run_async(coro):
+    """Safely run async coroutine, handling existing event loop."""
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(asyncio.run, coro)
+        return future.result()
+
+
 # ── 初始化 ──
 @st.cache_resource
 def init_eval_system():
@@ -65,8 +79,7 @@ with col1:
     if st.button("▶️ 一键完整检查", use_container_width=True):
         if eval_ready:
             with st.spinner("运行中: 结算历史 → 评分调仓 → 收盘结算 → 生成报告..."):
-                import asyncio
-                result = asyncio.run(orch.run_full_check())
+                result = _run_async(orch.run_full_check())
                 st.success(f"批次 {result['batch_id'][:16]} 完成！报告: {result.get('report_path', '')}")
                 st.rerun()
     st.caption("👆 每个交易日收盘后点一次。自动完成: 结算历史收益 → 14条线独立评分调仓 → 收盘结算 → 生成报告。耗时1-2分钟。")
@@ -83,12 +96,11 @@ with col_reb1:
     if st.button("📊 仅收盘前调仓（不结算）", use_container_width=True):
         if eval_ready:
             with st.spinner("调仓运行中: 评分→选股→生成订单→执行..."):
-                import asyncio
                 async def _rebalance_all():
                     current_date = datetime.now().strftime("%Y%m%d")
                     for term in ["short", "medium", "long"]:
                         await orch.run_daily_rebalance(term, current_date, {})
-                asyncio.run(_rebalance_all())
+                _run_async(_rebalance_all())
                 st.success("全部期限调仓完成！持仓已更新。")
     st.caption("👆 根据最新数据重评分→选股→生成调仓订单→执行交易，但不结算当日收益。适合盘中调整持仓时使用。")
 
@@ -108,8 +120,7 @@ with col3:
     if st.button("🎯 更新精筛池", use_container_width=True, type="primary"):
         if eval_ready:
             with st.spinner("四层管线运行中: 硬筛→M1/M3批量粗筛分档→M2快筛→1:1.2差额精筛..."):
-                import asyncio
-                update_result = asyncio.run(orch.run_pool_update(pool_term))
+                update_result = _run_async(orch.run_pool_update(pool_term))
                 if "error" in update_result:
                     st.error(update_result["error"])
                 else:

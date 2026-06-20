@@ -479,7 +479,7 @@ class LLMFreeStrategy(BaseStrategy):
             if not isinstance(item, dict):
                 continue
             code = item.get("stock_code", "").strip()
-            target_value = float(item.get("target_value", 0))
+            target_value = float(str(item.get("target_value", 0)).replace(",", ""))
             reason = item.get("reason", "")
 
             if not code or target_value <= 0:

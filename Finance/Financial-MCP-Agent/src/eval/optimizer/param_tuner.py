@@ -92,7 +92,7 @@ class ParamTuner:
         """
         random.seed(self.random_seed)
 
-        n_grid = max(4, int(n_iterations * self.grid_fraction))
+        n_grid = max(1, min(n_iterations, int(n_iterations * self.grid_fraction)))
         n_refine = n_iterations - n_grid
 
         history: List[Dict[str, Any]] = []

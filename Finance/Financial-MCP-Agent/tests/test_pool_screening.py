@@ -17,7 +17,12 @@ class TestHardScreen:
 
     def test_excludes_b_shares(self):
         from src.eval.pool_screening import _is_stock_excluded
-        assert _is_stock_excluded(self._make_stock("200001.B")) is True
+        # 深交所B股: 200002.SZ
+        assert _is_stock_excluded(self._make_stock("200002.SZ")) is True
+        # 上交所B股: 900901.SH
+        assert _is_stock_excluded(self._make_stock("900901.SH")) is True
+        # 非B股的200xxx上交所正常股票不应被误排
+        assert _is_stock_excluded(self._make_stock("200001.SH")) is False
 
     def test_excludes_st_stocks(self):
         from src.eval.pool_screening import _is_st_name

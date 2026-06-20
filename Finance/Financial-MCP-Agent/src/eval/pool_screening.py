@@ -51,7 +51,13 @@ def _is_stock_excluded(stock: Dict[str, Any]) -> bool:
     code = stock.get("ts_code", "")
     name = stock.get("name", "")
 
-    if code.endswith(".BJ") or code.endswith(".B"):
+    if code.endswith(".BJ"):
+        return True
+    # B股: 上交所900xxx, 深交所200xxx (Tushare ts_code格式: 900901.SH / 200002.SZ)
+    # B股: 上交所900xxx.SH, 深交所200xxx.SZ
+    if code.startswith("900") and code.endswith(".SH"):
+        return True
+    if code.startswith("200") and code.endswith(".SZ"):
         return True
     if _is_st_name(name):
         return True
@@ -388,9 +394,8 @@ def calculate_candidate_quota(
     total_candidates = int(target_size * ratio)
     ideal_whitelist = int(total_candidates * 1.0 / (1.0 + ratio))
 
-    whitelist_slots = min(whitelist_count, max(ideal_whitelist, whitelist_count))
-    if whitelist_count > ideal_whitelist * 2:
-        whitelist_slots = ideal_whitelist * 2
+    # 白名单 ≤ 理想配额: 全部进入; 白名单 > 理想配额: 按理想配额截断
+    whitelist_slots = min(whitelist_count, ideal_whitelist)
 
     initial_slots = total_candidates - whitelist_slots
     initial_slots = min(initial_slots, initial_passing_count)
@@ -514,10 +519,12 @@ async def formal_score_layer3(
             result = await engine.score_stock(code, name)
             if result and result.get("score_data"):
                 sd = result["score_data"]
-                score = sd.get("score", 50)
+                score = sd.get("score") or 50  # 防止 None: key存在但值为None时用50
 
                 term_score = sd.get(term_key.get(term, "medium_term_score"), {})
-                actual_score = term_score.get("score", score) if isinstance(term_score, dict) else score
+                actual_score = term_score.get("score") if isinstance(term_score, dict) else score
+                if actual_score is None:
+                    actual_score = score
                 recommendation = sd.get("recommendation", "")
 
                 entry = {**stock, "final_score": actual_score, "recommendation": recommendation}
@@ -625,7 +632,7 @@ async def run_pool_update(
 
     # ── Layer 1: Batch Scoring ──
     _stage("1_batch_score", f"用M1/M3批量粗筛{len(ts_stocks)}只...")
-    layer1 = await batch_score_layer1(ts_stocks, term)
+    layer1 = await batch_score_layer1(ts_stocks, term, on_progress=on_progress)
     result["stages"]["1_batch_score"] = (
         f"白名单{len(layer1['whitelist'])}只, "
         f"初筛池{len(layer1['initial_pool'])}只, "
@@ -634,7 +641,7 @@ async def run_pool_update(
 
     # ── Layer 2: Quick Screen ──
     _stage("2_quick_screen", f"用M2快筛初筛池{len(layer1['initial_pool'])}只...")
-    initial_passing = await quick_screen_layer2(layer1["initial_pool"], term)
+    initial_passing = await quick_screen_layer2(layer1["initial_pool"], term, on_progress=on_progress)
     result["stages"]["2_quick_screen"] = f"快筛通过{len(initial_passing)}只"
 
     # ── Layer 3: Formal Scoring ──
@@ -644,12 +651,16 @@ async def run_pool_update(
     layer3 = await formal_score_layer3(
         layer1["whitelist"], initial_passing,
         term=term, target_size=target_size, ratio=ratio,
+        on_progress=on_progress,
     )
 
     # ── Store ──
+    # 清理过期黑名单后存储
+    pm.clean_expired_blacklist()
     pm.update_pool(term, layer3["pool"])
 
     # 黑名单入库 (Layer1 + Layer3)
+    blacklist_expiry = eval_get("blacklist_expiry_days", 120)
     all_blacklist = layer1["blacklist"] + layer3.get("blacklist", [])
     for b in all_blacklist:
         code = b.get("code", "")
@@ -657,7 +668,7 @@ async def run_pool_update(
             pm.add_to_blacklist(
                 code,
                 b.get("layer1_reason", b.get("recommendation", "批量粗筛判定")),
-                expiry_days=120,
+                expiry_days=blacklist_expiry,
             )
 
     result["stages"]["3_formal_score"] = (

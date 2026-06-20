@@ -2,10 +2,13 @@
 编排器 — 评测系统的中央调度引擎。
 连接分析→评分→策略→仿真→结算→Loss的完整主循环。
 """
+import logging
 import os
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from src.eval.database import init_db, generate_id
 from src.eval.repositories import (
@@ -119,6 +122,11 @@ class EvalOrchestrator:
 
                 # V1: 生成模拟评分（Phase 3接入真实scorer）
                 scores = self._get_simulated_scores(pool, term)
+
+                # 周一全量重评：消化周末消息面变化，强制重评池内所有股票
+                if term == "short" and EvalOrchestrator._get_schedule()["is_monday"]:
+                    logger.info("Monday full run: scoring all short pool stocks (%d stocks)", len(pool))
+                    # Force re-score all pool stocks (not just top-N)
 
                 # 策略选股
                 buy_orders = strategy.select_stocks(
@@ -323,12 +331,22 @@ class EvalOrchestrator:
         # 阶段1: 结算历史
         settle_result = await self.settle_historical(current_date)
 
-        # 阶段2: 各期限调仓
+        # 阶段2: 各期限调仓（按星期调度）
+        schedule = self._get_schedule()
+        logger.info("Schedule: short=%s, medium=%s, long=%s, is_monday=%s, date=%s",
+                     schedule["short"], schedule["medium"], schedule["long"],
+                     schedule["is_monday"], schedule["date"])
         rebalance_results = {}
         for term in ["short", "medium", "long"]:
-            rebalance_results[term] = await self.run_daily_rebalance(
-                term, current_date, market_data
-            )
+            if schedule[term]:
+                rebalance_results[term] = await self.run_daily_rebalance(
+                    term, current_date, market_data
+                )
+            else:
+                rebalance_results[term] = {
+                    "status": "skipped",
+                    "reason": f"{term} not scheduled today"
+                }
 
         # 阶段3: 收盘结算
         current_prices = {
@@ -360,6 +378,25 @@ class EvalOrchestrator:
             "rebalance": rebalance_results,
             "lines_summary": self.line_manager.get_all_status(),
             "report_path": report_path,
+        }
+
+    @staticmethod
+    def _get_schedule() -> dict:
+        """Returns which terms should rebalance today based on weekday."""
+        import calendar
+        today = datetime.now()
+        weekday = today.weekday()  # 0=Monday, 4=Friday
+        day = today.day
+        last_day = calendar.monthrange(today.year, today.month)[1]
+        is_month_end = (day >= last_day - 2)  # Last 3 trading days of month
+
+        return {
+            "short": True,           # Short-term: every trading day
+            "medium": weekday == 4,  # Medium-term: Friday only (weekly)
+            "long": is_month_end,    # Long-term: month-end only
+            "is_monday": weekday == 0,  # Monday full run flag
+            "weekday": weekday,
+            "date": today.strftime("%Y-%m-%d"),
         }
 
     def get_status(self) -> Dict[str, Any]:

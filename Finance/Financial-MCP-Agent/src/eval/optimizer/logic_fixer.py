@@ -216,6 +216,25 @@ class LogicFixer:
                     "confidence": 0.75,
                 })
 
+            # Also check: dep agents optimistic (positive delta), scorer pessimistic (negative delta)
+            if dep_mean > 0.01 and scorer_delta < -0.01:
+                anomalies.append({
+                    "anomaly_type": "contribution_divergence",
+                    "severity": "high",
+                    "description": (
+                        f"依赖 agent 平均负贡献 (mean_delta={dep_mean:.4f}) "
+                        f"但 scorer '{scorer}' 正贡献 (delta={scorer_delta:.4f})，"
+                        f"可能 scorer 融合权重或逻辑有误"
+                    ),
+                    "affected_agent": scorer,
+                    "evidence": {
+                        "scorer_delta": scorer_delta,
+                        "dep_mean_delta": dep_mean,
+                        "dep_deltas": {d: contrib_map.get(d) for d in deps if d in contrib_map},
+                    },
+                    "confidence": 0.75,
+                })
+
         return anomalies
 
     def _detect_loss_concentration(

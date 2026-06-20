@@ -92,7 +92,7 @@ _STOCK_CODE_PATTERN = re.compile(
     r'688\d{3}|'                     # 科创板
     r'00[0123]\d{3}|'                # 深市主板
     r'30[0123]\d{3}|'                # 创业板
-    r'8[3-9]\d{2}\d{2})\b'          # 北交所
+    r'8[3-9]\d{3})'          # 北交所 (6-digit codes, match by length)
 )
 
 # Agent名称白名单（来自总纲和项目实际Agent）
@@ -692,8 +692,18 @@ def verify_comparison_validity(comparisons: List[Dict[str, Any]],
     for i, comp in enumerate(comparisons):
         left_path = comp.get("left", "")
         operator = comp.get("operator", "gt")
-        right_val = comp.get("right", 0)
+        right_val = comp.get("right")
+        right_path = comp.get("right_path")
         claim_text = comp.get("claim_text", f"comparison[{i}]")
+
+        # Resolve right value: use direct numeric if available, else resolve path
+        if right_val is None and right_path:
+            right_val = _resolve_path(baseline, right_path)
+            if right_val is None:
+                issues.append(f"{claim_text}: 无法在baseline中找到右侧路径 '{right_path}'")
+                continue
+        if right_val is None:
+            right_val = 0
 
         # 在baseline中查找left_path对应的实际值
         left_val = _resolve_path(baseline, left_path)
@@ -703,6 +713,10 @@ def verify_comparison_validity(comparisons: List[Dict[str, Any]],
 
         if not isinstance(left_val, (int, float)):
             issues.append(f"{claim_text}: '{left_path}' 的值 ({left_val}) 不是数值")
+            continue
+
+        if not isinstance(right_val, (int, float)):
+            issues.append(f"{claim_text}: 右侧值 ({right_val}) 不是数值，跳过比较")
             continue
 
         valid = False
@@ -1055,15 +1069,16 @@ class AntiHallucinationPipeline:
         if multi_run_results and len(multi_run_results) >= 2:
             sc = check_self_consistency(multi_run_results)
             sc_passed = sc.get("is_consistent", False)
+            sc_is_critical = not sc_passed and sc.get("consistency_score", 1.0) < 0.3
             verifications.append(VerificationResult(
                 layer="Layer4_SelfConsistency",
                 passed=sc_passed,
                 score=sc.get("consistency_score", 0.0),
                 issues=[f"discrepancy: {d}" for d in sc.get("discrepancies", [])],
                 details=sc,
-                is_critical=not sc_passed and sc.get("consistency_score", 1.0) < 0.3,
+                is_critical=sc_is_critical,
             ))
-            if not sc_passed:
+            if not sc_passed and sc_is_critical:
                 overall_pass = False
         else:
             verifications.append(VerificationResult(
@@ -1170,9 +1185,9 @@ def _extract_entities_from_output(text: str, known_entities: dict,
     """从LLM输出中提取Agent名、文件名、路径等实体。"""
     entities = []
 
-    # Agent名称
+    # Agent名称 — sort by length descending to avoid substring duplicates
     known_agents = known_entities.get("known_agents", _VALID_AGENT_NAMES)
-    for agent_name in known_agents:
+    for agent_name in sorted(known_agents, key=len, reverse=True):
         if agent_name in text:
             entities.append({"type": "agent", "name": agent_name})
 
@@ -1196,14 +1211,25 @@ def _extract_comparisons_from_output(text: str) -> List[Dict[str, Any]]:
     comparisons = []
     # 匹配形如 "A(0.5) > B(0.3)" 或 "X比Y高"
     comp_pattern = re.compile(
-        r'(\w+(?:\.\w+)*)\s*[><]\s*(\w+(?:\.\w+)*)')
+        r'(\w+(?:\.\w+)*)\s*([><])\s*(\w+(?:\.\w+)*)')
     for m in comp_pattern.finditer(text):
+        left = m.group(1)
+        op = m.group(2)
+        right = m.group(3)
+        # Try to resolve right as a numeric value
+        try:
+            right_val = float(right)
+        except ValueError:
+            # Try to parse as path and resolve from baseline later;
+            # mark as raw so verify_comparison_validity can resolve it
+            right_val = None
         comparisons.append({
-            "left": m.group(1),
-            "operator": "gt",
-            "right": 0.0,  # 需要从上下文/输入数据解析
+            "left": left,
+            "operator": "gt" if op == ">" else "lt",
+            "right": right_val,
+            "right_path": right if right_val is None else None,
             "claim_text": m.group(0),
-            "raw": True,  # 标记需要进一步解析
+            "raw": right_val is None,  # True if right needs path resolution
         })
     return comparisons
 
@@ -1239,6 +1265,9 @@ def verify_with_consistency(llm_outputs: List[str],
     Returns:
         与 Pipeline.run() 同格式的结果字典
     """
+    if not llm_outputs:
+        return {"error": "llm_outputs is empty", "consistency_score": 0.0, "is_consistent": False}
+
     pipeline = AntiHallucinationPipeline()
 
     # 分别验证每个输出，获取parsed结果

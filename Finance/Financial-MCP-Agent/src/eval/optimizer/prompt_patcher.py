@@ -11,8 +11,11 @@ LLM 调用通过 OpenAICompatibleClient + get_eval_model_config，使用 eval_or
 """
 
 import json
+import logging
 import re
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from src.utils.model_config import get_eval_model_config
 from src.utils.llm_clients import OpenAICompatibleClient
@@ -162,6 +165,9 @@ class PromptPatcher:
                 "diagnosis_source": "llm" | "fallback_rules"
             }
         """
+        if hasattr(self, '_init_error') and self._init_error:
+            logger.warning("PromptPatcher initialized with error: %s", self._init_error)
+
         if self._client is None:
             return self._fallback_diagnose(agent_name, prompt_text, performance_data)
 
@@ -321,12 +327,14 @@ class PromptPatcher:
         self,
         agent_name: str,
         diagnosis: Dict[str, Any],
+        original_prompt: str = "",
     ) -> Dict[str, Any]:
         """基于诊断结果生成 prompt 补丁。
 
         Args:
             agent_name: Agent 名称
             diagnosis: 来自 diagnose() 的诊断结果
+            original_prompt: 原始 prompt 文本（用于 LLM 不可用时的 fallback）
 
         Returns:
             {
@@ -337,7 +345,7 @@ class PromptPatcher:
             }
         """
         if self._client is None:
-            return self._fallback_patch(agent_name, diagnosis)
+            return self._fallback_patch(agent_name, diagnosis, original_prompt)
 
         diag_json = json.dumps(diagnosis, ensure_ascii=False, indent=2)
         user_content = f"## Agent: {agent_name}\n\n### 诊断结果\n\n{diag_json}"
@@ -350,12 +358,13 @@ class PromptPatcher:
                 parsed["patch_source"] = "llm"
                 return parsed
 
-        return self._fallback_patch(agent_name, diagnosis)
+        return self._fallback_patch(agent_name, diagnosis, original_prompt)
 
     def _fallback_patch(
         self,
         agent_name: str,
         diagnosis: Dict[str, Any],
+        original_prompt: str = "",
     ) -> Dict[str, Any]:
         """Fallback 补丁生成（不需要 LLM，基于诊断建议构造 patched_prompt）。"""
         suggestions = diagnosis.get("suggestions", [])
@@ -370,7 +379,7 @@ class PromptPatcher:
                 "reason": s.get("expected_improvement", ""),
             })
         return {
-            "patched_prompt": "",
+            "patched_prompt": original_prompt,  # Return original prompt unchanged when LLM unavailable
             "changes": changes,
             "rationale": f"基于 {len(suggestions)} 条诊断建议生成补丁摘要（LLM 不可用，未生成完整 patched_prompt）",
             "patch_source": "fallback",

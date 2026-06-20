@@ -26,6 +26,8 @@ class ContributionEngine:
         term: str,
         all_agent_results: Dict[str, List[Dict[str, Any]]],
         ablation_results: Dict[str, Dict[str, List[Dict[str, Any]]]],
+        dates: List[str] = None,
+        cluster_size_days: int = 5,
     ) -> Dict[str, Any]:
         """
         计算所有agent的贡献分。
@@ -37,6 +39,8 @@ class ContributionEngine:
                 "fundamental": {"scores": [...], "returns": [...], ...},
                 "technical": {...}, ...
             }
+            dates: ISO日期列表，与scores等长。短期线(term="short")用于cluster bootstrap
+            cluster_size_days: cluster bootstrap的块大小（天），默认5天=1周
 
         Returns:
             {
@@ -78,9 +82,16 @@ class ContributionEngine:
             delta_structure = ablated_loss["structure_detail"]["L_structure"] - baseline["structure_detail"]["L_structure"]
 
             # Bootstrap置信区间
-            ci_low, ci_high = self._bootstrap_ci(
-                term, all_agent_results, ablated, agent_name, delta_total
-            )
+            # 总纲 §10.4: 短期线以周为单位cluster bootstrap保持周内结构
+            if term == "short" and dates and len(dates) == len(all_agent_results.get("scores", [])):
+                ci_low, ci_high = self._bootstrap_ci_cluster(
+                    term, all_agent_results, ablated, agent_name,
+                    delta_total, dates, cluster_size_days
+                )
+            else:
+                ci_low, ci_high = self._bootstrap_ci(
+                    term, all_agent_results, ablated, agent_name, delta_total
+                )
 
             # 显著性判断
             significance, stars = self._classify_significance(delta_total, ci_low, ci_high)
@@ -203,6 +214,152 @@ class ContributionEngine:
         ci_high = deltas[int(len(deltas) * (1 - alpha))]
 
         return ci_low, ci_high
+
+    def _bootstrap_ci_cluster(self, term: str, baseline: Dict[str, List],
+                               ablated: Dict[str, List], agent_name: str,
+                               observed_delta: float, dates: List[str],
+                               cluster_size_days: int = 5) -> Tuple[float, float]:
+        """Cluster bootstrap with week-level blocks for short-term lines.
+
+        Resamples complete weeks (not individual days) to preserve within-week
+        structure. 总纲 §10.4: 以周为单位Bootstrap，保持周内结构。
+
+        Args:
+            term: short/medium/long
+            baseline: all-agent results
+            ablated: ablation results for this agent
+            agent_name: name of the ablated agent
+            observed_delta: observed delta_L for centering
+            dates: ISO date strings aligned with scores/returns
+            cluster_size_days: block size in days (default 5 = trading week)
+
+        Returns:
+            (ci_low, ci_high) — 95% confidence interval bounds
+        """
+        baseline_scores = baseline.get("scores", [])
+        ablated_scores = ablated.get("scores", [])
+        returns = baseline.get("returns", [])
+
+        n = min(len(baseline_scores), len(ablated_scores), len(returns), len(dates))
+        if n < 5:
+            return observed_delta - 0.05, observed_delta + 0.05
+
+        # Extract shared portfolio data
+        daily_rets = baseline.get("daily_returns", returns)
+        benchmarks = baseline.get("benchmark_returns", [0.0] * n)
+        weights = baseline.get("holdings_weights", [])
+        turnover = baseline.get("turnover_rate", 0.0)
+        cash = baseline.get("cash_ratio", 0.0)
+        sectors = baseline.get("sector_weights", [])
+
+        # Group observations into clusters by date
+        date_indices = list(range(n))
+        clusters = self._cluster_by_dates(
+            [dates[i] for i in date_indices],
+            cluster_size_days
+        )
+
+        if len(clusters) < 3:
+            # Insufficient clusters for block bootstrap → fall back to simple bootstrap
+            return self._bootstrap_ci(term, baseline, ablated, agent_name, observed_delta)
+
+        deltas = []
+        n_clusters = len(clusters)
+
+        for _ in range(self.bootstrap_iterations):
+            # Resample complete clusters (weeks) with replacement
+            sampled_clusters = [
+                clusters[random.randint(0, n_clusters - 1)]
+                for _ in range(n_clusters)
+            ]
+
+            # Flatten sampled indices
+            bs_indices = []
+            for cluster in sampled_clusters:
+                bs_indices.extend(cluster)
+
+            # Trim to original n
+            bs_indices = bs_indices[:n]
+
+            bs_baseline = [baseline_scores[i] for i in bs_indices]
+            bs_ablated = [ablated_scores[i] for i in bs_indices]
+            bs_returns = [returns[i] for i in bs_indices]
+
+            bs_benchmarks = (
+                [benchmarks[i] for i in bs_indices]
+                if len(benchmarks) >= n else [0.0] * n
+            )
+            bs_daily = (
+                [daily_rets[i] for i in bs_indices]
+                if len(daily_rets) >= n else bs_returns
+            )
+
+            bs_base_loss = self.loss_engine.compute_total_loss(
+                term, bs_baseline, bs_returns, bs_benchmarks, bs_daily,
+                weights, turnover, cash, sectors
+            )["L_total"]
+            bs_ablate_loss = self.loss_engine.compute_total_loss(
+                term, bs_ablated, bs_returns, bs_benchmarks, bs_daily,
+                weights, turnover, cash, sectors
+            )["L_total"]
+            deltas.append(bs_ablate_loss - bs_base_loss)
+
+        deltas.sort()
+        alpha = (1 - self.significance_level) / 2
+        ci_low = deltas[int(len(deltas) * alpha)]
+        ci_high = deltas[int(len(deltas) * (1 - alpha))]
+
+        return ci_low, ci_high
+
+    @staticmethod
+    def _cluster_by_dates(dates: List[str], cluster_size_days: int = 5) -> List[List[int]]:
+        """Group date-indexed observations into clusters of cluster_size_days.
+
+        Each cluster contains the original indices (0-based) of observations
+        that fall within the same day-block.
+
+        Args:
+            dates: ISO date strings (e.g., "2024-01-15")
+            cluster_size_days: number of days per cluster (default 5 = trading week)
+
+        Returns:
+            List of clusters, each cluster is a list of original indices.
+        """
+        from datetime import datetime as dt, timedelta
+
+        if not dates:
+            return []
+
+        # Parse dates and sort by date with original indices
+        parsed = []
+        for i, d in enumerate(dates):
+            try:
+                parsed.append((i, dt.fromisoformat(d[:10])))
+            except (ValueError, TypeError):
+                parsed.append((i, dt.now()))
+
+        parsed.sort(key=lambda x: x[1])
+
+        clusters = []
+        current_cluster = []
+        cluster_start = None
+
+        for idx, date_obj in parsed:
+            if cluster_start is None:
+                cluster_start = date_obj
+                current_cluster = [idx]
+            elif (date_obj - cluster_start).days < cluster_size_days:
+                current_cluster.append(idx)
+            else:
+                if current_cluster:
+                    clusters.append(current_cluster)
+                cluster_start = date_obj
+                current_cluster = [idx]
+
+        if current_cluster:
+            clusters.append(current_cluster)
+
+        return clusters
 
     def _classify_significance(self, delta: float, ci_low: float, ci_high: float) -> Tuple[str, str]:
         """根据ΔL和CI判断显著性"""

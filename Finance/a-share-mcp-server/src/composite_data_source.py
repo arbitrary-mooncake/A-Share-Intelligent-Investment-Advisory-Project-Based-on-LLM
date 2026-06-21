@@ -1,12 +1,11 @@
 """
-CompositeDataSource: Primary-Fallback data source pattern.
-Tries Baostock first; on NoDataFoundError / DataSourceError, falls back to AKshare.
+CompositeDataSource: AKshare data source with in-memory cache.
 Includes in-memory cache (5-min TTL) to avoid redundant calls within a single session.
 """
 import logging
 import time
 import pandas as pd
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from .data_source_interface import FinancialDataSource, DataSourceError, NoDataFoundError, LoginError
 
@@ -18,41 +17,14 @@ _MEMORY_CACHE_TTL = 300  # 5 分钟
 
 class CompositeDataSource(FinancialDataSource):
     """
-    Wraps an AKshare data source (primary) and a Baostock fallback.
-    AKshare is tried first for speed (no login needed, pure HTTP).
-    Baostock is used only when AKshare fails — and skipped entirely if
-    a connectivity pre-check shows it's unreachable.
-
+    AKshare data source with in-memory cache.
     Maintains an in-memory cache keyed by (method_name, args, kwargs)
     with a 5-min TTL to avoid redundant upstream calls within a session.
     """
 
     def __init__(self, primary: FinancialDataSource, fallback: FinancialDataSource):
-        # Note: in mcp_server.py, primary=Baostock, fallback=AKshare.
-        # We flip them here: try AKshare (fallback) first, then Baostock (primary).
-        self.primary = primary      # Baostock
-        self.fallback = fallback    # AKshare
-        self._baostock_available = True  # will be set to False if pre-check fails
+        self.fallback = fallback    # AKshare (sole active data source)
         self._memory_cache: dict = {}  # key → (timestamp, result)
-
-    def _check_baostock(self) -> bool:
-        """Quick connectivity check for Baostock. Caches result."""
-        if not self._baostock_available:
-            return False
-        try:
-            import baostock as bs
-            lg = bs.login()
-            ok = (lg.error_code == '0')
-            if ok:
-                bs.logout()
-            else:
-                logger.warning(f"[Composite] Baostock login failed: {lg.error_msg}, disabling Baostock")
-                self._baostock_available = False
-            return ok
-        except Exception as e:
-            logger.warning(f"[Composite] Baostock unreachable ({e}), disabling Baostock fallback")
-            self._baostock_available = False
-            return False
 
     @staticmethod
     def _make_cache_key(method_name: str, args: tuple, kwargs: dict) -> str:
@@ -63,8 +35,7 @@ class CompositeDataSource(FinancialDataSource):
 
     def _try(self, method_name: str, *args, **kwargs):
         """
-        Try AKshare first, then Baostock as fallback.
-        This order is faster because AKshare doesn't require login.
+        Try AKshare as the sole data source.
         Results are cached in-memory for 5 minutes to avoid redundant upstream calls.
         """
         # 0. Check memory cache
@@ -76,7 +47,7 @@ class CompositeDataSource(FinancialDataSource):
                 return result
             del self._memory_cache[cache_key]
 
-        # 1. Try AKshare first (fast, no login needed)
+        # 1. Try AKshare (sole data source)
         try:
             fallback_method = getattr(self.fallback, method_name)
             result = fallback_method(*args, **kwargs)
@@ -84,32 +55,18 @@ class CompositeDataSource(FinancialDataSource):
             self._memory_cache[cache_key] = (time.time(), result)
             return result
         except LoginError:
-            # AKshare should never raise LoginError, but handle it
             logger.warning(f"[Composite] AKshare {method_name} login error (unexpected)")
         except NoDataFoundError as e:
-            logger.info(f"[Composite] AKshare {method_name} returned no data ({e}), trying Baostock")
+            logger.info(f"[Composite] AKshare {method_name} returned no data ({e})")
         except DataSourceError as e:
-            logger.warning(f"[Composite] AKshare {method_name} error ({e}), trying Baostock")
+            logger.warning(f"[Composite] AKshare {method_name} error ({e})")
         except Exception as e:
-            logger.warning(f"[Composite] AKshare {method_name} unexpected error ({e}), trying Baostock")
+            logger.warning(f"[Composite] AKshare {method_name} unexpected error ({e})")
 
-        # 2. Baostock fallback
-        if not self._check_baostock():
-            raise DataSourceError(
-                f"Both data sources failed for {method_name}: AKshare returned no data, Baostock unavailable"
-            )
-
-        try:
-            method = getattr(self.primary, method_name)
-            result = method(*args, **kwargs)
-            logger.info(f"[Composite] Baostock fallback {method_name} succeeded")
-            self._memory_cache[cache_key] = (time.time(), result)
-            return result
-        except Exception as baostock_err:
-            logger.error(f"[Composite] Baostock {method_name} also failed: {baostock_err}")
-            raise DataSourceError(
-                f"Both data sources failed for {method_name}: " f"Baostock error={baostock_err}"
-            ) from baostock_err
+        raise DataSourceError(
+            f"AKshare {method_name} failed. "
+            f"Use Tushare MCP tools (tushare_*) for equivalent data."
+        )
 
     # --- Interface methods ---
     def get_historical_k_data(
@@ -189,12 +146,9 @@ class CompositeDataSource(FinancialDataSource):
         return self._try("get_stock_industry", code=code, date=date)
 
     def crawl_news(self, query: str, top_k: int = 10) -> str:
-        """
-        News crawler is only available on Baostock primary.
-        No AKshare fallback.
-        """
+        """News via AkShare East Money (Baostock news crawler disabled)."""
         try:
-            return self.primary.crawl_news(query, top_k)
+            return self.fallback.crawl_news(query, top_k)
         except Exception as e:
-            logger.warning(f"[Composite] Primary crawl_news failed: {e}, no AKshare fallback available")
-            return f"新闻爬取失败: {e} (AKshare不支持此功能)"
+            logger.warning(f"[Composite] crawl_news failed: {e}")
+            return f"新闻获取失败: {e}。请使用 tushare_news 工具获取新闻数据。"

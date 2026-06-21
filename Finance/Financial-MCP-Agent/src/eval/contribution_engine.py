@@ -138,15 +138,26 @@ class ContributionEngine:
 
     def _compute_ablated_loss(self, term: str, ablated: Dict[str, List],
                                baseline_results: Dict[str, List]) -> Dict[str, Any]:
-        """计算消融后的Loss（使用消融线的scores，但组合数据来自基线）"""
+        """计算消融后的Loss。
+
+        优先使用消融线自己的 returns / 组合数据（反映消融后的真实组合表现），
+        当消融线缺失这些字段时回退到基线数据。
+        """
         scores = ablated.get("scores", [])
-        returns = baseline_results.get("returns", [])
-        benchmarks = baseline_results.get("benchmark_returns", [0.0] * len(returns))
-        daily_rets = baseline_results.get("daily_returns", returns)
-        weights = baseline_results.get("holdings_weights", [])
-        turnover = baseline_results.get("turnover_rate", 0.0)
-        cash = baseline_results.get("cash_ratio", 0.0)
-        sectors = baseline_results.get("sector_weights", [])
+        # 优先使用消融线自己的 returns（消融线有自己的交易决策和持仓收益）
+        returns = ablated.get("returns", baseline_results.get("returns", []))
+        benchmarks = ablated.get("benchmark_returns",
+                                 baseline_results.get("benchmark_returns", [0.0] * len(returns)))
+        daily_rets = ablated.get("daily_returns",
+                                  baseline_results.get("daily_returns", returns))
+        weights = ablated.get("holdings_weights",
+                              baseline_results.get("holdings_weights", []))
+        turnover = ablated.get("turnover_rate",
+                               baseline_results.get("turnover_rate", 0.0))
+        cash = ablated.get("cash_ratio",
+                           baseline_results.get("cash_ratio", 0.0))
+        sectors = ablated.get("sector_weights",
+                              baseline_results.get("sector_weights", []))
 
         # Ensure length match
         n = min(len(scores), len(returns))
@@ -164,19 +175,28 @@ class ContributionEngine:
         """Bootstrap置信区间 — 使用完整的L_total而非仅L_return"""
         baseline_scores = baseline.get("scores", [])
         ablated_scores = ablated.get("scores", [])
-        returns = baseline.get("returns", [])
+        # 优先使用消融线自己的 returns（与 _compute_ablated_loss 保持一致）
+        returns = ablated.get("returns", baseline.get("returns", []))
 
         n = min(len(baseline_scores), len(ablated_scores), len(returns))
         if n < 5:
             return observed_delta - 0.05, observed_delta + 0.05
 
-        # Extract shared portfolio data from baseline (same for both lines)
-        daily_rets = baseline.get("daily_returns", returns)
-        benchmarks = baseline.get("benchmark_returns", [0.0] * n)
-        weights = baseline.get("holdings_weights", [])
-        turnover = baseline.get("turnover_rate", 0.0)
-        cash = baseline.get("cash_ratio", 0.0)
-        sectors = baseline.get("sector_weights", [])
+        # Extract shared portfolio data — baseline 用于基线Loss, ablated 用于消融Loss
+        baseline_daily_rets = baseline.get("daily_returns", baseline.get("returns", returns))
+        ablated_daily_rets = ablated.get("daily_returns", returns)
+        baseline_benchmarks = baseline.get("benchmark_returns", [0.0] * n)
+        ablated_benchmarks = ablated.get("benchmark_returns", baseline_benchmarks)
+        baseline_weights = baseline.get("holdings_weights", [])
+        ablated_weights = ablated.get("holdings_weights", baseline_weights)
+        baseline_turnover = baseline.get("turnover_rate", 0.0)
+        ablated_turnover = ablated.get("turnover_rate", baseline_turnover)
+        baseline_cash = baseline.get("cash_ratio", 0.0)
+        ablated_cash = ablated.get("cash_ratio", baseline_cash)
+        baseline_sectors = baseline.get("sector_weights", [])
+        ablated_sectors = ablated.get("sector_weights", baseline_sectors)
+        # 基线的 returns 用于基线Loss计算
+        baseline_returns = baseline.get("returns", returns)
 
         deltas = []
         indices = list(range(n))
@@ -188,23 +208,32 @@ class ContributionEngine:
             bs_returns = [returns[i] for i in sample_idx]
 
             # Resample benchmark and daily returns if available
-            bs_benchmarks = (
-                [benchmarks[i] for i in sample_idx]
-                if len(benchmarks) >= n else [0.0] * n
+            bs_benchmarks_base = (
+                [baseline_benchmarks[i] for i in sample_idx]
+                if len(baseline_benchmarks) >= n else [0.0] * n
             )
-            bs_daily = (
-                [daily_rets[i] for i in sample_idx]
-                if len(daily_rets) >= n else bs_returns
+            bs_benchmarks_ablate = (
+                [ablated_benchmarks[i] for i in sample_idx]
+                if len(ablated_benchmarks) >= n else bs_benchmarks_base
             )
+            bs_daily_base = (
+                [baseline_daily_rets[i] for i in sample_idx]
+                if len(baseline_daily_rets) >= n else [baseline_returns[i] for i in sample_idx]
+            )
+            bs_daily_ablate = (
+                [ablated_daily_rets[i] for i in sample_idx]
+                if len(ablated_daily_rets) >= n else bs_returns
+            )
+            bs_returns_base = [baseline_returns[i] for i in sample_idx] if len(baseline_returns) >= n else bs_returns
 
             # Compute full L_total for both lines (not just L_return)
             bs_base_loss = self.loss_engine.compute_total_loss(
-                term, bs_baseline, bs_returns, bs_benchmarks, bs_daily,
-                weights, turnover, cash, sectors
+                term, bs_baseline, bs_returns_base, bs_benchmarks_base, bs_daily_base,
+                baseline_weights, baseline_turnover, baseline_cash, baseline_sectors
             )["L_total"]
             bs_ablate_loss = self.loss_engine.compute_total_loss(
-                term, bs_ablated, bs_returns, bs_benchmarks, bs_daily,
-                weights, turnover, cash, sectors
+                term, bs_ablated, bs_returns, bs_benchmarks_ablate, bs_daily_ablate,
+                ablated_weights, ablated_turnover, ablated_cash, ablated_sectors
             )["L_total"]
             deltas.append(bs_ablate_loss - bs_base_loss)
 
@@ -238,19 +267,27 @@ class ContributionEngine:
         """
         baseline_scores = baseline.get("scores", [])
         ablated_scores = ablated.get("scores", [])
-        returns = baseline.get("returns", [])
+        # 优先使用消融线自己的 returns
+        returns = ablated.get("returns", baseline.get("returns", []))
 
         n = min(len(baseline_scores), len(ablated_scores), len(returns), len(dates))
         if n < 5:
             return observed_delta - 0.05, observed_delta + 0.05
 
-        # Extract shared portfolio data
-        daily_rets = baseline.get("daily_returns", returns)
-        benchmarks = baseline.get("benchmark_returns", [0.0] * n)
-        weights = baseline.get("holdings_weights", [])
-        turnover = baseline.get("turnover_rate", 0.0)
-        cash = baseline.get("cash_ratio", 0.0)
-        sectors = baseline.get("sector_weights", [])
+        # Extract portfolio data for both lines
+        baseline_daily_rets = baseline.get("daily_returns", baseline.get("returns", returns))
+        ablated_daily_rets = ablated.get("daily_returns", returns)
+        baseline_benchmarks = baseline.get("benchmark_returns", [0.0] * n)
+        ablated_benchmarks = ablated.get("benchmark_returns", baseline_benchmarks)
+        baseline_weights = baseline.get("holdings_weights", [])
+        ablated_weights = ablated.get("holdings_weights", baseline_weights)
+        baseline_turnover = baseline.get("turnover_rate", 0.0)
+        ablated_turnover = ablated.get("turnover_rate", baseline_turnover)
+        baseline_cash = baseline.get("cash_ratio", 0.0)
+        ablated_cash = ablated.get("cash_ratio", baseline_cash)
+        baseline_sectors = baseline.get("sector_weights", [])
+        ablated_sectors = ablated.get("sector_weights", baseline_sectors)
+        baseline_returns = baseline.get("returns", returns)
 
         # Group observations into clusters by date
         date_indices = list(range(n))
@@ -284,23 +321,32 @@ class ContributionEngine:
             bs_baseline = [baseline_scores[i] for i in bs_indices]
             bs_ablated = [ablated_scores[i] for i in bs_indices]
             bs_returns = [returns[i] for i in bs_indices]
+            bs_returns_base = [baseline_returns[i] for i in bs_indices] if len(baseline_returns) >= n else bs_returns
 
-            bs_benchmarks = (
-                [benchmarks[i] for i in bs_indices]
-                if len(benchmarks) >= n else [0.0] * n
+            bs_benchmarks_base = (
+                [baseline_benchmarks[i] for i in bs_indices]
+                if len(baseline_benchmarks) >= n else [0.0] * n
             )
-            bs_daily = (
-                [daily_rets[i] for i in bs_indices]
-                if len(daily_rets) >= n else bs_returns
+            bs_benchmarks_ablate = (
+                [ablated_benchmarks[i] for i in bs_indices]
+                if len(ablated_benchmarks) >= n else bs_benchmarks_base
+            )
+            bs_daily_base = (
+                [baseline_daily_rets[i] for i in bs_indices]
+                if len(baseline_daily_rets) >= n else bs_returns_base
+            )
+            bs_daily_ablate = (
+                [ablated_daily_rets[i] for i in bs_indices]
+                if len(ablated_daily_rets) >= n else bs_returns
             )
 
             bs_base_loss = self.loss_engine.compute_total_loss(
-                term, bs_baseline, bs_returns, bs_benchmarks, bs_daily,
-                weights, turnover, cash, sectors
+                term, bs_baseline, bs_returns_base, bs_benchmarks_base, bs_daily_base,
+                baseline_weights, baseline_turnover, baseline_cash, baseline_sectors
             )["L_total"]
             bs_ablate_loss = self.loss_engine.compute_total_loss(
-                term, bs_ablated, bs_returns, bs_benchmarks, bs_daily,
-                weights, turnover, cash, sectors
+                term, bs_ablated, bs_returns, bs_benchmarks_ablate, bs_daily_ablate,
+                ablated_weights, ablated_turnover, ablated_cash, ablated_sectors
             )["L_total"]
             deltas.append(bs_ablate_loss - bs_base_loss)
 
@@ -400,8 +446,9 @@ def permutation_test(
     returns: List[float], n_permutations: int = 10000
 ) -> Dict[str, Any]:
     """Permutation Test: 随机打乱标签，测试ΔL是否显著"""
-    observed = LossEngine().compute_L_return(all_scores, returns)["L_return"]
-    observed_ablate = LossEngine().compute_L_return(ablated_scores, returns)["L_return"]
+    engine = LossEngine()  # 复用单一实例
+    observed = engine.compute_L_return(all_scores, returns)["L_return"]
+    observed_ablate = engine.compute_L_return(ablated_scores, returns)["L_return"]
     observed_delta = observed_ablate - observed
 
     n = len(all_scores)
@@ -416,8 +463,8 @@ def permutation_test(
         group_a = [c[0] for c in combined[:half]] + [c[1] for c in combined[half:]]
         group_b = [c[0] for c in combined[half:]] + [c[1] for c in combined[:half]]
 
-        loss_a = LossEngine().compute_L_return(group_a[:n], returns[:len(group_a)])["L_return"]
-        loss_b = LossEngine().compute_L_return(group_b[:n], returns[:len(group_b)])["L_return"]
+        loss_a = engine.compute_L_return(group_a[:n], returns[:len(group_a)])["L_return"]
+        loss_b = engine.compute_L_return(group_b[:n], returns[:len(group_b)])["L_return"]
         permuted_deltas.append(loss_b - loss_a)
 
     permuted_deltas.sort()

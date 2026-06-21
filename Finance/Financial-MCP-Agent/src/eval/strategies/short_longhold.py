@@ -213,9 +213,12 @@ class ShortLongHoldStrategy(BaseStrategy):
             if code in holdings:
                 self._add_cooldown[code] += 1
 
-        # ── 清理不在池子中的 pending ──
+        # ── 清理不在池子中的 pending 和未成交的 Day1 残留 ──
         for code in list(self._pending_builds.keys()):
             if code not in pool:
+                del self._pending_builds[code]
+            elif self._pending_builds[code].get("target_value", 0) <= 0:
+                # Day1订单未在size_positions中成交（资金不足/槽位满），清理残留
                 del self._pending_builds[code]
 
         return orders

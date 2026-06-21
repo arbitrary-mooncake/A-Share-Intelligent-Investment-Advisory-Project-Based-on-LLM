@@ -376,7 +376,7 @@ class AkshareDataSource(FinancialDataSource):
 
     # ---- Index constituents ----
     def get_sz50_stocks(self, date: Optional[str] = None) -> pd.DataFrame:
-        return self._get_index_constituents("000016", "SZSE 50")
+        return self._get_index_constituents("000016", "SSE 50")
 
     def get_hs300_stocks(self, date: Optional[str] = None) -> pd.DataFrame:
         return self._get_index_constituents("000300", "CSI 300")

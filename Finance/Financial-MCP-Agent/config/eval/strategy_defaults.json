@@ -1,0 +1,59 @@
+{
+  "_comment": "交易策略参数默认值 — 评测系统所有可配置策略参数。",
+  "_note": "这些值覆盖 src/eval/config.py 中的代码默认值，可通过环境变量 EVAL_<KEY> 进一步覆盖。",
+
+  "strategy_short_ablation": {
+    "max_positions_short_ablation": 10,
+    "single_weight_limit_short_ablation": 0.10,
+    "score_buy_threshold_short": 60
+  },
+
+  "strategy_short_longhold": {
+    "max_positions_short_longhold": 12,
+    "single_weight_limit_short_longhold": 0.12,
+    "min_cash_ratio_short": 0.10,
+    "score_buy_threshold_short": 60,
+    "score_sell_hard_short": 35,
+    "score_sell_soft_low_short": 35,
+    "score_sell_soft_high_short": 45,
+    "max_hold_days_short": 20,
+    "profit_protection_drawdown_pct": 0.08,
+    "turnover_anomaly_threshold": 0.25,
+    "max_sector_concentration": 0.35,
+    "position_weight_factor": 50
+  },
+
+  "strategy_medium_term": {
+    "max_positions_medium": 8,
+    "single_weight_limit_medium": 0.18,
+    "min_cash_ratio_medium": 0.15,
+    "score_buy_threshold_medium": 65,
+    "score_sell_hard_medium": 45,
+    "max_drawdown_sell_medium": 0.15,
+    "max_hold_days_medium": 60
+  },
+
+  "strategy_long_term": {
+    "max_positions_long": 5,
+    "single_weight_limit_long": 0.25,
+    "min_cash_ratio_long": 0.20,
+    "score_buy_threshold_long": 70,
+    "score_sell_hard_long": 35,
+    "max_hold_days_long": 252
+  },
+
+  "market_simulator": {
+    "commission_rate": 0.00025,
+    "min_commission": 5.0,
+    "transfer_fee_rate": 0.00002,
+    "stamp_tax_rate": 0.001,
+    "slippage_base": 0.0005,
+    "slippage_hs300": 0.0002,
+    "slippage_small_cap": 0.001,
+    "max_single_order_ratio": 0.05,
+    "max_daily_buy_ratio": 0.10,
+    "suspension_force_days": 20,
+    "suspension_discount": 0.95,
+    "small_cap_threshold": 5000000000
+  }
+}

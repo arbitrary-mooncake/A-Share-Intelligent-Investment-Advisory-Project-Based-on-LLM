@@ -40,4 +40,13 @@ with col3:
     st.caption("公募基金 & ETF多维分析 + 评分 + 报告")
 
 st.markdown("---")
+
+col1_r2, col2_r2, col3_r2 = st.columns(3)
+
+with col1_r2:
+    st.page_link("pages/06_模拟分析与迭代.py", label="📈 模拟分析与迭代", icon="📈",
+                 help="模拟盘评估、消融实验、回测、自动优化 — 系统自我迭代引擎")
+    st.caption("14条实盘模拟 + 回测消融 + Agent贡献归因 + 自动优化")
+
+st.markdown("---")
 st.caption("提示：也可以使用左侧边栏 `〉` 直接切换页面")

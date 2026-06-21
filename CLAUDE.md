@@ -147,6 +147,98 @@ When `news` conflicts with `event`, `event` wins. Reports must surface conflicts
 
 Cache hit restores both text AND structured signal_pack (via `read_signal_pack_cache` → fallback re-extraction from cached LLM text).
 
+## Eval/Backtest System (V2 — 2026-06 upgrade)
+
+The eval system (`src/eval/`) is an **evaluation control tower** surrounding the main advisory system. It runs simulation trading (14 lines) and historical backtesting (23 lines) to measure agent contributions via ablation experiments.
+
+Design spec: `评分智能体开发总纲.md` at repo root. All eval design decisions reference this document.
+
+### Line Architecture (总纲 §3)
+
+**14 live simulation lines** (`src/eval/line_manager.py`):
+- Short-term (10 lines): S-L0 (ablation baseline, all 7 agents) → S-L7 (minus moneyflow), S-L8 (longhold with mature short-term strategy), S-L9 (LLM free)
+- Medium-term (2 lines): M-L0 (all agents), M-L1 (LLM free)
+- Long-term (2 lines): L-L0 (all agents), L-L1 (LLM free)
+
+**23 backtest lines** (`src/eval/replay_backtest_engine.py`):
+- SB-L0~SB-L6 (7 short), MB-L0~MB-L7 (8 medium), LB-L0~LB-L7 (8 long)
+- MB-L6/LB-L6 and MB-L7/LB-L7 are degenerate lines (remove news/event, already disabled in backtest) → consistency checks
+- SB-L6 is a reference line (continuous holding with ShortLongHoldStrategy), NOT used in ablation ΔLoss
+
+### Core Pipeline
+
+```
+run_full_check() → detect_missed_days() → catch_up (≤7 days) →
+  settle_historical() → run_daily_rebalance() → run_daily_settlement() →
+  ReportBuilder → ReportWriterAgent (DeepSeek V4 Pro) → MemoryManager
+```
+
+### Key Modules
+
+| Module | Role |
+|--------|------|
+| `orchestrator.py` | Central scheduler: full check, rebalance, settlement, catch-up, pool update |
+| `market_simulator.py` | Shared trade execution: commission, stamp tax, slippage, volume constraints, limit up/down, suspension, T+1 |
+| `loss_engine.py` | Multi-dim Loss: L_total = w_effect×L_effect + w_stability×L_stability + w_efficiency×L_efficiency |
+| `contribution_engine.py` | Agent ablation ΔLoss with Bootstrap CI, Cluster Bootstrap (short-term), Permutation Test |
+| `replay_backtest_engine.py` | PIT backtest: per-anchor agent analysis via cache, regime slicing (bull/bear/ranging) |
+| `pool_manager.py` | 3 refined pools (short/medium/long) with health monitoring (5 trigger conditions from 总纲 §4.2) |
+| `pool_screening.py` | 4-layer screening pipeline: hard screen → batch score (M1/M3) → quick screen (M2) → formal scoring |
+| `fidelity_engine.py` | Detects score drift between eval model (M5) and production models (M1/M3) |
+| `report_writer_agent.py` | LLM report writing via DeepSeek V4 Pro with anti-hallucination verification |
+| `memory_manager.py` | Long-term trend storage: score/loss/contribution/fidelity/runtime histories |
+| `chart_service.py` | Trend data generation for Streamlit charts (5 tabs) |
+
+### Strategies (总纲 §5)
+
+All strategies are pure code, no LLM calls (except LLM Free). Implemented in `src/eval/strategies/`:
+- **ShortAblationStrategy** (`short_ablation.py`): Daily clear + Top-N by score, for ablation lines S-L0~S-L7
+- **ShortLongHoldStrategy** (`short_longhold.py`): Continuous holding with multi-signal protection, for S-L8
+- **MediumTermStrategy** (`medium_term.py`): Value + trend, weekly rebalance, cross-term synergy with long scores
+- **LongTermStrategy** (`long_term.py`): Deep value, monthly rebalance, buy-more-on-dips, very restrained selling
+- **LLMFreeStrategy** (`llm_free.py`): DeepSeek V4 Pro autonomous decisions using raw market data ONLY (NO Agent scores per 总纲 §3.5)
+
+### Adapter Layer
+
+`src/eval/adapters/stock_pipeline_adapter.py`:
+- `run_stock_analysis(stock_code, company_name, as_of_date, eval_mode)` — non-invasive wrapper around `ScoringEngine.score_stock()`
+- Returns scores + signal_packs + analysis_texts for all 3 terms
+- `_build_decision_pack()` — maps scorer JSON output to `DecisionPack` dataclass
+
+### Cache Architecture (总纲 §14)
+
+**Dual cache system — production and eval are physically isolated:**
+
+| | Production Cache | Eval Cache |
+|---|---|---|
+| Directory | `data/intermediate_cache/` | `data/eval/cache/` |
+| Module | `cache_utils.py` | `eval/cache.py` |
+| Key suffix | (none) | `_eval` |
+| Model | M1/M3 | M5 (MiMo-V2.5) |
+
+**Cache namespace switching** (`cache_utils.set_cache_namespace()`):
+- Pool screening (M1/M3) → namespace=None → writes to `intermediate_cache/` → **shared with production**
+- Daily simulation/backtest (M5) → namespace="eval" → writes to `eval/cache/` → **strictly isolated**
+- `finish_batch()` auto-resets namespace to None
+
+**Per-agent independent caching**: Each of the 7 agents caches its signal_pack separately with its own TTL (fundamental=15d, value=7d, quality_risk=7d, technical/news/event/moneyflow=1d). When all 7 agent caches are fresh, the LLM pipeline is skipped.
+
+**Graded scoring frequency** (总纲 §14.4): Stocks analyzed at different cadences based on score tier:
+- Holdings + high-volatility candidates: daily
+- Stable high-score (score>75, low vol): every 3 days
+- Mid-range (score 45-65): every 5 days
+- Stable low-score (score<45): every 7 days
+- Monday full coverage for all tiers
+
+### Eval-Specific Constraints
+
+- **Max catch-up: 7 trading days** (总纲 §7.1). If missed days > 7, reset to latest trading day with empty positions.
+- **Tushare unavailable → hard error** (`TushareUnavailableError` in `data_fetcher.py`). Never fall back to simulated/estimated data. 总纲 §20.2 第10条.
+- **LLM Free lines**: DeepSeek V4 Pro makes autonomous decisions using raw Tushare MCP data ONLY. Agent scores/signal_packs/analysis_packages are FORBIDDEN in LLM Free prompts (总纲 §3.5).
+- **Market regime slicing**: Backtest can optionally run `run_regime_analysis()` to compare agent contributions in bull/bear/ranging markets.
+- **10-batch minimum for trend charts**: Trend curves only render after ≥10 batches accumulated, otherwise show progress bar.
+- **Progress bars**: All operations >1 second MUST show `st.progress()` + `st.status()` in Streamlit (总纲 §16.1.9).
+
 ## Commands
 
 All commands run from `Finance/Financial-MCP-Agent/`.
@@ -169,6 +261,17 @@ python -m src.main_pool add 603871 嘉友国际    # Add to pool (default: mediu
 python -m src.main_pool score 603871          # Score (all 3 terms)
 python -m src.main_pool report 603871         # View score details
 python -m src.fund_main --command "分析华夏上证50ETF"  # Fund analysis
+
+# Eval system
+python -m src.eval check              # One-click daily check (rebalance + settlement)
+python -m src.eval status             # View all line status
+python -m src.eval pool status --term short  # View refined pool
+python -m src.eval pool update --term short --mode full  # Full pool update (4-layer pipeline)
+python -m src.eval backtest --term medium --start 2024-01-01 --end 2025-12-31  # Run backtest
+python -m src.eval report --latest    # View latest evaluation report
+python -m src.eval trends --metric score --term medium --days 90  # View trends
+python -m src.eval agent-contribution --term medium --source backtest  # Agent contribution data
+python -m src.eval optimize --analyze  # Generate optimization suggestions
 ```
 
 ### Testing
@@ -188,7 +291,8 @@ python -m pytest tests/test_risk_gate.py -v         # Risk gate rules
 | M2 | `_2` | Qwen3.6-Flash | Quick query, quick-screen, batch scoring |
 | M3 | `_3` | Qwen3.7-Plus | technical, news, short scorer, event, moneyflow, fund manager/event/fee/doc/benchmark |
 | M4 | `_4` | (unused — migrated to M1) | Previously Kimi K2.6 for fundamental/value |
-| M5 | `_5` | MiMo-V2.5 | qa_engine; complex → M1 (qa_engine_pro) |
+| M5 | `_5` | MiMo-V2.5 | qa_engine; complex → M1 (qa_engine_pro). **Also used by eval system** for daily simulation/backtest agent analysis (cost-effective). |
+| M6 | `_6` | DeepSeek V4 Pro | **Eval system orchestrator**: ablation analysis, root cause diagnosis, optimization suggestions, report writing, LLM free investment lines. Must use anti-hallucination verification (§12 of 总纲). |
 
 Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}`, `OPENAI_COMPATIBLE_MODEL{_N}`.
 `get_thinking_body()` handles DashScope (`enable_thinking`) vs OpenAI-compatible (`thinking.type`) parameter formats.
@@ -200,7 +304,7 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - `src/utils/risk_gate.py` — 4-rule post-scoring risk gate for A-stock
 - `src/utils/fund_risk_gate.py` — 10-rule risk gate for fund scoring
 - `src/utils/tool_cache.py` — In-memory MCP tool result cache (5-min TTL, asyncio.Lock, 500-entry cap)
-- `src/utils/cache_utils.py` — File-based intermediate cache with per-agent TTL; `read/write_signal_pack_cache()`
+- `src/utils/cache_utils.py` — File-based intermediate cache with per-agent TTL; `read/write_signal_pack_cache()`. V2 adds `set_cache_namespace("eval" | None)` for production vs eval cache isolation (thread-safe). Eval namespace routes writes to `data/eval/cache/` with `_eval` suffix, production writes to `data/intermediate_cache/` without suffix.
 - `src/utils/fetch_utils.py` — `retry_failed_fetches()` with `alt_kwargs_list` support
 - `src/utils/model_config.py` — Centralized agent→model mapping; `get_model_config_for_agent()`, `get_thinking_body()`
 - `src/utils/industry_knowledge.py` — 25 Shenwan industry PE/PB/ROE benchmarks
@@ -217,6 +321,11 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - **Do NOT hardcode model names** — use `get_model_config_for_agent()` from `model_config.py`
 - **Do NOT skip the cache-hit signal_pack fallback** — every agent must restore signal_pack on cache hit (try `read_signal_pack_cache` → regex re-extraction → `text_to_signal_pack`)
 - **Do NOT remove the `merge_dicts` reducer** — parallel agent writes depend on it
+- **Do NOT contaminate production cache with M5 results** — daily simulation/backtest MUST use `cache_namespace="eval"` to isolate M5 outputs in `data/eval/cache/`. Only pool screening (M1/M3) writes to production cache.
+- **Do NOT use Agent scores in LLM Free prompts** — total纲 §3.5 prohibits passing `{agent}_score`, `{agent}_signal_pack`, or `analysis_package` to LLM free lines.
+- **Do NOT fall back to simulated/estimated data when Tushare is down** — raise `TushareUnavailableError` and stop. 总纲 §20.2 第10条.
+- **Do NOT skip eval cache (_eval suffix)** — all eval agent cache keys must use the `_eval` suffix to prevent cross-contamination with production cache.
+- **Do NOT modify 总纲 without updating CLAUDE.md** — the two documents must stay in sync on architecture, constraints, and design decisions.
 
 ## Windows-Specific Notes
 

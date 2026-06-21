@@ -276,23 +276,22 @@ class MarketSimulator:
             result.reject_reason = "计算后数量为零"
             return result
 
-        # 6. 成交量约束检查
-        reason = self._check_volume(order, market_data)
-        if reason == RejectReason.LIQUIDITY.value:
-            # 尝试缩减到最大允许量
+        # 6. 成交量约束检查（使用实际成交额而非目标金额）
+        if order.direction == "buy" and market_data.amount > 0:
             max_single = market_data.amount * self.MAX_SINGLE_ORDER_RATIO
             daily_bought = self._daily_bought.get(order.stock_code, 0)
             remaining = market_data.amount * self.MAX_DAILY_BUY_RATIO - daily_bought
             max_allowable = min(max_single, max(remaining, 0))
-            if max_allowable <= 0:
-                result.status = OrderStatus.REJECTED.value
-                result.reject_reason = RejectReason.LIQUIDITY.value
-                return result
-            scale = max_allowable / result.actual_value
-            result.quantity = int(result.quantity * scale / 100) * 100
-            result.actual_value = result.quantity * result.actual_price
-            result.status = OrderStatus.PARTIAL.value
-            result.flags.append("流动性受限")
+            if result.actual_value > max_allowable:
+                if max_allowable <= 0:
+                    result.status = OrderStatus.REJECTED.value
+                    result.reject_reason = RejectReason.LIQUIDITY.value
+                    return result
+                scale = max_allowable / result.actual_value
+                result.quantity = int(result.quantity * scale / 100) * 100
+                result.actual_value = result.quantity * result.actual_price
+                result.status = OrderStatus.PARTIAL.value
+                result.flags.append("流动性受限")
 
         # 7. 计算交易成本
         result.commission, result.transfer_fee, result.stamp_tax, result.net_cost = \

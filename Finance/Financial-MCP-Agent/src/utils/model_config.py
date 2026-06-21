@@ -14,7 +14,7 @@
   - 提取 get_thinking_body() 统一 thinking 参数格式（DashScope/Qwen 用 enable_thinking，其余用 thinking.type）
 """
 import os
-from typing import Dict, Optional
+from typing import Dict, Any, Optional
 
 from dotenv import load_dotenv
 
@@ -71,6 +71,62 @@ def get_thinking_body(base_url: str, enabled: bool = True) -> dict:
     if "dashscope" in base_url.lower():
         return {"enable_thinking": True}
     return {"thinking": {"type": "enabled"}}
+
+
+# ── 评测系统模型Profiles（总纲 §13.3）──
+# 通过 get_eval_model_config() 调用，不走 AGENT_MODEL_SUFFIX
+EVAL_PROFILES: Dict[str, Dict[str, Any]] = {
+    "eval_analysis": {       # 评测分析Agent（日常高频）→ MiMo-V2.5
+        "suffix": "_5",
+        "thinking": True,
+        "max_tokens": 8000,
+        "timeout": 360,
+    },
+    "eval_orchestrator": {  # 评测运筹调度（按需）→ DeepSeek V4 Pro
+        "suffix": "_6",
+        "thinking": True,
+        "max_tokens": 16000,
+        "timeout": 600,
+    },
+    "eval_llm_free": {      # LLM自由投资线 → DeepSeek V4/V4.1
+        "suffix": "_6",
+        "thinking": True,
+        "max_tokens": 16000,
+        "timeout": 600,
+    },
+}
+
+
+def get_eval_model_config(profile: str = "eval_analysis") -> Dict[str, str]:
+    """
+    获取评测系统的模型配置。
+
+    Args:
+        profile: 评测模型profile名称
+            - "eval_analysis": 日常分析Agent（MiMo-V2.5, 性价比高）
+            - "eval_orchestrator": 运筹调度（DeepSeek V4 Pro, 最强分析）
+            - "eval_llm_free": LLM自由投资线（DeepSeek V4/V4.1）
+
+    Returns: {"api_key": ..., "base_url": ..., "model_name": ...}
+    """
+    profile_cfg = EVAL_PROFILES.get(profile, {"suffix": "_5"})
+    suffix = profile_cfg.get("suffix", "_5")
+
+    api_key = os.getenv(f"{BASE_PREFIX}_API_KEY{suffix}", "")
+    base_url = os.getenv(f"{BASE_PREFIX}_BASE_URL{suffix}", "")
+    model_name = os.getenv(f"{BASE_PREFIX}_MODEL{suffix}", "")
+
+    # 回退: 如果指定模型未配置 → 回退到Model 1
+    if not all([api_key, base_url, model_name]):
+        api_key = os.getenv(f"{BASE_PREFIX}_API_KEY", "")
+        base_url = os.getenv(f"{BASE_PREFIX}_BASE_URL", "")
+        model_name = os.getenv(f"{BASE_PREFIX}_MODEL", "mimo-v2.5-pro")
+
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model_name": model_name,
+    }
 
 
 def get_model_config_for_agent(

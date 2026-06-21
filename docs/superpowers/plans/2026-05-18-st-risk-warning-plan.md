@@ -13,7 +13,7 @@
 ### Task 1: Add `get_st_risk_data` tool to local a-share-mcp
 
 **Files:**
-- Modify: `Finance/a-share-mcp-is-just-i-need/src/tools/stock_market.py` (append new tool)
+- Modify: `Finance/a-share-mcp-server/src/tools/stock_market.py` (append new tool)
 
 - [ ] **Step 1: Add `get_st_risk_data` tool function**
 
@@ -96,7 +96,7 @@ The tool uses AkShare directly (bypassing data source interface), matching the p
 ### Task 2: Add `tushare_st_status` tool to Tushare MCP server
 
 **Files:**
-- Modify: `Finance/a-share-mcp-is-just-i-need/tushare_mcp_server.py` (lines 267-273, before `if __name__`)
+- Modify: `Finance/a-share-mcp-server/tushare_mcp_server.py` (lines 267-273, before `if __name__`)
 
 - [ ] **Step 1: Add `ts_st_status` data function**
 
@@ -324,7 +324,7 @@ Since scorers already extract and read the full analysis text from fundamental_a
 - [ ] **Step 1: Test `get_st_risk_data` tool independently**
 
 ```bash
-cd Finance/a-share-mcp-is-just-i-need && python -c "
+cd Finance/a-share-mcp-server && python -c "
 import akshare as ak
 # Test with normal stock
 df = ak.stock_info_a_code_name()
@@ -339,7 +339,7 @@ print('ST stock:', row_st.iloc[0].to_dict() if not row_st.empty else 'Not found'
 - [ ] **Step 2: Test `tushare_st_status` tool independently**
 
 ```bash
-cd Finance/a-share-mcp-is-just-i-need && python -c "
+cd Finance/a-share-mcp-server && python -c "
 from tushare_mcp_server import ts_st_status
 print('Normal stock:', ts_st_status('603871'))
 print('ST stock:', ts_st_status('000004'))

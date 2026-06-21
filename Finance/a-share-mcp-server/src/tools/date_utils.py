@@ -47,7 +47,7 @@ def register_date_utils_tools(app: FastMCP, active_data_source: FinancialDataSou
             today = datetime.now().strftime("%Y-%m-%d")
             # 获取当前日期前后一周的交易日历
             start_date = (datetime.now().replace(day=1)).strftime("%Y-%m-%d")
-            end_date = (datetime.now().replace(day=28)).strftime("%Y-%m-%d")
+            end_date = datetime.now().strftime("%Y-%m-%d")
 
             df = active_data_source.get_trade_dates(
                 start_date=start_date, end_date=end_date)

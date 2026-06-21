@@ -422,14 +422,18 @@ async def _dynamic_threshold(scores: List[float], target_size: int) -> float:
     # 用LLM微调阈值
     try:
         from src.utils.llm_clients import OpenAICompatibleClient
-        import os
+        from src.utils.model_config import get_eval_model_config, get_thinking_body
+
+        # 精筛池阈值设定属于评测调度逻辑，使用 eval_orchestrator profile (DeepSeek V4 Pro)
+        # 而非生产模型，避免污染生产缓存与模型配额
+        model_cfg = get_eval_model_config("eval_orchestrator")
 
         llm = OpenAICompatibleClient(
-            api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY", ""),
-            base_url=os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""),
-            model=os.getenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro"),
+            api_key=model_cfg["api_key"],
+            base_url=model_cfg["base_url"],
+            model=model_cfg["model_name"],
             env_prefix="",
-            extra_body={"thinking": {"type": "enabled"}},
+            extra_body=get_thinking_body(model_cfg["base_url"], enabled=True),
             http_timeout=60,
         )
 

@@ -215,13 +215,17 @@ class LLMFreeStrategy(BaseStrategy):
     def _format_stocks_data(self, pool: List[str],
                             scores: Dict[str, float],
                             market_data_map: Dict[str, Any]) -> str:
-        """将精筛池股票格式化为 LLM 可读的文本表格。"""
+        """
+        将精筛池股票格式化为 LLM 可读的文本表格。
+
+        总纲 §3.5: LLM自由线不可使用任何Agent评分数值。
+        scores参数保留用于API兼容但不再输出到prompt中。
+        """
         lines = []
         for code in pool:
-            score = scores.get(code, 0)
             md = market_data_map.get(code) if market_data_map else None
 
-            parts = [f"| {code} | score={score:.0f}"]
+            parts = [f"| {code}"]
             if md:
                 parts.append(f"close={md.close:.2f}")
                 if hasattr(md, 'pre_close') and md.pre_close > 0:
@@ -292,7 +296,7 @@ class LLMFreeStrategy(BaseStrategy):
             ]
             if pnl_pct:
                 parts.append(f"| {pnl_pct}")
-            parts.append(f"| 持有{days}天 | score={score:.0f}")
+            parts.append(f"| 持有{days}天")
 
             # 额外信号
             signals = []
@@ -333,11 +337,10 @@ class LLMFreeStrategy(BaseStrategy):
 - 当前持仓:
 {holdings_info}
 
-## 可选股票池（含Agent评分和市场数据）
+## 可选股票池（仅原始市场数据，不含任何Agent评分）
 {stocks_data}
 
 ## 数据字段说明
-- score: Agent系统的综合评分（0-100，越高越好，仅供参考）
 - close: 当日收盘价（元）
 - chg: 当日涨跌幅
 - turnover: 换手率
@@ -348,7 +351,7 @@ class LLMFreeStrategy(BaseStrategy):
 - 沪深300: 是否为沪深300成分股
 
 ## 决策要求
-1. 基于你的专业判断，从股票池中选出值得买入的股票
+1. 仅基于原始市场数据（价格/估值/流动性/市值等）独立判断，不得依赖任何外部评分
 2. 考虑投资期限：短线注重动量和资金面，中线注重估值和基本面，长线注重质量和护城河
 3. 每只入选股票必须给出买入金额（target_value），总和不超过可用现金
 4. 不要买入【涨停】或【停牌】的股票，[跌停]的股票谨慎处理
@@ -390,15 +393,14 @@ class LLMFreeStrategy(BaseStrategy):
 - price: 当前价格（元）
 - 盈亏: 相对买入价的盈亏百分比
 - 持有X天: 已持有交易日数
-- score: Agent最新综合评分（0-100，越低越危险）
 - 换手: 当日换手率
 - PE: 市盈率
 
 ## 卖出决策指引
-- 硬止损参考：score < {sell_hard} 通常建议清仓
+- 仅基于原始市场数据判断（价格走势/估值变化/换手异常/涨跌停等）
 - 短线考量：日涨幅过大、量价背离、换手异常
-- 中线考量：基本面恶化、估值过高、趋势破位
-- 长线考量：护城河受损、长期逻辑破坏
+- 中线考量：估值过高、趋势破位、基本面数据恶化
+- 长线考量：长期逻辑破坏、估值极端
 - 可以部分卖出（sell_ratio: 0-1之间的小数），不需要全部清仓
 - 如果持仓质量良好，可以不卖出（返回空数组）
 

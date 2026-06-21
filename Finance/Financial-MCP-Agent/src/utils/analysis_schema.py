@@ -79,6 +79,81 @@ class RiskGateResult:
     warnings: List[str]
 
 
+@dataclass
+class DecisionPack:
+    """最终决策结构化产物 — 评测系统的核心输入。
+
+    signal_pack 描述"证据"，decision_pack 描述"最终决策"。
+    """
+    asset_type: str             # "stock" / "fund"
+    symbol: str                 # 股票/基金代码
+    name: str = ""              # 名称
+    task_type: str = ""         # "single_stock" / "stock_pool" / "fund_analysis"
+    term: str = ""              # "short" / "medium" / "long" / "fund"
+    as_of_date: str = ""        # 评测时点 YYYY-MM-DD
+    action: str = ""            # "strong_buy" / "buy" / "cautious_buy" / "hold" / "cautious_sell" / "sell" / "strong_sell"
+    score: float = 0.0          # 0-100
+    confidence: float = 0.0     # 0-1
+    data_quality_score: float = 0.0  # 0-1
+    risk_gate_applied: bool = False
+    risk_gate_result: Optional[Dict[str, Any]] = None
+    supporting_agents: Optional[List[str]] = None
+    missing_agents: Optional[List[str]] = None
+    key_positive_signals: Optional[List[str]] = None
+    key_negative_signals: Optional[List[str]] = None
+    conflicts: Optional[List[str]] = None
+    model_profile: str = ""
+    version_hash: str = ""
+    meta: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def normalize(data: Dict[str, Any]) -> 'DecisionPack':
+        """从dict构造DecisionPack，做类型标准化和fallback"""
+        if not data or not isinstance(data, dict):
+            return DecisionPack(asset_type="unknown", symbol="unknown")
+
+        def _safe_float(v, default=0.0):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return default
+
+        def _safe_bool(v, default=False):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.lower() in ("true", "1", "yes")
+            return default
+
+        return DecisionPack(
+            asset_type=str(data.get("asset_type", "unknown")),
+            symbol=str(data.get("symbol", "unknown")),
+            name=str(data.get("name", "")),
+            task_type=str(data.get("task_type", "")),
+            term=str(data.get("term", "")),
+            as_of_date=str(data.get("as_of_date", "")),
+            action=str(data.get("action", "")),
+            score=_safe_float(data.get("score"), 0.0),
+            confidence=_safe_float(data.get("confidence"), 0.0),
+            data_quality_score=_safe_float(data.get("data_quality_score"), 0.0),
+            risk_gate_applied=_safe_bool(data.get("risk_gate_applied")),
+            risk_gate_result=data.get("risk_gate_result") if isinstance(data.get("risk_gate_result"), dict) else None,
+            supporting_agents=data.get("supporting_agents") if isinstance(data.get("supporting_agents"), list) else None,
+            missing_agents=data.get("missing_agents") if isinstance(data.get("missing_agents"), list) else None,
+            key_positive_signals=data.get("key_positive_signals") if isinstance(data.get("key_positive_signals"), list) else None,
+            key_negative_signals=data.get("key_negative_signals") if isinstance(data.get("key_negative_signals"), list) else None,
+            conflicts=data.get("conflicts") if isinstance(data.get("conflicts"), list) else None,
+            model_profile=str(data.get("model_profile", "")),
+            version_hash=str(data.get("version_hash", "")),
+            meta=data.get("meta") if isinstance(data.get("meta"), dict) else None,
+        )
+
+    def to_json(self) -> Dict[str, Any]:
+        """序列化为JSON兼容的dict"""
+        import dataclasses
+        return dataclasses.asdict(self)
+
+
 FALLBACK_SIGNAL_PACK: Dict[str, Any] = {
     "agent_name": "unknown",
     "analysis_text": "",

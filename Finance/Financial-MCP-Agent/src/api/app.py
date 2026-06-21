@@ -1060,6 +1060,9 @@ async def generate_report_task(task_id: str, stock_code: str, company_name: str)
         from src.agents.technical_agent import technical_agent
         from src.agents.fundamental_agent import fundamental_agent
         from src.agents.news_agent import news_agent
+        from src.agents.event_analyst_agent import event_analyst_agent
+        from src.agents.quality_risk_analyst_agent import quality_risk_analyst_agent
+        from src.agents.moneyflow_analyst_agent import moneyflow_analyst_agent
 
         workflow = StateGraph(AgentState)
         workflow.add_node("start_node", lambda state: state)
@@ -1067,6 +1070,9 @@ async def generate_report_task(task_id: str, stock_code: str, company_name: str)
         workflow.add_node("technical_analyst", technical_agent)
         workflow.add_node("value_analyst", value_agent)
         workflow.add_node("news_analyst", news_agent)
+        workflow.add_node("event_analyst", event_analyst_agent)
+        workflow.add_node("quality_risk_analyst", quality_risk_analyst_agent)
+        workflow.add_node("moneyflow_analyst", moneyflow_analyst_agent)
         workflow.add_node("summarizer", summary_agent)
 
         workflow.set_entry_point("start_node")
@@ -1074,18 +1080,24 @@ async def generate_report_task(task_id: str, stock_code: str, company_name: str)
         workflow.add_edge("start_node", "technical_analyst")
         workflow.add_edge("start_node", "value_analyst")
         workflow.add_edge("start_node", "news_analyst")
+        workflow.add_edge("start_node", "event_analyst")
+        workflow.add_edge("start_node", "quality_risk_analyst")
+        workflow.add_edge("start_node", "moneyflow_analyst")
         workflow.add_edge("fundamental_analyst", "summarizer")
         workflow.add_edge("technical_analyst", "summarizer")
         workflow.add_edge("value_analyst", "summarizer")
         workflow.add_edge("news_analyst", "summarizer")
+        workflow.add_edge("event_analyst", "summarizer")
+        workflow.add_edge("quality_risk_analyst", "summarizer")
+        workflow.add_edge("moneyflow_analyst", "summarizer")
         workflow.add_edge("summarizer", END)
 
         app = workflow.compile()
         logger.info(f"{WAIT_ICON} 报告Pipeline开始: {company_name}({stock_code}), 超时=2100s")
 
-        # 使用 astream 追踪真实进度（6个节点：start + 4分析 + summarizer）
+        # 使用 astream 追踪真实进度（9个节点：start + 7分析 + summarizer）
         completed_nodes = set()
-        total_nodes = 6
+        total_nodes = 9
         final_state = None
         async for chunk in app.astream(initial_state, config={"recursion_limit": 30}):
             for node_name, node_state in chunk.items():
@@ -1332,8 +1344,8 @@ async def lifespan(app: FastAPI):
         clean_expired_cache()
     except Exception:
         pass
-    # 后台预加载名称缓存
-    asyncio.get_running_loop().run_in_executor(_thread_pool, _ensure_name_cache)
+    # 预加载名称缓存（阻塞至加载完成，避免请求在缓存未就绪时到达导致名称查找失败）
+    await asyncio.get_running_loop().run_in_executor(_thread_pool, _ensure_name_cache)
     yield
     logger.info(f"{WAIT_ICON} 关闭 FastAPI 后端...")
 
@@ -1363,14 +1375,21 @@ _name_code_cache: Optional[dict] = None  # name → code 映射
 
 _name_code_cache: Optional[dict] = None  # name → normalized_code 映射 (sh.xxxxxx / sz.xxxxxx)
 _etf_name_cache: Optional[dict] = None   # ETF name → sh.xxxxxx 映射
+_name_cache_loaded: bool = False          # 仅在缓存完全加载后置 True（用 flag 而非 dict is not None，避免空 dict 误判）
 
 def _ensure_name_cache():
-    """加载并缓存股票+ETF名称→代码映射（首次调用约15秒）"""
-    global _name_code_cache, _etf_name_cache
-    if _name_code_cache is not None:
+    """加载并缓存股票+ETF名称→代码映射（首次调用约15秒）
+
+    线程安全：用 _name_cache_loaded flag 标记加载完成，避免空 dict 误判。
+    无锁设计：并发加载最多重复工作，但 GIL 保证单次 dict 写入原子性，最终结果一致。
+    """
+    global _name_code_cache, _etf_name_cache, _name_cache_loaded
+    if _name_cache_loaded:
         return
-    _name_code_cache = {}
-    _etf_name_cache = {}
+    if _name_code_cache is None:
+        _name_code_cache = {}
+    if _etf_name_cache is None:
+        _etf_name_cache = {}
 
     # 1. 加载A股股票名称
     try:
@@ -1406,6 +1425,8 @@ def _ensure_name_cache():
             logger.info(f"{SUCCESS_ICON} ETF名称缓存加载完成: {len(_etf_name_cache)} 只ETF")
     except Exception as e:
         logger.warning(f"ETF名称缓存加载失败: {e}")
+
+    _name_cache_loaded = True  # 必须在所有数据填充完成后设置（即使部分加载失败也标记，避免反复重试阻塞请求）
 
 
 def _lookup_stock_code_by_name(name: str) -> Optional[str]:

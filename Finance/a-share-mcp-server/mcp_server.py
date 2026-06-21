@@ -13,7 +13,6 @@ from mcp.server.fastmcp import FastMCP
 
 # Import the interface and the concrete implementations
 from src.data_source_interface import FinancialDataSource
-from src.baostock_data_source import BaostockDataSource
 from src.akshare_data_source import AkshareDataSource
 from src.composite_data_source import CompositeDataSource
 from src.utils import setup_logging
@@ -35,9 +34,9 @@ setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Dependency Injection ---
-# Primary: Baostock; Fallback: AKshare (Composite pattern)
+# AKshare as sole data source (Baostock disabled 2026-05, replaced by Tushare MCP)
 active_data_source: FinancialDataSource = CompositeDataSource(
-    primary=BaostockDataSource(),
+    primary=AkshareDataSource(),
     fallback=AkshareDataSource(),
 )
 

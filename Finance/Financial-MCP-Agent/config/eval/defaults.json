@@ -1,0 +1,9 @@
+{
+  "_comment": "评测系统默认配置 — 所有值可通过环境变量 EVAL_<KEY> 覆盖。",
+  "initial_capital_per_line": 1000000.0,
+  "catchup_max_missed_days": 7,
+  "hard_screen_min_daily_amount": 20000000,
+  "progress_bar_min_duration_seconds": 1.0,
+  "bootstrap_iterations": 10000,
+  "significance_level": 0.95
+}

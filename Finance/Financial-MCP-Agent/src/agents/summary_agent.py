@@ -126,15 +126,26 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
 
     # 获取之前 Agent的分析结果（mimo 大上下文，无需截断）
     current_date = current_data.get("current_date", "未知日期")
-    fundamental_analysis = current_data.get(
-        "fundamental_analysis", "Not available")
-    technical_analysis = current_data.get(
-        "technical_analysis", "Not available")
-    value_analysis = current_data.get("value_analysis", "Not available")
-    news_analysis = current_data.get("news_analysis", "Not available")
-    event_analysis = current_data.get("event_analysis", "Not available")
-    quality_risk_analysis = current_data.get("quality_risk_analysis", "Not available")
-    moneyflow_analysis = current_data.get("moneyflow_analysis", "Not available")
+
+    def _sanitize(text: str) -> str:
+        """Clean raw analysis text: replace tool-level data-unavailable phrases
+        that mislead the summary LLM into thinking entire modules are missing."""
+        import re as _re
+        if not text or text == "Not available":
+            return text
+        t = text
+        t = _re.sub(r'tushare_\w+\s*数据不可用', '[该子项工具未返回数据]', t)
+        t = _re.sub(r'\[[^\]]+\]\s*数据不可用[（(](?:超时|返回过短|调用异常)[)）]', '[该子项工具未返回数据]', t)
+        t = _re.sub(r'数据不可用[（(](?:超时|返回过短)[)）]', '[该子项工具未返回数据]', t)
+        return t
+
+    fundamental_analysis = _sanitize(current_data.get("fundamental_analysis", "Not available"))
+    technical_analysis = _sanitize(current_data.get("technical_analysis", "Not available"))
+    value_analysis = _sanitize(current_data.get("value_analysis", "Not available"))
+    news_analysis = _sanitize(current_data.get("news_analysis", "Not available"))
+    event_analysis = _sanitize(current_data.get("event_analysis", "Not available"))
+    quality_risk_analysis = _sanitize(current_data.get("quality_risk_analysis", "Not available"))
+    moneyflow_analysis = _sanitize(current_data.get("moneyflow_analysis", "Not available"))
 
     from src.utils.analysis_package_builder import build_analysis_package
     pkg = build_analysis_package(current_data, current_date)
@@ -227,7 +238,11 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         ⛔ 防幻觉规则:
         - 所有陈述必须标注 [数据] 或 [判断]
         - 禁止编造数值、新闻、或未在输入中出现的事实
-        - 如果某模块数据缺失，写"该模块数据不可用"
+        - 数据可用性判断规则：
+          1. 只有在"结构化分析摘要"中某模块显示为"未执行agent"时，才写"该模块数据不可用"
+          2. 如果"结构化分析摘要"中某模块有 bias 和置信度（即使置信度较低），说明该模块已产出分析结论，必须正常展示其核心观点
+          3. 某模块原始分析中提到"部分数据缺失"（如"未获取到商誉数据"）不等于整个模块缺失——应在第7节"数据缺口"中注明，而不是在第2节总览中将该模块标记为不可用
+          4. 第2节总览表格中，每个模块的方向和置信度应以"结构化分析摘要"为准，不要自行降级
 
         输出为纯Markdown，不含代码块标记。
         """
@@ -238,10 +253,7 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
 
 原始用户查询: {user_query}
 
-## 结构化分析摘要（优先参考）
-{pkg.compact_prompt_context}
-
-## 各维度原始分析
+## 各维度原始分析（参考用，注意：原始文本中提到的部分数据缺口不代表整个模块缺失）
 
 FUNDAMENTAL ANALYSIS:
 {fundamental_analysis}
@@ -266,6 +278,11 @@ MONEYFLOW ANALYSIS:
 
 {"ANALYSIS ISSUES:" if errors else ""}
 {". ".join(errors) if errors else ""}
+
+## 结构化分析摘要（⚠️ 最终权威 — 以此为准判断各模块是否有数据）
+{pkg.compact_prompt_context}
+
+⚠️ 重要：上方结构化摘要中列出的每个agent，只要显示有bias和置信度，就代表该模块已成功产出分析结论。即使上方原始分析文本中提到"部分数据缺失"或"未获取到XX"，也不代表整个模块不可用——那只是该模块中某些子项的数据缺口，应在报告第7节中提及，而不是在第2节总览中标记为不可用。
 
 IMPORTANT: Output in valid Markdown with proper headings. No code block markers.
 """

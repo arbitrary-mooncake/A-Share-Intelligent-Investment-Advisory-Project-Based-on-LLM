@@ -12,6 +12,7 @@ v2升级（2026-06）:
 import os
 import json
 import math
+import random
 import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -52,6 +53,12 @@ BACKTEST_LINE_DEFINITIONS = {
               "description": "短线消融-质量风险"},
     "SB-L5": {"term": "short", "agents": "-moneyflow",
               "description": "短线消融-资金流"},
+
+    # ── 短线参考线 (1条, 非消融) — 长持对照线, 连续持仓, 不参与ΔLoss ──
+    "SB-L6": {"term": "short", "agents": "all",
+              "description": "短线长持对照线 (成熟短线策略, 连续持仓, 不参与消融ΔLoss)",
+              "strategy": "longhold",
+              "is_reference": True},
 
     # ── 中线回测线 (8条) ──
     "MB-L0": {"term": "medium", "agents": "all",
@@ -102,6 +109,17 @@ ACTIVE_BACKTEST_LINES = {
                if v["term"] == "medium" and not v.get("degenerate")],
     "long": [k for k, v in BACKTEST_LINE_DEFINITIONS.items()
              if v["term"] == "long" and not v.get("degenerate")],
+}
+
+# 参考线（非消融，不参与ΔLoss计算）
+# 这些线使用不同的交易逻辑（如连续持仓），提供现实性校验对照
+REFERENCE_LINES = [k for k, v in BACKTEST_LINE_DEFINITIONS.items()
+                   if v.get("is_reference", False)]
+
+# 纯消融线（用于ΔLoss归因），排除参考线和退化线
+ABLATION_LINES = {
+    term: [k for k in active if k not in REFERENCE_LINES]
+    for term, active in ACTIVE_BACKTEST_LINES.items()
 }
 
 
@@ -670,8 +688,10 @@ class ReplayBacktestEngine:
         agent_label: str,
     ) -> float:
         """
-        Point-in-Time scoring using real Tushare historical data.
-        回退到基于股票段位+日期的确定性估算（不使用随机哈希）。
+        Point-in-Time scoring using real Agent analysis via cache.
+
+        总纲 §8.3: 回测中对精筛池跑分析Agent（仅可回溯的5个），禁用news/event。
+        总纲 §14.1: 分析Agent只跑一次，缓存跨线跨期限共享。
 
         Args:
             stock_code: 内部格式 (sh.601888)
@@ -680,22 +700,63 @@ class ReplayBacktestEngine:
             agent_label: "full" 或 "-fundamental" 等
 
         Returns:
-            分数 (0-100), 范围通常35-95
+            分数 (0-100)
         """
-        # Step 1: 尝试获取PIT基本面数据
-        pit_data = self._fetch_pit_fundamentals(stock_code, anchor_date)
+        import json
+        from src.eval.cache import read_cache, write_cache
+        from src.eval.adapters.stock_pipeline_adapter import run_stock_analysis
 
+        # Step 1: 尝试从评测缓存获取真实Agent分析结果
+        try:
+            cached_raw = read_cache("full_analysis", stock_code, anchor_date)
+            if cached_raw:
+                result = json.loads(cached_raw)
+            else:
+                logger.info("Backtest cache miss for %s @ %s, running agent analysis...",
+                           stock_code, anchor_date)
+                result = await run_stock_analysis(
+                    stock_code, company_name, anchor_date, eval_mode=True
+                )
+                if not result.get("error"):
+                    write_cache("full_analysis", stock_code, anchor_date,
+                               json.dumps(result, ensure_ascii=False, default=str))
+
+            # 提取该期限评分
+            term = self.config.term
+            term_key = f"{term}_term_score"
+            term_score = result.get(term_key, {})
+            if isinstance(term_score, dict):
+                base_score = float(term_score.get("score", 50))
+            else:
+                base_score = 50.0
+
+            # 消融调整（与模拟盘使用相同逻辑）
+            ablated_agent = None
+            if agent_label != "full" and agent_label.startswith("-"):
+                ablated_agent = agent_label.lstrip("-")
+
+            if ablated_agent and ablated_agent in self.config.ablation_agents:
+                signal_packs = result.get("signal_packs", {})
+                from src.eval.orchestrator import EvalOrchestrator
+                base_score = EvalOrchestrator._adjust_score_for_ablation(
+                    base_score, signal_packs, ablated_agent, term
+                )
+
+            return round(min(max(base_score, 10.0), 98.0), 2)
+
+        except Exception as e:
+            logger.warning("Agent analysis failed for %s @ %s: %s, falling back to PIT fundamentals",
+                          stock_code, anchor_date, str(e))
+
+        # Step 2: 回退 — PIT Tushare基本面数据
+        pit_data = self._fetch_pit_fundamentals(stock_code, anchor_date)
         if pit_data.get("_has_data"):
-            # Step 2: 基于真实数据计算基础分
             base_score = self._compute_fundamental_score(pit_data, stock_code)
         else:
-            # Step 3: 回退到确定性非哈希估算
             base_score = self._fallback_composite_score(stock_code, anchor_date)
 
-        # Step 4: 消融打折
+        # 消融打折
         score = self._apply_ablation_discount(base_score, agent_label, self.config.term)
-
-        # 确保范围
         return round(min(max(score, 10.0), 98.0), 2)
 
     # ═══════════════════════════════════════════════════════════
@@ -774,6 +835,253 @@ class ReplayBacktestEngine:
             "ablation_results": ablation_results,
         }
 
+    # ═══════════════════════════════════════════════════════════
+    # Reference Line Backtest (SB-L6: 短线长持对照线)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _run_reference_line(
+        self, pool: List[str], price_data: Dict[str, Any],
+        anchors: List[str], term: str = "short",
+    ) -> Dict[str, Any]:
+        """
+        运行参考线回测 — 使用ShortLongHoldStrategy实现连续持仓跨anchor date运作。
+
+        SB-L6与S-L8使用完全相同的ShortLongHoldStrategy策略类，关键区别：
+          - SB-L0~L5: 每个anchor清仓重新建仓 (daily-clearing ablation)
+          - SB-L6: 持仓连续跨越anchor date (continuous holding, like S-L8 in live)
+
+        Args:
+            pool: 精筛池
+            price_data: 历史价格数据
+            anchors: anchor date列表
+            term: 期限 (固定为short)
+
+        Returns:
+            参考线回测结果dict
+        """
+        from src.eval.strategies.factory import get_strategy
+        from src.eval.market_simulator import MarketData
+
+        strategy = get_strategy(term, "longhold", {})
+        cfg = self.config
+
+        # ── 初始状态 ──
+        initial_capital = 1_000_000.0
+        cash = initial_capital
+        holdings: Dict[str, int] = {}             # code -> shares
+        purchase_prices: Dict[str, float] = {}     # code -> avg price
+        hold_days_state: Dict[str, int] = {}        # code -> days held
+
+        daily_values: List[tuple] = []   # [(anchor_date, total_value), ...]
+        trade_log: List[Dict] = []       # 每anchor的交易摘要
+
+        anchors_sorted = sorted(anchors)
+
+        for anchor_date in anchors_sorted:
+            # ── 1. 获取当日评分 ──
+            scores: Dict[str, float] = {}
+            for code in pool:
+                score = await self._score_stock_pit(code, code, anchor_date, "full")
+                scores[code] = score
+
+            # ── 2. 获取当日收盘价 ──
+            anchor_prices: Dict[str, float] = {}
+            for code in pool:
+                series = self._get_price_series(price_data, code, anchor_date, 2)
+                if series and len(series) >= 1:
+                    anchor_prices[code] = series[0]
+
+            # ── 3. 构建最小MarketData map (用于策略判定) ──
+            market_data_map: Dict[str, MarketData] = {}
+            for code in pool:
+                price = anchor_prices.get(code, 0)
+                if price > 0:
+                    md = MarketData(stock_code=code, close=price, open=price)
+                    # 设置前收盘价 (从price_data查找前一天)
+                    prev_series = self._get_price_series(price_data, code,
+                        (datetime.strptime(anchor_date, "%Y-%m-%d")
+                         - timedelta(days=1)).strftime("%Y-%m-%d"), 2)
+                    if prev_series and len(prev_series) >= 1:
+                        md.pre_close = prev_series[0]
+                    else:
+                        md.pre_close = price  # 回退：用当日价格
+                    market_data_map[code] = md
+
+            # ── 4. 当前组合市值 ──
+            holdings_value = sum(
+                holdings.get(c, 0) * anchor_prices.get(c, 0)
+                for c in holdings
+            )
+            total_capital = cash + holdings_value
+
+            # ── 5. Strategy: 更新价格历史（用于近3日涨幅计算）──
+            for code in holdings:
+                if code in anchor_prices:
+                    strategy.update_price_history(code, anchor_prices[code])
+
+            # ── 6. 卖出判定 ──
+            sell_orders = strategy.generate_sell_orders(
+                holdings, scores, market_data_map,
+                purchase_prices, hold_days_state,
+            )
+
+            # ── 7. 执行卖出 ──
+            sell_log = []
+            for so in sell_orders:
+                code = so.stock_code
+                if code not in holdings or holdings[code] <= 0:
+                    continue
+                sell_shares = int(holdings[code] * so.sell_ratio / 100) * 100
+                if sell_shares <= 0:
+                    continue
+                price = anchor_prices.get(code, 0)
+                if price <= 0:
+                    continue
+                cash += sell_shares * price
+                holdings[code] -= sell_shares
+                sell_log.append({
+                    "code": code, "shares": sell_shares, "price": price,
+                    "reason": so.reason,
+                })
+                if holdings[code] <= 0:
+                    del holdings[code]
+                    purchase_prices.pop(code, None)
+                    hold_days_state.pop(code, None)
+
+            # ── 8. 选股 ──
+            buy_orders = strategy.select_stocks(
+                pool, scores, holdings, cash,
+                market_data_map, total_capital,
+            )
+
+            # ── 9. 仓位调整 ──
+            sized = strategy.size_positions(
+                buy_orders, total_capital,
+                len(holdings), strategy.get_max_positions(),
+                strategy.get_single_weight_limit(), strategy.get_min_cash_ratio(),
+                holdings, market_data_map,
+            )
+
+            # ── 10. 执行买入 ──
+            buy_log = []
+            for bo in sized:
+                code = bo.stock_code
+                if bo.target_value <= 0 or bo.target_value > cash:
+                    continue
+                price = anchor_prices.get(code, 0)
+                if price <= 0:
+                    continue
+                shares = int(bo.target_value / price / 100) * 100
+                if shares <= 0:
+                    continue
+                buy_cost = shares * price
+
+                # 不能超过剩余现金
+                if buy_cost > cash:
+                    shares = int(cash / price / 100) * 100
+                    buy_cost = shares * price
+                    if shares <= 0:
+                        continue
+
+                cash -= buy_cost
+                old_shares = holdings.get(code, 0)
+                if old_shares > 0:
+                    old_avg = purchase_prices.get(code, price)
+                    new_avg = (old_avg * old_shares + price * shares) / (old_shares + shares)
+                    purchase_prices[code] = new_avg
+                else:
+                    purchase_prices[code] = price
+                    hold_days_state[code] = 0
+                holdings[code] = old_shares + shares
+
+                buy_log.append({
+                    "code": code, "shares": shares, "price": price,
+                    "target_value": bo.target_value, "score": bo.score,
+                    "reason": bo.reason if hasattr(bo, 'reason') else "",
+                })
+
+            # ── 11. 更新持有天数 ──
+            for code in list(hold_days_state):
+                if code in holdings and holdings[code] > 0:
+                    hold_days_state[code] += 1
+                else:
+                    hold_days_state.pop(code, None)
+
+            # ── 12. 记录当日组合市值 ──
+            holdings_value = sum(
+                holdings.get(c, 0) * anchor_prices.get(c, 0)
+                for c in holdings
+            )
+            total_value = cash + holdings_value
+            daily_values.append((anchor_date, total_value))
+
+            trade_log.append({
+                "anchor_date": anchor_date,
+                "num_holdings": len(holdings),
+                "cash": round(cash, 2),
+                "holdings_value": round(holdings_value, 2),
+                "total_value": round(total_value, 2),
+                "buys": len(buy_log),
+                "sells": len(sell_log),
+                "buy_details": buy_log,
+                "sell_details": sell_log,
+            })
+
+        # ── 13. 汇总指标 ──
+        values = [v for _, v in daily_values]
+        if len(values) >= 2:
+            cumulative_return = (values[-1] - initial_capital) / initial_capital
+            # 日收益序列
+            daily_rets = []
+            for i in range(1, len(values)):
+                if values[i-1] > 0:
+                    daily_rets.append((values[i] - values[i-1]) / values[i-1])
+            # 最大回撤
+            peak = values[0]
+            mdd = 0.0
+            for v in values:
+                peak = max(peak, v)
+                dd = (peak - v) / peak if peak > 0 else 0.0
+                mdd = max(mdd, dd)
+            # 年化收益 (252 trading days)
+            num_days = len(values)
+            annualized_return = (1 + cumulative_return) ** (252 / max(num_days, 1)) - 1
+            # Sharpe (simplified)
+            if daily_rets and len(daily_rets) >= 2:
+                avg_daily = sum(daily_rets) / len(daily_rets)
+                var = sum((r - avg_daily) ** 2 for r in daily_rets) / (len(daily_rets) - 1)
+                std_daily = var ** 0.5 if var > 0 else 0.0
+                sharpe = (avg_daily / std_daily * (252 ** 0.5)) if std_daily > 0 else 0.0
+            else:
+                sharpe = 0.0
+            # 胜率 (positive return anchors)
+            win_count = sum(1 for _, v in daily_values if v > initial_capital)
+            win_rate = win_count / len(daily_values) if daily_values else 0.0
+        else:
+            cumulative_return = 0.0
+            annualized_return = 0.0
+            mdd = 0.0
+            sharpe = 0.0
+            win_rate = 0.0
+
+        return {
+            "line_id": "SB-L6",
+            "term": "short",
+            "type": "reference_longhold",
+            "description": BACKTEST_LINE_DEFINITIONS["SB-L6"]["description"],
+            "num_anchors": len(daily_values),
+            "initial_capital": initial_capital,
+            "final_value": round(values[-1], 2) if values else initial_capital,
+            "cumulative_return_pct": round(cumulative_return * 100, 2),
+            "annualized_return_pct": round(annualized_return * 100, 2),
+            "max_drawdown_pct": round(mdd * 100, 2),
+            "sharpe_ratio": round(sharpe, 2),
+            "win_rate_pct": round(win_rate * 100, 1),
+            "final_holdings_count": len(holdings),
+            "daily_values": [{"date": d, "value": v} for d, v in daily_values],
+            "trade_log": trade_log,
+        }
+
     async def run_full_backtest(self, pool: List[str],
                                  price_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -807,10 +1115,25 @@ class ReplayBacktestEngine:
                 result["split"] = split_name
                 all_results.append(result)
 
-        # 汇总agent贡献
+        # 汇总agent贡献 (仅消融线，不含参考线)
         contribution_summary = self._summarize_contributions(all_results)
 
-        return {
+        # ── 短线参考线 (SB-L6: 连续持仓长持对照) ──
+        reference_results = None
+        if self.config.term == "short":
+            print(f"\n[回测] 运行短线参考线 SB-L6 (长持对照, 连续持仓)...")
+            try:
+                reference_results = await self._run_reference_line(
+                    pool, price_data, anchors, term="short"
+                )
+                print(f"  SB-L6 完成: 累计收益 {reference_results['cumulative_return_pct']}%, "
+                      f"最大回撤 {reference_results['max_drawdown_pct']}%, "
+                      f"Sharpe {reference_results['sharpe_ratio']}")
+            except Exception as e:
+                print(f"  [警告] SB-L6 参考线回测失败: {e}")
+                reference_results = {"error": str(e), "line_id": "SB-L6"}
+
+        result = {
             "config": {
                 "term": self.config.term,
                 "start": self.config.start_date,
@@ -822,13 +1145,16 @@ class ReplayBacktestEngine:
             "splits": {k: len(v) for k, v in splits.items()},
             "anchor_results": all_results,
             "contribution_summary": contribution_summary,
+            "reference_line": reference_results,
             "declarations": [
                 "本回测基于当前精筛股票池，不含回测期间退市/暴雷股票",
                 "news_agent和event_agent在回测中被禁用",
                 "绝对收益可能高估，但agent贡献排序受偏差影响较小",
                 "评分基于Tushare PIT历史数据，回退至段位确定性估算（无随机哈希）",
+                "SB-L6为参考线（长持对照），使用ShortLongHoldStrategy连续持仓，不参与消融ΔLoss计算",
             ],
         }
+        return result
 
     # ═══════════════════════════════════════════════════════════
     # Fix 4: Quarterly Calibration (方案B)
@@ -1038,9 +1364,12 @@ class ReplayBacktestEngine:
                 return []
 
             # Sample stocks to avoid processing all ~5000 one-by-one
+            # 使用确定性采样（基于anchor_date哈希），保证相同输入可复现
             max_candidates = min(len(stock_list), target_size * 4)
-            import random
-            stock_list = random.sample(stock_list, max_candidates)
+            import hashlib
+            seed = int(hashlib.md5(anchor_date.encode()).hexdigest()[:8], 16)
+            rng = random.Random(seed)
+            stock_list = rng.sample(stock_list, max_candidates)
 
             # 2. 基本面快筛 (获取PIT数据并评分)
             scored = []

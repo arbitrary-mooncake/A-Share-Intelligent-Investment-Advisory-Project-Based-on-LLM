@@ -170,13 +170,16 @@ class FidelityEngine:
         else:
             topK_overlap = 1.0
 
-        rank_drift = 0.5  # Cannot compute rank drift from legacy format
+        # Cannot compute rank drift from legacy format — use 0.0 (neutral, no detected drift)
+        # Formula direction must match modern path: rank_drift is (1.0 - Spearman),
+        # so higher = worse. Using 0.0 means "no drift detected", contributing 0 to loss.
+        rank_drift = 0.0
 
         fidelity_loss = (
             action_flip_rate * 0.25 +
             (1.0 - topK_overlap) * 0.25 +
             min(score_drift / 100.0, 1.0) * 0.25 +
-            (1.0 - rank_drift) * 0.25
+            rank_drift * 0.25
         )
 
         fidelity_data = {

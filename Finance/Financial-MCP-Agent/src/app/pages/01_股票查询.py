@@ -35,6 +35,13 @@ st.markdown(
     """
     <style>
     .stMetric { background: #f8f9fa; border-radius: 8px; padding: 0.5rem; }
+    .stExpander ul ul, .stExpander ol ul, .stExpander ul ol {
+        margin-top: 0.25rem;
+        margin-bottom: 0.25rem;
+        padding-left: 1.5rem;
+    }
+    .stExpander li { margin-bottom: 0.2rem; }
+    .stExpander li > p { margin-bottom: 0.1rem; }
     </style>
     """,
     unsafe_allow_html=True,

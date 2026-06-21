@@ -5,7 +5,7 @@ import os
 import sys
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-MCP_SERVER_DIR = os.path.join(CURRENT_DIR, "..", "..", "..", "a-share-mcp-is-just-i-need")
+MCP_SERVER_DIR = os.path.join(CURRENT_DIR, "..", "..", "..", "a-share-mcp-server")
 MCP_SERVER_DIR = os.path.normpath(MCP_SERVER_DIR)
 # Financial-MCP-Agent 项目根目录 (用于 tushare_mcp_server 导入 src.utils.tushare_client)
 AGENT_ROOT = os.path.normpath(os.path.join(CURRENT_DIR, "..", ".."))

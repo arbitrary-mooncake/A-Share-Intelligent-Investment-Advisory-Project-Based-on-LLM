@@ -68,6 +68,7 @@ async def _call_tool_safe(tool, kwargs: dict, label: str) -> str:
 
 
 def _extract_signal_pack(llm_output: str, agent_name: str, as_of_date: str) -> Dict[str, Any]:
+    # Layer 1: <SIGNAL_PACK> 标签
     tag_match = re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', llm_output)
     if tag_match:
         try:
@@ -76,9 +77,26 @@ def _extract_signal_pack(llm_output: str, agent_name: str, as_of_date: str) -> D
             sp["as_of_date"] = as_of_date
             sp.setdefault("analysis_text", llm_output[:500])
             sp.setdefault("data_quality_score", 0.6)
-            return sp
+            from src.utils.analysis_package_builder import normalize_signal_pack
+            return normalize_signal_pack(sp)
         except (json.JSONDecodeError, ValueError):
             pass
+
+    # Layer 2: 裸 JSON 回退 — 从文本中找包含 bias 和 signals 的 JSON
+    json_match = re.search(r'\{[\s\S]*"bias"[\s\S]*"signals"[\s\S]*\}', llm_output)
+    if json_match:
+        try:
+            sp = json.loads(json_match.group(0))
+            sp["agent_name"] = agent_name
+            sp["as_of_date"] = as_of_date
+            sp.setdefault("analysis_text", llm_output[:500])
+            sp.setdefault("data_quality_score", 0.5)
+            from src.utils.analysis_package_builder import normalize_signal_pack
+            return normalize_signal_pack(sp)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Layer 3: 纯文本推断
     return text_to_signal_pack(llm_output, agent_name, as_of_date)
 
 

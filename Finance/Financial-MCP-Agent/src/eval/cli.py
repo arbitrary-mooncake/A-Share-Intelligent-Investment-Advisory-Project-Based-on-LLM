@@ -170,6 +170,19 @@ def cmd_backtest(args):
         print(f"    Agent贡献摘要:")
         for agent, info in result.get("contribution_summary", {}).items():
             print(f"      {agent}: ΔL={info['mean_delta_L']:.4f} ({info['direction']})")
+        # 参考线结果 (SB-L6)
+        ref = result.get("reference_line")
+        if ref and "error" not in ref:
+            print(f"\n  ── 长持对照线 (SB-L6, 现实性校验) ──")
+            print(f"    累计收益: {ref.get('cumulative_return_pct', 0)}%")
+            print(f"    年化收益: {ref.get('annualized_return_pct', 0)}%")
+            print(f"    最大回撤: {ref.get('max_drawdown_pct', 0)}%")
+            print(f"    Sharpe: {ref.get('sharpe_ratio', 0)}")
+            print(f"    胜率: {ref.get('win_rate_pct', 0)}%")
+            print(f"    最终持仓: {ref.get('final_holdings_count', 0)}只")
+            print(f"    注: SB-L6不参与消融ΔLoss计算")
+        elif ref and "error" in ref:
+            print(f"\n  [警告] SB-L6参考线回测失败: {ref['error']}")
         print(f"\n  ⚠ 声明: {result['declarations'][0]}")
     except Exception as e:
         print(f"  回测失败: {e}")

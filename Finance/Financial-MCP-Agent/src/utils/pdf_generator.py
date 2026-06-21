@@ -5,8 +5,10 @@ PDF Report Generator - 将 Markdown 分析报告转换为专业 PDF 格式。
 import os
 import re
 import sys
+import uuid
 import logging
 from fpdf import FPDF, FontFace
+from fpdf.enums import AccessPermission, EncryptionMethod
 
 logger = logging.getLogger(__name__)
 
@@ -603,6 +605,16 @@ def markdown_to_pdf(markdown_text: str, output_path: str,
     pdf.set_title(f"{company_name}({stock_code}) 综合分析报告")
     pdf.set_author("股票投资顾问 Agent")
     pdf.set_creator("Stock Investment Advisor System")
+
+    # 加密PDF，限制编辑权限：仅允许打印和复制，禁止修改/注释/填表/组合
+    pdf.set_encryption(
+        owner_password=str(uuid.uuid4()),
+        user_password=None,
+        encryption_method=EncryptionMethod.RC4,
+        permissions=(AccessPermission.PRINT_LOW_RES | AccessPermission.PRINT_HIGH_RES
+                     | AccessPermission.COPY),
+        encrypt_metadata=True,
+    )
 
     pdf.render_blocks(blocks)
 

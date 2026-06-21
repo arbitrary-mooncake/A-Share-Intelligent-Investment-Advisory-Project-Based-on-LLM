@@ -69,6 +69,85 @@ with col_s4:
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════
+# 精筛池健康
+# ═══════════════════════════════════════════════════
+st.subheader("📊 精筛池健康")
+
+if eval_ready:
+    health = orch.pool_manager.get_pool_health(
+        lines_status=status.get("lines", [])
+    )
+
+    # 三个状态卡片
+    emoji_map = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
+    status_label = {"red": "需更新", "yellow": "注意", "green": "健康"}
+    pool_configs = [
+        ("short", "短线", 100),
+        ("medium", "中线", 80),
+        ("long", "长线", 60),
+    ]
+    col_h1, col_h2, col_h3 = st.columns(3)
+    cols_by_idx = {0: col_h1, 1: col_h2, 2: col_h3}
+
+    for i, (term, label, target_size) in enumerate(pool_configs):
+        h = health.get(term, {})
+        emoji = emoji_map.get(h.get("status", "green"), "🟢")
+        s_label = status_label.get(h.get("status", "green"), "健康")
+        with cols_by_idx[i]:
+            st.markdown(f"### {emoji} {label}({target_size}只)")
+            last_upd = h.get("last_update", "从未更新")
+            if isinstance(last_upd, str) and len(last_upd) >= 10:
+                last_upd = last_upd[:10]
+            st.caption(
+                f"状态: **{s_label}**  |  "
+                f"更新于: {last_upd}  |  "
+                f"平均分: {h.get('details', {}).get('avg_score', 'N/A')}"
+            )
+            if h.get("triggers"):
+                for t in h["triggers"]:
+                    if h["status"] == "red":
+                        st.error(t)
+                    else:
+                        st.warning(t)
+            else:
+                st.success("状态健康，无需操作")
+
+    # 对有问题的池显示操作入口
+    problem_terms = [
+        (term, label) for term, label, _ in pool_configs
+        if health.get(term, {}).get("status") in ("red", "yellow")
+    ]
+    if problem_terms:
+        st.markdown("---")
+        st.caption("以下精筛池需要关注，可快速更新：")
+        action_cols = st.columns(len(problem_terms))
+        for j, (term, label) in enumerate(problem_terms):
+            h = health[term]
+            with action_cols[j]:
+                st.caption(
+                    f"{emoji_map[h['status']]} **{label}池**: "
+                    f"{h.get('suggested_action', '')}"
+                )
+                if st.button(
+                    f"🔄 全量更新{label}池", key=f"health_full_{term}",
+                    use_container_width=True,
+                ):
+                    with st.spinner(f"全量更新{label}池中..."):
+                        update_result = _run_async(orch.run_pool_update(term))
+                        if "error" in update_result:
+                            st.error(update_result["error"])
+                        else:
+                            st.success(
+                                f"更新完成！共"
+                                f"{update_result.get('final_pool_size', 0)}只"
+                            )
+                            st.rerun()
+else:
+    st.info("精筛池未初始化，请先运行评测系统（点击上方\"一键完整检查\"或\"更新精筛池\"按钮）。")
+
+st.markdown("---")
+
+# ═══════════════════════════════════════════════════
 # 操作面板
 # ═══════════════════════════════════════════════════
 st.subheader("🔧 操作面板")
@@ -78,11 +157,38 @@ col1, col2 = st.columns(2)
 with col1:
     if st.button("▶️ 一键完整检查", use_container_width=True):
         if eval_ready:
-            with st.spinner("运行中: 结算历史 → 评分调仓 → 收盘结算 → 生成报告..."):
+            status_box = st.status("初始化...", expanded=True)
+            progress_bar = st.progress(0, text="准备中...")
+            try:
+                # 运行完整检查（内部包含: 检测缺失日→补回历史→结算→调仓→收盘结算→报告）
+                status_box.update(label="检测缺失日+补回历史+调仓...", state="running")
+                progress_bar.progress(5, text="检测缺失日+补回历史+调仓...")
                 result = _run_async(orch.run_full_check())
-                st.success(f"批次 {result['batch_id'][:16]} 完成！报告: {result.get('report_path', '')}")
+                progress_bar.progress(85, text="生成报告...")
+
+                # 检查reset信息（run_full_check内部已调用detect_missed_days）
+                if result.get("reset_triggered"):
+                    st.warning(f"⚠️ {result.get('reset_reason', '缺失超过上限，已重置')}")
+
+                # 完成
+                progress_bar.progress(100, text="完成!")
+                status_box.update(label="检查完成", state="complete")
+
+                batch_info = f"批次 {result['batch_id'][:16]} 完成！"
+                catchup = result.get("catchup")
+                if catchup:
+                    caught = catchup.get("caught_up", 0)
+                    if caught > 0:
+                        batch_info += f" 追赶了{caught}个交易日"
+                st.success(batch_info)
+                if result.get("report_path"):
+                    st.caption(f"报告: {result['report_path']}")
                 st.rerun()
-    st.caption("👆 每个交易日收盘后点一次。自动完成: 结算历史收益 → 14条线独立评分调仓 → 收盘结算 → 生成报告。耗时1-2分钟。")
+            except Exception as e:
+                progress_bar.progress(100, text="失败")
+                status_box.update(label=f"检查失败: {str(e)[:100]}", state="error")
+                st.error(f"检查失败: {e}")
+    st.caption("👆 每个交易日收盘后点一次。自动完成: 检测缺失日→补回历史（如有）→结算历史收益→14条线独立评分调仓→收盘结算→生成报告。缺失超过7天自动重置。")
 
 with col2:
     if st.button("🧮 仅收盘结算（不调仓）", use_container_width=True):
@@ -116,11 +222,30 @@ with col3:
                                   min_value=20, max_value=200,
                                   value=target_sizes.get(pool_term, 100),
                                   step=10,
-                                  help="精筛候选股数。四层管线会自动按1:1.2差额组建候选，默认等于池目标容量。")
+                                  help="精筛候选股数（参考值，实际由四层管线按1:1.2差额机制自动决定）。此输入仅用于展示目标容量，不直接传入run_pool_update。")
     if st.button("🎯 更新精筛池", use_container_width=True, type="primary"):
         if eval_ready:
-            with st.spinner("四层管线运行中: 硬筛→M1/M3批量粗筛分档→M2快筛→1:1.2差额精筛..."):
-                update_result = _run_async(orch.run_pool_update(pool_term))
+            status_box = st.status("四层管线初始化...", expanded=True)
+            progress_bar = st.progress(0, text="Layer 0 硬筛...")
+            try:
+                def on_stage(stage_name: str, message: str):
+                    progress_map = {
+                        "0_hard_screen": (5, "Layer 0: 硬筛 (去ST/新股/BJ/B股/低流动)"),
+                        "1_batch_score": (20, "Layer 1: M1/M3批量粗筛分档"),
+                        "2_quick_screen": (60, "Layer 2: M2快筛过滤初筛池"),
+                        "3_formal_score": (75, "Layer 3: 7Agent+3Scorer精筛"),
+                        "done": (100, "完成!"),
+                    }
+                    pct, text = progress_map.get(stage_name, (50, message))
+                    progress_bar.progress(pct, text=text[:80])
+                    status_box.update(label=f"{stage_name}: {message[:60]}", state="running")
+
+                update_result = _run_async(
+                    orch.run_pool_update(pool_term, on_stage=on_stage)
+                )
+                progress_bar.progress(100, text="完成!")
+                status_box.update(label="精筛池更新完成", state="complete")
+
                 if "error" in update_result:
                     st.error(update_result["error"])
                 else:
@@ -131,6 +256,10 @@ with col3:
                     st.text(f"  候选池: {update_result.get('final_pool_size', 0) - len(whitelist)}只")
                     st.text(f"  黑名单(卖出): {len(blacklist)}只")
                     st.rerun()
+            except Exception as e:
+                progress_bar.progress(100, text="失败")
+                status_box.update(label=f"更新失败", state="error")
+                st.error(f"精筛池更新失败: {e}")
     st.caption(
         "👆 四层筛选管线（总纲§4.1）:\n\n"
         "**Layer 0 硬筛**: 去ST/新股/BJ/B股/近20日日均成交额<2000万 → ~4500只\n"
@@ -241,9 +370,14 @@ with st.expander("⚙️ 历史回测（点击展开）", expanded=False):
     with col_ab3:
         ab_money = st.checkbox("moneyflow", value=True)
 
+    regime_enabled = st.checkbox("🔬 按市场环境切片分析（牛/熊/震荡分别统计）", value=False,
+                                help="总纲 §8.5: 对同一回测在牛市/熊市/震荡市分别验证，确认Agent贡献在不同市场环境下是否一致")
+
     if st.button("▶️ 开始回测", type="primary"):
         if eval_ready:
-            with st.spinner("回测运行中..."):
+            progress_bar = st.progress(0, text="回测初始化...")
+            status_box = st.status("回测运行中...", expanded=True)
+            try:
                 from src.eval.replay_backtest_engine import ReplayBacktestEngine, BacktestConfig
                 term_map = {"short": "short", "medium": "medium", "long": "long"}
                 cfg = BacktestConfig(
@@ -251,10 +385,104 @@ with st.expander("⚙️ 历史回测（点击展开）", expanded=False):
                     start_date=bt_start.strftime("%Y-%m-%d"),
                     end_date=bt_end.strftime("%Y-%m-%d"),
                 )
+                # 设置消融agent
+                ablation_list = []
+                if ab_fund: ablation_list.append("fundamental")
+                if ab_tech: ablation_list.append("technical")
+                if ab_value: ablation_list.append("value")
+                if ab_quality: ablation_list.append("quality_risk")
+                if ab_money: ablation_list.append("moneyflow")
+                cfg.ablation_agents = ablation_list
+
                 engine = ReplayBacktestEngine(cfg)
                 anchors = engine.generate_anchor_dates()
-                st.success(f"回测完成: 共{len(anchors)}个回测时点")
-                st.info("结果解读: 查看下方 Agent贡献榜，ΔL > 0 = 该Agent在帮忙，ΔL < 0 = 该Agent在拖后腿。显着性★★★ = 统计可信。")
+                progress_bar.progress(10, text=f"共{len(anchors)}个回测时点")
+
+                # 运行回测
+                pool = orch.pool_manager.get_pool(bt_term)
+                async def _run_bt():
+                    return await engine.run_full_backtest(pool, {})
+                bt_result = _run_async(_run_bt())
+
+                progress_bar.progress(90, text="汇总贡献...")
+                contrib = bt_result.get("contribution_summary", {})
+
+                # 展示结果
+                status_box.update(label=f"回测完成: {len(anchors)}个时点", state="complete")
+                progress_bar.progress(100, text="完成!")
+
+                if contrib:
+                    import pandas as pd
+                    st.subheader("📊 Agent贡献结果")
+                    contrib_rows = []
+                    for agent, info in sorted(contrib.items(),
+                                            key=lambda x: x[1].get("mean_delta_L", 0),
+                                            reverse=True):
+                        delta = info.get("mean_delta_L", 0)
+                        direction = info.get("direction", "neutral")
+                        stars = "★★★" if delta > 0.03 else ("★★" if delta > 0.01 else ("☆" if delta > -0.01 else "↓"))
+                        contrib_rows.append({
+                            "Agent": agent,
+                            "ΔL": f"{delta:+.4f}",
+                            "方向": "👍正贡献" if direction == "positive" else "👎负贡献",
+                            "显著性": stars,
+                            "样本数": info.get("sample_size", 0),
+                        })
+                    st.dataframe(pd.DataFrame(contrib_rows), use_container_width=True)
+
+                    # 参考线结果
+                    ref = bt_result.get("reference_line")
+                    if ref and "error" not in ref:
+                        with st.expander("📈 长持对照线 (SB-L6) — 现实性校验", expanded=False):
+                            col_r1, col_r2, col_r3 = st.columns(3)
+                            col_r1.metric("累计收益", f"{ref.get('cumulative_return_pct', 0)}%")
+                            col_r2.metric("最大回撤", f"{ref.get('max_drawdown_pct', 0)}%")
+                            col_r3.metric("Sharpe", f"{ref.get('sharpe_ratio', 0)}")
+                            st.caption("SB-L6使用成熟短线策略（连续持仓），不参与消融ΔLoss计算。用于验证消融结论在连续持仓场景下是否依然成立。")
+
+                # 声明
+                for decl in bt_result.get("declarations", []):
+                    st.info(f"⚠️ {decl}")
+
+                # ── 市场环境切片分析（总纲 §8.5）──
+                if regime_enabled:
+                    progress_bar.progress(95, text="市场环境切片分析...")
+                    status_box.update(label="运行市场环境切片分析（牛/熊/震荡）...", state="running")
+                    try:
+                        regime_result = _run_async(
+                            engine.run_regime_analysis(pool, {})
+                        )
+                        if regime_result:
+                            with st.expander("🔬 市场环境切片 — Agent贡献在不同市场环境下的表现", expanded=True):
+                                st.caption("同一优化结论在不同市场环境下是否依然成立？如果只在牛市有效，熊市无效，系统会记录此边界。")
+                                agg = regime_result.get("aggregate", {})
+                                col_bull, col_bear, col_range = st.columns(3)
+                                col_bull.metric("🐂 牛市anchors", agg.get("bull_anchors", 0))
+                                col_bear.metric("🐻 熊市anchors", agg.get("bear_anchors", 0))
+                                col_range.metric("📊 震荡市anchors", agg.get("ranging_anchors", 0))
+
+                                # 按环境展示贡献
+                                for regime_label, regime_emoji in [("bull", "🐂 牛市"), ("bear", "🐻 熊市"), ("ranging", "📊 震荡市")]:
+                                    rdata = regime_result.get(regime_label, {})
+                                    rcontrib = rdata.get("contribution_summary", {})
+                                    if rcontrib:
+                                        st.caption(f"**{regime_emoji}** ({rdata.get('num_anchors', 0)}个时点):")
+                                        regime_rows = []
+                                        for agent, info in sorted(rcontrib.items(),
+                                                                 key=lambda x: x[1].get("mean_delta_L", 0),
+                                                                 reverse=True):
+                                            regime_rows.append({
+                                                "Agent": agent,
+                                                "ΔL": f"{info.get('mean_delta_L', 0):+.4f}",
+                                                "方向": info.get("direction", "neutral"),
+                                            })
+                                        st.dataframe(pd.DataFrame(regime_rows), use_container_width=True, hide_index=True)
+                    except Exception as e:
+                        st.warning(f"市场环境切片分析失败: {e}")
+            except Exception as e:
+                progress_bar.progress(100, text="失败")
+                status_box.update(label=f"回测失败", state="error")
+                st.error(f"回测失败: {e}")
 
 # ═══════════════════════════════════════════════════
 # Agent贡献榜
@@ -307,43 +535,82 @@ else:
 st.markdown("---")
 st.subheader("📈 趋势图 — 系统表现随时间的变化")
 
-st.caption("每天运行'一键完整检查'会积累数据。数据越多，趋势越有意义。至少积累7-10天后才能看到明显趋势。")
+st.caption("每天运行'一键完整检查'会积累数据。至少积累10个批次后趋势图才会展示。")
 
 if eval_ready:
     try:
         from src.eval.chart_service import ChartService
+        from src.eval.memory_manager import MemoryManager
         cs = ChartService()
+        mm = MemoryManager()
 
-        tab_t1, tab_t2, tab_t3 = st.tabs(["Score趋势", "Loss趋势", "线路收益对比"])
-        with tab_t1:
-            score_data = cs.get_score_trend_data(90)
-            if score_data["data"]:
-                import pandas as pd
-                df = pd.DataFrame(score_data["data"])
-                if not df.empty:
-                    st.line_chart(df.set_index("date")["value"], use_container_width=True)
-                    st.caption("Score越高越好 = 系统评分质量在提升。曲线向上 = 优化方向对了。")
-                else:
-                    st.info("暂无数据，运行几次检查后出现。")
-        with tab_t2:
-            loss_data = cs.get_loss_trend_data(90)
-            if loss_data["data"]:
-                import pandas as pd
-                df = pd.DataFrame(loss_data["data"])
-                if not df.empty:
-                    st.line_chart(df.set_index("date")["value"], use_container_width=True)
-                    st.caption("Loss越低越好 = 预测与实际的差距在缩小。曲线向下 = 优化有效果。")
-                else:
-                    st.info("暂无数据，运行几次检查后出现。")
-        with tab_t3:
-            if status.get("lines"):
-                line_data = cs.get_line_comparison_data(status["lines"])
-                if line_data["data"]:
+        # 总纲 §19 第10条: 至少10个批次数据后才展示趋势曲线
+        batch_count = len(mm.trends.get("score_history", []))
+        min_batches = 10
+
+        if batch_count < min_batches:
+            st.info(
+                f"📊 数据积累中: 当前{batch_count}/{min_batches}批次 "
+                f"（至少需要{min_batches}批次才能展示趋势曲线）。"
+                f"每天运行'一键完整检查'会积累1个批次。"
+            )
+            st.progress(batch_count / min_batches, text=f"数据积累进度: {batch_count}/{min_batches}")
+        else:
+            tab_t1, tab_t2, tab_t3, tab_t4, tab_t5 = st.tabs([
+                "Score趋势", "Loss趋势", "线路收益对比", "保真度趋势", "运行耗时/Token"
+            ])
+            with tab_t1:
+                score_data = cs.get_score_trend_data(90)
+                if score_data["data"]:
                     import pandas as pd
-                    df = pd.DataFrame(line_data["data"])
+                    df = pd.DataFrame(score_data["data"])
                     if not df.empty:
-                        st.bar_chart(df.set_index("line_id")["return"], use_container_width=True)
-                        st.caption("对比各条线的累计收益。消融线之间差异 = Agent贡献的直观体现。")
+                        st.line_chart(df.set_index("date")["value"], use_container_width=True)
+                        st.caption("Score越高越好 = 系统评分质量在提升。曲线向上 = 优化方向对了。")
+            with tab_t2:
+                loss_data = cs.get_loss_trend_data(90)
+                if loss_data["data"]:
+                    import pandas as pd
+                    df = pd.DataFrame(loss_data["data"])
+                    if not df.empty:
+                        st.line_chart(df.set_index("date")["value"], use_container_width=True)
+                        st.caption("Loss越低越好 = 预测与实际的差距在缩小。曲线向下 = 优化有效果。")
+            with tab_t3:
+                if status.get("lines"):
+                    line_data = cs.get_line_comparison_data(status["lines"])
+                    if line_data["data"]:
+                        import pandas as pd
+                        df = pd.DataFrame(line_data["data"])
+                        if not df.empty:
+                            st.bar_chart(df.set_index("line_id")["return"], use_container_width=True)
+                            st.caption("对比各条线的累计收益。消融线之间差异 = Agent贡献的直观体现。")
+            with tab_t4:
+                fidelity_data = cs.get_fidelity_trend_data(90)
+                if fidelity_data["data"]:
+                    import pandas as pd
+                    df = pd.DataFrame(fidelity_data["data"])
+                    if not df.empty and len(df) >= 2:
+                        st.line_chart(df.set_index("date")["fidelity_loss"], use_container_width=True)
+                        st.caption("保真度Loss越低 = 评测模型与生产模型输出越一致。突然上升 → 可能存在配置漂移或模型行为变化。")
+                        with st.expander("📋 详细保真度指标", expanded=False):
+                            st.dataframe(df.set_index("date"), use_container_width=True)
+                    else:
+                        st.info("保真度数据积累中（需要至少2个批次）。运行几次检查后出现。")
+            with tab_t5:
+                runtime_data = cs.get_runtime_trend_data(90)
+                if runtime_data["data"]:
+                    import pandas as pd
+                    df = pd.DataFrame(runtime_data["data"])
+                    if not df.empty and len(df) >= 2:
+                        col_r1, col_r2 = st.columns(2)
+                        with col_r1:
+                            st.line_chart(df.set_index("date")["duration_minutes"], use_container_width=True)
+                            st.caption("运行耗时（分钟）。持续上升 → 池子变大或Agent调用量增加。")
+                        with col_r2:
+                            st.line_chart(df.set_index("date")["cache_hit_rate"], use_container_width=True)
+                            st.caption("缓存命中率%。越高越好 → 分析Agent结果被有效复用。")
+                    else:
+                        st.info("运行耗时数据积累中（需要至少2个批次）。运行几次检查后出现。")
     except Exception:
         st.caption("趋势数据加载中...")
 else:

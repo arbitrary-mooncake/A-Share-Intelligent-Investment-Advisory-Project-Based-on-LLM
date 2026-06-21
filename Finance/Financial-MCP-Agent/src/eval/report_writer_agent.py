@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from openai import OpenAI
 
-from src.utils.model_config import get_eval_model_config
+from src.utils.model_config import get_eval_model_config, get_thinking_body
 from src.eval.optimizer.anti_hallucination import quick_verify
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ class ReportWriterAgent:
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body={"thinking": {"type": "enabled"}},
+                extra_body=get_thinking_body(self.model_config["base_url"], enabled=True),
             )
             return response.choices[0].message.content or ""
         except Exception as e:

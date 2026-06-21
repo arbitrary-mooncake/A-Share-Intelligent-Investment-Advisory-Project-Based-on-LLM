@@ -81,6 +81,75 @@ def _extract_risk_flags_from_text(text: str) -> List[str]:
     return list(dict.fromkeys(flags))
 
 
+# ── 信号字段标准化映射 ──────────────────────────────
+
+_DIRECTION_MAP = {
+    "positive": 1, "bullish": 1, "long": 1, "buy": 1,
+    "看多": 1, "利多": 1, "正向": 1, "积极": 1, "偏多": 1,
+    "negative": -1, "bearish": -1, "short": -1, "sell": -1,
+    "看空": -1, "利空": -1, "负向": -1, "消极": -1, "偏空": -1,
+    "neutral": 0, "中性": 0, "持平": 0, "观望": 0,
+}
+
+_STRENGTH_MAP = {
+    "strong": 8, "强": 8, "very_strong": 9, "极强": 9,
+    "medium": 5, "中": 5, "moderate": 5, "一般": 5,
+    "weak": 3, "弱": 3, "mild": 3,
+    "none": 0, "无": 0,
+}
+
+
+def normalize_signal_pack(sp: Dict[str, Any]) -> Dict[str, Any]:
+    """标准化 signal_pack 中的字段类型和值映射。
+
+    LLM 输出不规范时，direction 可能是中文/英文字符串（如"利多"/"short"），
+    strength 可能是"强"/"medium"等。本函数统一转换为数值类型。
+    """
+    bias_raw = sp.get("bias", "")
+    if isinstance(bias_raw, str) and bias_raw not in ("bullish", "bearish", "neutral"):
+        mapped = None
+        if bias_raw in ("看多", "利多", "偏多", "积极向好", "positive"):
+            mapped = "bullish"
+        elif bias_raw in ("看空", "利空", "偏空", "消极", "negative"):
+            mapped = "bearish"
+        if mapped:
+            sp["bias"] = mapped
+
+    for sig in sp.get("signals", []):
+        if not isinstance(sig, dict):
+            continue
+
+        d = sig.get("direction", 0)
+        if isinstance(d, str):
+            sig["direction"] = _DIRECTION_MAP.get(d.strip(), 0)
+        try:
+            sig["direction"] = int(sig.get("direction", 0))
+        except (ValueError, TypeError):
+            sig["direction"] = 0
+
+        s = sig.get("strength", 5)
+        if isinstance(s, str):
+            s_stripped = s.strip()
+            if s_stripped in _STRENGTH_MAP:
+                sig["strength"] = _STRENGTH_MAP[s_stripped]
+            else:
+                try:
+                    sig["strength"] = int(s_stripped)
+                except (ValueError, TypeError):
+                    sig["strength"] = 5
+        try:
+            sig["strength"] = int(sig.get("strength", 5))
+        except (ValueError, TypeError):
+            sig["strength"] = 5
+
+        try:
+            sig["confidence"] = float(sig.get("confidence", 0.5))
+        except (ValueError, TypeError):
+            sig["confidence"] = 0.5
+
+    return sp
+
+
 # ── SignalPack 标准化 ────────────────────────────────
 
 def _parse_signal_pack(raw: Any, agent_name: str, as_of_date: str) -> Dict[str, Any]:
@@ -107,7 +176,7 @@ def _parse_signal_pack(raw: Any, agent_name: str, as_of_date: str) -> Dict[str, 
             sp["data_quality_score"] = float(sp.get("data_quality_score", 0.5))
         except (ValueError, TypeError):
             sp["data_quality_score"] = 0.5
-        return sp
+        return normalize_signal_pack(sp)
 
     if isinstance(raw, str) and raw.strip():
         return {
@@ -296,14 +365,23 @@ def _build_compact_context(
     lines.append("")
 
     lines.append("## 各Agent结论摘要")
-    bias_map = {"bullish": "看多", "neutral": "中性", "bearish": "看空"}
+    bias_map = {
+        "bullish": "看多", "neutral": "中性", "bearish": "看空",
+        "看多": "看多", "看空": "看空", "中性": "中性",
+        "偏多": "看多", "偏空": "看空", "利多": "看多", "利空": "看空",
+    }
     for agent_name, sp in signal_packs.items():
         bias_cn = bias_map.get(sp.get("bias", ""), "中性")
         try:
             conf = float(sp.get('confidence', 0))
         except (ValueError, TypeError):
             conf = 0.0
-        lines.append(f"- **{agent_name}**: {bias_cn} (置信度={conf:.0%})")
+        try:
+            dqs = float(sp.get('data_quality_score', 0.5))
+        except (ValueError, TypeError):
+            dqs = 0.5
+        sig_count = len([s for s in sp.get("signals", []) if isinstance(s, dict)])
+        lines.append(f"- **{agent_name}**: {bias_cn} (置信度={conf:.0%}, 数据质量={dqs:.0%}, {sig_count}条信号)")
         for kp in sp.get("key_points", [])[:3]:
             lines.append(f"  - {kp}")
     lines.append("")

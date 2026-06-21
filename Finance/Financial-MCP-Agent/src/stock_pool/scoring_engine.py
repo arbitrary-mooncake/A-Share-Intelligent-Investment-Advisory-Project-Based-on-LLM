@@ -255,10 +255,24 @@ class ScoringEngine:
             if self.pool_manager:
                 self.pool_manager.update_stock_score(stock_code, score_data)
 
+            # 提取所有agent的signal_pack和分析文本
+            signal_packs = {}
+            analysis_texts = {}
+            for agent in ("fundamental", "technical", "value", "news",
+                          "event", "quality_risk", "moneyflow"):
+                sp_key = f"{agent}_signal_pack"
+                if sp_key in data and data[sp_key]:
+                    signal_packs[agent] = data[sp_key]
+                txt_key = f"{agent}_analysis"
+                if txt_key in data and data[txt_key]:
+                    analysis_texts[agent] = data[txt_key]
+
             return {
                 "stock_code": stock_code,
                 "company_name": company_name,
                 "score_data": score_data,
+                "signal_packs": signal_packs,
+                "analysis_texts": analysis_texts,
                 "execution_time": elapsed
             }
 

@@ -92,7 +92,8 @@ def _extract_signal_pack_from_llm(llm_output: str, agent_name: str, as_of_date: 
             sp["as_of_date"] = as_of_date
             sp.setdefault("analysis_text", llm_output[:500])
             sp.setdefault("data_quality_score", 0.7)
-            return sp
+            from src.utils.analysis_package_builder import normalize_signal_pack
+            return normalize_signal_pack(sp)
         except (_json.JSONDecodeError, ValueError):
             pass
 
@@ -105,7 +106,8 @@ def _extract_signal_pack_from_llm(llm_output: str, agent_name: str, as_of_date: 
             sp["as_of_date"] = as_of_date
             sp.setdefault("analysis_text", llm_output[:500])
             sp.setdefault("data_quality_score", 0.5)
-            return sp
+            from src.utils.analysis_package_builder import normalize_signal_pack
+            return normalize_signal_pack(sp)
         except (_json.JSONDecodeError, ValueError):
             pass
 

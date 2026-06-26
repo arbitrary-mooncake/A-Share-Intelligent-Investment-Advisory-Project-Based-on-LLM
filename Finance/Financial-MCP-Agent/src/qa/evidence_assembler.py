@@ -119,6 +119,7 @@ async def assemble_evidence_fast(
         "get_us_cpi", "get_us_pmi", "get_us_non_farm",
         "get_us_unemployment", "get_us_gdp", "get_us_retail_sales",
         "get_comex_inventory", "get_spot_gold_sge",
+        "get_global_futures_spot", "get_sge_spot_prices", "get_fx_rates",
         # Phase 2: Yahoo Finance (no code needed)
         "get_commodity_price", "get_us_treasury_yield",
         "get_dollar_index", "get_gold_etf",
@@ -562,6 +563,9 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         "get_us_retail_sales": {},
         "get_comex_inventory": {},
         "get_spot_gold_sge": {},
+        "get_global_futures_spot": {},
+        "get_sge_spot_prices": {},
+        "get_fx_rates": {},
         # Web Search（使用问题文本作为查询）
         "web_search": {"query": _build_search_query(question, topic_name)},
         # web_fetch 是动态工具（URL由后续调用决定），不在预规划kwargs中

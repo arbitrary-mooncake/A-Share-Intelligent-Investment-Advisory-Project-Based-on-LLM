@@ -304,10 +304,14 @@ DATA_DOMAINS = {
         "keywords": ["国际", "全球", "美元", "美联储", "美债", "COMEX",
                      "伦敦金", "纽约", "欧央行", "日央行", "OPEC",
                      "地缘", "制裁", "贸易战", "关税", "冲突"],
-        "tools": ["web_search", "get_us_cpi", "get_us_pmi", "get_us_non_farm",
-                  "get_us_unemployment", "get_us_gdp", "get_comex_inventory",
-                  "get_spot_gold_sge", "get_commodity_price",
-                  "get_us_treasury_yield", "get_dollar_index"],
+        "tools": ["web_search",
+                  # AKShare 国际数据（无速率限制，主力数据源）
+                  "get_us_cpi", "get_us_pmi", "get_us_non_farm",
+                  "get_us_unemployment", "get_us_gdp", "get_us_retail_sales",
+                  "get_comex_inventory", "get_spot_gold_sge",
+                  "get_global_futures_spot", "get_sge_spot_prices", "get_fx_rates",
+                  # Yahoo Finance（有限速，补充数据源）
+                  "get_commodity_price", "get_us_treasury_yield", "get_dollar_index"],
         "description": "国际宏观、商品期货、美国国债、美元指数等数据"
                        "（Web Search + AKShare国际 + Yahoo Finance）",
     },
@@ -433,14 +437,19 @@ def _get_tools_for_domains(domains: List[str]) -> List[str]:
     if len(result) <= MAX_TOOLS_PER_QUERY:
         return result
 
-    # 超限时：国际/宏观工具优先，其次是行情/新闻，财务/估值工具在后
+    # 超限时：web_search 绝对最高优先级，其次国际/宏观工具，财务/估值最后
     priority_prefixes = [
         "web_search", "get_us_", "get_commodity", "get_dollar", "get_gold",
-        "get_spot", "get_comex", "tushare_cn_", "tushare_fx", "tushare_shibor",
+        "get_spot", "get_comex", "get_global", "get_sge", "get_fx",
+        "tushare_cn_", "tushare_fx", "tushare_shibor",
         "tushare_eco_cal", "tushare_latest_trading_date",
     ]
     prioritized = [t for t in result if any(t.startswith(p) for p in priority_prefixes)]
     rest = [t for t in result if t not in prioritized]
+    # web_search 必须排在最前面（绝对最高优先级）
+    if "web_search" in prioritized:
+        prioritized.remove("web_search")
+        prioritized.insert(0, "web_search")
     return (prioritized + rest)[:MAX_TOOLS_PER_QUERY]
 
 

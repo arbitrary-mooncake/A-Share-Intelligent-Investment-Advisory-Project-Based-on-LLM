@@ -106,24 +106,25 @@ async def process_question(
         macro_topic_hints = {
             "黄金": (
                 "\n\n[国际数据源] 本主题涉及国际定价资产。"
-                "请优先使用 web_search 工具获取最新的美联储政策声明、地缘政治事件、"
-                "美债收益率变化等驱动金价的关键信息。"
-                "结合 get_us_cpi/get_us_pmi 等美国宏观数据、"
-                "get_commodity_price(GC=F) 的COMEX黄金期货价格、"
-                "get_dollar_index 的美元指数进行综合分析。"
+                "请优先使用 web_search 获取最新的美联储政策声明、地缘政治事件。"
+                "使用 get_global_futures_spot 获取 COMEX 黄金期货实时价格，"
+                "使用 get_sge_spot_prices 获取上海黄金交易所 Au99.99 现货报价，"
+                "使用 get_fx_rates 获取美元/人民币汇率，"
+                "结合 get_us_cpi/get_us_pmi 等美国宏观数据分析通胀和货币政策预期。"
                 "A股黄金ETF和黄金股作为国内市场的辅助参考。"
                 "\n⚠️ 黄金价格的核心驱动因素（按重要性）："
-                "1) 美联储货币政策预期 2) 美元指数 3) 美国实际利率（TIPS）"
+                "1) 美联储货币政策预期 2) 美元走势 3) 美国实际利率"
                 "4) 地缘政治风险 5) 央行购金 6) 通胀预期"
             ),
             "白银": (
                 "\n\n[国际数据源] 白银定价同时受贵金属属性和工业需求影响。"
-                "请使用 web_search 获取最新宏观事件，结合 get_commodity_price(SI=F) 获取国际银价。"
+                "请使用 web_search 获取最新宏观事件，"
+                "结合 get_global_futures_spot 和 get_sge_spot_prices 获取国际银价。"
             ),
             "原油": (
                 "\n\n[国际数据源] 原油是全球定价大宗商品。"
                 "请使用 web_search 获取OPEC+决策、地缘政治事件，"
-                "结合 get_commodity_price(CL=F) 获取WTI原油期货价格。"
+                "结合 get_global_futures_spot 获取WTI/布伦特原油期货价格。"
             ),
         }
         if matched_topic_name in macro_topic_hints:

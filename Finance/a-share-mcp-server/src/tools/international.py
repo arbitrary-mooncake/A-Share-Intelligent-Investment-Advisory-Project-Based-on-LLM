@@ -161,3 +161,75 @@ def register_international_tools(app: FastMCP):
         if result is None or (hasattr(result, 'empty') and result.empty):
             return "## 上海金基准价\n\n数据获取失败或暂无数据"
         return _to_markdown_table(result, "上海黄金交易所现货基准价")
+
+    @app.tool()
+    def get_sge_spot_prices() -> str:
+        """
+        获取上海黄金交易所(SGE)所有品种实时报价。
+        包含 Au99.99（黄金）、Ag(T+D)（白银）等现货合约的实时价格、
+        涨跌幅、成交量。数据源 AKShare，无速率限制。
+
+        返回: Markdown 表格，含品种/最新价/涨跌幅
+        """
+        result = _safe_ak_call("spot_quotations_sge")
+        if result is None or (hasattr(result, 'empty') and result.empty):
+            return "## SGE实时报价\n\n数据获取失败或暂无数据"
+
+        import pandas as pd
+        if isinstance(result, pd.DataFrame) and not result.empty:
+            # 只返回最近时刻的数据，去重品种
+            latest = result.drop_duplicates(subset=result.columns[0] if len(result.columns) > 0 else None, keep='last')
+            return _to_markdown_table(latest.head(30), "上海黄金交易所实时报价")
+
+        return _to_markdown_table(result, "上海黄金交易所实时报价")
+
+    @app.tool()
+    def get_global_futures_spot() -> str:
+        """
+        获取全球期货交易所实时行情（CME/COMEX/LME等）。
+        包含 COMEX黄金、白银、铜、WTI原油、布伦特原油、天然气等
+        国际大宗商品期货的最新价格、涨跌幅、成交量。
+        数据源 AKShare（东方财富），无 Yahoo Finance 速率限制。
+
+        返回: Markdown 表格，含品种/合约/最新价/涨跌幅/成交量
+        """
+        result = _safe_ak_call("futures_global_spot_em")
+        if result is None or (hasattr(result, 'empty') and result.empty):
+            return "## 全球期货行情\n\n数据获取失败或暂无数据"
+
+        import pandas as pd
+        if isinstance(result, pd.DataFrame) and not result.empty:
+            # 筛选主要品种：黄金、白银、铜、原油、天然气
+            gold_keywords = ['黄金', '金', 'Gold', 'GOLD', 'GC', 'QO']
+            oil_keywords = ['原油', 'WTI', 'Brent', '布伦特', 'CL', 'BZ']
+            silver_keywords = ['白银', '银', 'Silver', 'SI']
+            copper_keywords = ['铜', 'Copper', 'HG']
+            all_kw = gold_keywords + oil_keywords + silver_keywords + copper_keywords
+
+            cols = list(result.columns)
+            text_col = cols[0] if cols else ''
+            # 在各列中搜索关键词
+            mask = pd.Series([False] * len(result), index=result.index)
+            for col in result.columns:
+                mask |= result[col].astype(str).str.contains('|'.join(all_kw), case=False, na=False)
+            filtered = result[mask].head(30)
+            if not filtered.empty:
+                return _to_markdown_table(filtered, "全球期货实时行情（黄金/白银/铜/原油）")
+            # 过滤无结果时返回前20条
+            return _to_markdown_table(result.head(20), "全球期货实时行情")
+
+        return _to_markdown_table(result, "全球期货实时行情")
+
+    @app.tool()
+    def get_fx_rates() -> str:
+        """
+        获取主要外汇汇率（USD/CNY、EUR/CNY、JPY/CNY等）。
+        包含买入报价和卖出报价，反映人民币对主要货币的汇率水平。
+        美元走强通常利空黄金，人民币汇率影响国内金价。
+
+        返回: Markdown 表格，含货币对/买入价/卖出价
+        """
+        result = _safe_ak_call("fx_spot_quote")
+        if result is None or (hasattr(result, 'empty') and result.empty):
+            return "## 外汇汇率\n\n数据获取失败或暂无数据"
+        return _to_markdown_table(result, "主要外汇汇率")

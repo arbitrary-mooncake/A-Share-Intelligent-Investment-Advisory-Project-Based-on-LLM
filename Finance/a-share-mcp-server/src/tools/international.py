@@ -10,10 +10,18 @@ logger = logging.getLogger(__name__)
 
 
 def _to_markdown_table(data, title: str) -> str:
-    """将 pandas DataFrame 或 list-of-dict 转为 Markdown 表格"""
+    """将 pandas DataFrame、dict 或 list-of-dict 转为 Markdown 表格"""
     import pandas as pd
     if isinstance(data, pd.DataFrame):
         df = data
+    elif isinstance(data, dict) and data:
+        # 单行 dict：转为两列表格（指标 | 值）
+        lines = [f"## {title}\n"]
+        lines.append("| 指标 | 数值 |")
+        lines.append("| --- | --- |")
+        for k, v in data.items():
+            lines.append(f"| {k} | {v} |")
+        return "\n".join(lines)
     elif isinstance(data, list) and data:
         df = pd.DataFrame(data)
     else:
@@ -23,11 +31,9 @@ def _to_markdown_table(data, title: str) -> str:
         return f"## {title}\n\n无数据"
 
     lines = [f"## {title}\n"]
-    # Headers
     headers = list(df.columns)
     lines.append("| " + " | ".join(str(h) for h in headers) + " |")
     lines.append("| " + " | ".join("---" for _ in headers) + " |")
-    # Rows (max 50)
     for _, row in df.head(50).iterrows():
         cells = [str(v) if v is not None else "" for v in row.values]
         lines.append("| " + " | ".join(cells) + " |")

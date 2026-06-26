@@ -124,7 +124,7 @@ def get_us_treasury_yield(tenor: str = "10y") -> str:
     - 收益率下降 → 利好黄金
 
     参数:
-        tenor: 期限，'3m'=3个月, '2y'=2年, '5y'=5年, '10y'=10年, '30y'=30年
+        tenor: 期限，'3m'=3个月, '5y'=5年, '10y'=10年, '30y'=30年
 
     返回: Markdown 表格
     """

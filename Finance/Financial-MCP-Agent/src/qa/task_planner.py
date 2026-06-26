@@ -419,13 +419,29 @@ def _identify_domains(question: str) -> List[str]:
     return matched
 
 
+MAX_TOOLS_PER_QUERY = 22
+
+
 def _get_tools_for_domains(domains: List[str]) -> List[str]:
-    """获取数据域对应的工具列表（去重）"""
+    """获取数据域对应的工具列表（去重）。多域时优先保留核心工具，上限 MAX_TOOLS_PER_QUERY。"""
     tools: Set[str] = set()
     for domain in domains:
         if domain in DATA_DOMAINS:
             tools.update(DATA_DOMAINS[domain]["tools"])
-    return sorted(tools)
+
+    result = sorted(tools)
+    if len(result) <= MAX_TOOLS_PER_QUERY:
+        return result
+
+    # 超限时：国际/宏观工具优先，其次是行情/新闻，财务/估值工具在后
+    priority_prefixes = [
+        "web_search", "get_us_", "get_commodity", "get_dollar", "get_gold",
+        "get_spot", "get_comex", "tushare_cn_", "tushare_fx", "tushare_shibor",
+        "tushare_eco_cal", "tushare_latest_trading_date",
+    ]
+    prioritized = [t for t in result if any(t.startswith(p) for p in priority_prefixes)]
+    rest = [t for t in result if t not in prioritized]
+    return (prioritized + rest)[:MAX_TOOLS_PER_QUERY]
 
 
 def extract_stock_from_question(question: str, session_stock_code: str = "",

@@ -464,18 +464,34 @@ async def assemble_evidence_react(
     return evidence
 
 
+def _build_search_query(question: str, topic_name: str) -> str:
+    """从用户问题中提取核心关键词构建搜索查询"""
+    if topic_name:
+        # 宏观主题：主题名 + 去噪后的问题关键部分
+        # 去除常见的噪音前缀和语气词
+        import re
+        cleaned = re.sub(r'(深度|详细|全面|系统)?(分析一下|分析|帮我)?(最近|当前|未来)?(的)?', '', question)
+        cleaned = cleaned.strip()
+        if len(cleaned) > 60:
+            # 截断过长查询，保留核心
+            return f"{topic_name} {cleaned[:40]}"
+        return f"{topic_name} {cleaned}" if cleaned else topic_name
+    # 无主题时直接用问题
+    return question[:100]
+
+
 def _topic_to_commodity_symbol(topic_name: str) -> str:
-    """将投资主题映射为 Yahoo Finance 商品期货代码"""
+    """将投资主题映射为 Yahoo Finance 商品期货代码。
+    未映射的主题返回空字符串，调用方应跳过 get_commodity_price。"""
     if not topic_name:
-        return "GC=F"
+        return ""
     mapping = {
         "黄金": "GC=F",
         "白银": "SI=F",
         "原油": "CL=F",
-        "煤炭": "CL=F",  # 煤炭无直接国际期货，用原油近似
         "有色金属": "HG=F",
     }
-    return mapping.get(topic_name, "GC=F")
+    return mapping.get(topic_name, "")
 
 
 def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
@@ -548,8 +564,8 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         "get_comex_inventory": {},
         "get_spot_gold_sge": {},
         # Web Search（使用问题文本作为查询）
-        "web_search": {"query": question},
-        "web_fetch": {"url": ""},
+        "web_search": {"query": _build_search_query(question, topic_name)},
+        # web_fetch 是动态工具（URL由后续调用决定），不在预规划kwargs中
         # Yahoo Finance（国际商品/利率 — 按主题选择默认symbol）
         "get_commodity_price": {"symbol": _topic_to_commodity_symbol(topic_name)},
         "get_us_treasury_yield": {"tenor": "10y"},

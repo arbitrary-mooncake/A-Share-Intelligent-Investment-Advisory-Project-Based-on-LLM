@@ -464,6 +464,20 @@ async def assemble_evidence_react(
     return evidence
 
 
+def _topic_to_commodity_symbol(topic_name: str) -> str:
+    """将投资主题映射为 Yahoo Finance 商品期货代码"""
+    if not topic_name:
+        return "GC=F"
+    mapping = {
+        "黄金": "GC=F",
+        "白银": "SI=F",
+        "原油": "CL=F",
+        "煤炭": "CL=F",  # 煤炭无直接国际期货，用原油近似
+        "有色金属": "HG=F",
+    }
+    return mapping.get(topic_name, "GC=F")
+
+
 def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
                         question: str, current_date: str = "",
                         topic_name: str = "") -> dict:
@@ -536,8 +550,8 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         # Web Search（使用问题文本作为查询）
         "web_search": {"query": question},
         "web_fetch": {"url": ""},
-        # Yahoo Finance（国际商品/利率）
-        "get_commodity_price": {"symbol": "GC=F"},
+        # Yahoo Finance（国际商品/利率 — 按主题选择默认symbol）
+        "get_commodity_price": {"symbol": _topic_to_commodity_symbol(topic_name)},
         "get_us_treasury_yield": {"tenor": "10y"},
         "get_dollar_index": {},
         "get_gold_etf": {"symbol": "GLD"},

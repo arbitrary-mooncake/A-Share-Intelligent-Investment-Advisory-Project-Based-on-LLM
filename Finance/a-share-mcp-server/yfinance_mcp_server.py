@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 app = FastMCP()
 
-SYMBOL_MAP = {
+COMMODITY_COMMODITY_SYMBOL_MAP = {
     "gold": "GC=F",
     "silver": "SI=F",
     "oil": "CL=F",
@@ -28,9 +28,14 @@ SYMBOL_MAP = {
     "silver_future": "SI=F",
 }
 
+GOLD_ETF_MAP = {
+    "gld": "GLD",
+    "iau": "IAU",
+    "gdx": "GDX",
+}
+
 TREASURY_MAP = {
     "3m": "^IRX",
-    "2y": "^FVX",
     "5y": "^FVX",
     "10y": "^TNX",
     "30y": "^TYX",
@@ -39,8 +44,8 @@ TREASURY_MAP = {
 
 def _resolve_symbol(symbol: str) -> str:
     key = symbol.lower().strip()
-    if key in SYMBOL_MAP:
-        return SYMBOL_MAP[key]
+    if key in COMMODITY_SYMBOL_MAP:
+        return COMMODITY_SYMBOL_MAP[key]
     return symbol
 
 
@@ -153,8 +158,9 @@ def get_gold_etf(symbol: str = "GLD") -> str:
 
     返回: Markdown 表格
     """
-    logger.info(f"Fetching gold ETF: {symbol}")
-    return _get_yf_history(symbol, period="6mo")
+    resolved = GOLD_ETF_MAP.get(symbol.lower().strip(), symbol)
+    logger.info(f"Fetching gold ETF: {resolved} (input={symbol})")
+    return _get_yf_history(resolved, period="6mo")
 
 
 if __name__ == "__main__":

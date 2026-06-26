@@ -8,6 +8,8 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import logging
+import threading
+import time
 from mcp.server.fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +17,12 @@ logger = logging.getLogger(__name__)
 
 app = FastMCP()
 
-COMMODITY_COMMODITY_SYMBOL_MAP = {
+# 限制对 Yahoo Finance 的并发调用，防止速率限制
+_yf_lock = threading.Lock()
+_yf_min_interval = 1.5  # 两次调用之间的最小间隔（秒）
+_last_yf_call = 0.0
+
+COMMODITY_SYMBOL_MAP = {
     "gold": "GC=F",
     "silver": "SI=F",
     "oil": "CL=F",
@@ -50,45 +57,69 @@ def _resolve_symbol(symbol: str) -> str:
 
 
 def _get_yf_history(symbol: str, period: str = "6mo") -> str:
+    """获取 Yahoo Finance 历史数据，含速率限制保护和重试"""
     import yfinance as yf
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        hist = ticker.history(period=period)
+    global _last_yf_call
 
-        name = info.get("shortName") or info.get("longName") or symbol
-        current_price = info.get("regularMarketPrice") or info.get("previousClose", "N/A")
+    with _yf_lock:
+        elapsed = time.time() - _last_yf_call
+        if elapsed < _yf_min_interval:
+            time.sleep(_yf_min_interval - elapsed)
 
-        lines = [
-            f"## {name} ({symbol})",
-            f"**最新价格**: {current_price}",
-            f"**数据周期**: {period}",
-            "",
-        ]
+        for attempt in range(3):
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                hist = ticker.history(period=period)
+                _last_yf_call = time.time()
 
-        if hist.empty:
-            lines.append("无历史数据")
-            return "\n".join(lines)
+                if "Too Many Requests" in str(info.get("regularMarketPrice", "")):
+                    if attempt < 2:
+                        wait = (attempt + 1) * 3
+                        logger.warning(f"YH rate limited for {symbol}, retry in {wait}s")
+                        time.sleep(wait)
+                        continue
+                    return f"获取 {symbol} 数据失败: Yahoo Finance 请求过于频繁，请稍后重试"
 
-        recent = hist.tail(20)
-        lines.append("| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 |")
-        lines.append("| --- | --- | --- | --- | --- | --- |")
-        for idx, row in recent.iterrows():
-            date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
-            lines.append(
-                f"| {date_str} "
-                f"| {row.get('Open', 'N/A')} "
-                f"| {row.get('High', 'N/A')} "
-                f"| {row.get('Low', 'N/A')} "
-                f"| {row.get('Close', 'N/A')} "
-                f"| {int(row.get('Volume', 0)):,} |"
-            )
+                name = info.get("shortName") or info.get("longName") or symbol
+                current_price = info.get("regularMarketPrice") or info.get("previousClose", "N/A")
 
-        return "\n".join(lines)
+                lines = [
+                    f"## {name} ({symbol})",
+                    f"**最新价格**: {current_price}",
+                    f"**数据周期**: {period}",
+                    "",
+                ]
 
-    except Exception as e:
-        logger.error(f"Yahoo Finance fetch failed for {symbol}: {e}")
-        return f"获取 {symbol} 数据失败: {e}"
+                if hist.empty:
+                    lines.append("无历史数据")
+                    return "\n".join(lines)
+
+                recent = hist.tail(20)
+                lines.append("| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 |")
+                lines.append("| --- | --- | --- | --- | --- | --- |")
+                for idx, row in recent.iterrows():
+                    date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+                    lines.append(
+                        f"| {date_str} "
+                        f"| {row.get('Open', 'N/A')} "
+                        f"| {row.get('High', 'N/A')} "
+                        f"| {row.get('Low', 'N/A')} "
+                        f"| {row.get('Close', 'N/A')} "
+                        f"| {int(row.get('Volume', 0)):,} |"
+                    )
+                return "\n".join(lines)
+
+            except Exception as e:
+                err_msg = str(e)
+                if "rate limit" in err_msg.lower() or "too many requests" in err_msg.lower():
+                    if attempt < 2:
+                        wait = (attempt + 1) * 3
+                        logger.warning(f"YH rate limited for {symbol}, retry in {wait}s")
+                        time.sleep(wait)
+                        continue
+                logger.error(f"Yahoo Finance fetch failed for {symbol}: {e}")
+                return f"获取 {symbol} 数据失败: {e}"
 
 
 @app.tool()

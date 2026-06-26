@@ -72,6 +72,11 @@ def web_fetch(url: str) -> str:
         网页的纯文本内容（截断至 {FETCH_MAX_CHARS} 字符）
     """
     try:
+        # SSRF 防护：仅允许 http/https
+        parsed = httpx.URL(url)
+        if parsed.scheme not in ("http", "https"):
+            return f"不支持的协议: {parsed.scheme}，仅支持 http/https"
+
         resp = httpx.get(
             url,
             timeout=FETCH_TIMEOUT,

@@ -489,7 +489,6 @@ def _topic_to_commodity_symbol(topic_name: str) -> str:
         "黄金": "GC=F",
         "白银": "SI=F",
         "原油": "CL=F",
-        "有色金属": "HG=F",
     }
     return mapping.get(topic_name, "")
 

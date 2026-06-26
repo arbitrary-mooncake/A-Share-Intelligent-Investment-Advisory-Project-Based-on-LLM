@@ -26,6 +26,7 @@ from src.tools.macroeconomic import register_macroeconomic_tools
 from src.tools.date_utils import register_date_utils_tools
 from src.tools.analysis import register_analysis_tools
 from src.tools.news_crawler import register_news_crawler_tools
+from src.tools.international import register_international_tools
 
 # --- Logging Setup ---
 # Call the setup function from utils
@@ -68,6 +69,7 @@ register_macroeconomic_tools(app, active_data_source)
 register_date_utils_tools(app, active_data_source)
 register_analysis_tools(app, active_data_source)
 register_news_crawler_tools(app, active_data_source)
+register_international_tools(app)
 
 # --- Main Execution Block ---
 if __name__ == "__main__":

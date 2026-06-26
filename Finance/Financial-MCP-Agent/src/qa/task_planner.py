@@ -281,8 +281,8 @@ DATA_DOMAINS = {
     "新闻": {
         "keywords": ["新闻", "公告", "消息", "事件", "发布", "披露", "分红方案",
                      "回购", "减持", "增持", "业绩预告", "ST", "风险警示"],
-        "tools": ["tushare_news", "tushare_st_status"],
-        "description": "新闻公告、ST风险、重大事件等舆情数据（Tushare+东方财富）",
+        "tools": ["tushare_news", "tushare_st_status", "web_search"],
+        "description": "新闻公告、ST风险、重大事件等舆情数据（Tushare+Web Search）",
     },
     "宏观": {
         "keywords": ["利率", "汇率", "CPI", "PPI", "GDP", "PMI", "通胀", "货币",
@@ -292,8 +292,24 @@ DATA_DOMAINS = {
                      "价格指数", "采购经理", "M0", "M1", "M2", "SHIBOR"],
         "tools": ["tushare_cn_cpi", "tushare_cn_gdp", "tushare_cn_pmi",
                   "tushare_cn_ppi", "tushare_cn_m", "tushare_shibor",
-                  "tushare_fx_daily", "tushare_eco_cal", "tushare_stock_info"],
-        "description": "CPI、GDP、PMI、PPI、M2、SHIBOR、汇率等宏观经济指标（Tushare）",
+                  "tushare_fx_daily", "tushare_eco_cal", "tushare_stock_info",
+                  "get_us_cpi", "get_us_pmi", "get_us_non_farm",
+                  "get_us_unemployment", "get_us_gdp", "get_us_retail_sales",
+                  "get_comex_inventory", "get_spot_gold_sge",
+                  "web_search"],
+        "description": "CPI、GDP、PMI、PPI、M2、SHIBOR、汇率等宏观经济指标"
+                       "（Tushare中国宏观 + AKShare美国宏观 + Web Search国际事件）",
+    },
+    "国际": {
+        "keywords": ["国际", "全球", "美元", "美联储", "美债", "COMEX",
+                     "伦敦金", "纽约", "欧央行", "日央行", "OPEC",
+                     "地缘", "制裁", "贸易战", "关税", "冲突"],
+        "tools": ["web_search", "get_us_cpi", "get_us_pmi", "get_us_non_farm",
+                  "get_us_unemployment", "get_us_gdp", "get_comex_inventory",
+                  "get_spot_gold_sge", "get_commodity_price",
+                  "get_us_treasury_yield", "get_dollar_index"],
+        "description": "国际宏观、商品期货、美国国债、美元指数等数据"
+                       "（Web Search + AKShare国际 + Yahoo Finance）",
     },
 }
 
@@ -353,14 +369,16 @@ def plan_task(question: str, complexity_level: str, history_text: str = "",
         macro_topics = {"黄金", "白银", "原油", "煤炭", "房地产"}
         if topic_name in macro_topics and "宏观" not in domains:
             domains.append("宏观")
+        # 宏观主题总是追加国际域，获取国际商品价格、美国宏观和最新事件
+        if topic_name in macro_topics and "国际" not in domains:
+            domains.append("国际")
 
     tools = _get_tools_for_domains(domains)
 
-    # 确定是否需要 ReAct
-    # L1/L2: 永不用ReAct
-    # L3: 默认不走ReAct，仅运行时升级触发（证据矛盾/数据大量缺失等极端情况）
-    # L4: 稳定走ReAct
-    need_react = (complexity_level == "L4")
+    # 全部复杂度统一使用两阶段快路径（并行拉取+单次LLM），不走ReAct
+    # ReAct 串行 LLM-工具迭代导致频繁超时（18工具串行需270-810s），快路径并行+缓存3-15s完成
+    # L4 仍通过 model=mimo-v2.5-pro + thinking=True + deep模板 保持分析深度
+    need_react = False
 
     data_volume = "small"
     if len(domains) >= 4:
@@ -437,23 +455,48 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
         name = session_company_name
 
     # 纯公司名称提取（无代码时的兜底）：问题开头/整体为中文名称
-    # 排除以通用疑问词/时间词/礼貌用语开头的搜索性问题
-    _GENERIC_STARTS = r'^(?:现在|哪些|什么|怎么|如何|为什么|最近|当前|目前|哪只|哪个|哪家|哪类|怎样|何时|多少|有没有|是否|请|帮|麻烦|能否|可否|能否)'
-    if not code and not name and not re.match(_GENERIC_STARTS, question):
-        # ② 先尝试前缀匹配："中际旭创最近..." → 提取开头的公司名（{2,8}?非贪婪）
-        name_match = re.match(
-            r'^([一-鿿·]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|能|该|值得|可以|是不是|表现|业绩|价格|涨|跌)',
-            question)
-        # 过滤：提取结果不能是动词/副词组合（如"请深入"、"帮我看"等误匹配）
-        _FALSE_NAME_PATTERN = re.compile(r'^[请帮麻烦能否可否深入详细全面简单大概大致快速仔细认真简单具体综合系统全面]')
-        if name_match:
-            candidate = name_match.group(1)
-            if _FALSE_NAME_PATTERN.match(candidate):
-                name = None  # 误匹配：如"请深入"→跳过，交给主题匹配
-            else:
-                name = candidate
-        # ① 兜底：整个输入就是2-4个纯中文字符 → 公司名
-        elif re.match(r'^[一-鿿·]{2,4}$', question):
+    # 排除以通用疑问词/时间词/礼貌用语/对话前缀开头的搜索性问题
+    _generic_prefixes = [
+        "现在", "哪些", "什么", "怎么", "如何", "为什么", "最近", "当前", "目前",
+        "哪只", "哪个", "哪家", "哪类", "怎样", "何时", "多少", "有没有", "是否",
+        "请", "帮", "麻烦", "能否", "可否",
+        "你觉得", "你认为", "你看", "你说", "你想", "你估计", "你猜", "你看呢", "你觉得呢",
+        "我觉得", "我认为", "我看", "我说", "我想", "我知道", "我想知道", "我估计", "我猜",
+        "大家觉得", "大家认为", "大家看", "大家说",
+        "诸位觉得", "诸位认为", "诸位看",
+        "咱们看", "咱们说", "咱们觉得",
+        "看看", "看一下", "看一", "听说", "说一说", "聊一聊", "来聊聊", "来谈谈", "来说说",
+    ]
+    _generic_prefixes.sort(key=len, reverse=True)
+    _GENERIC_STARTS = r'^(?:' + '|'.join(_generic_prefixes) + ')'
+    _FALSE_NAME_PATTERN = re.compile(
+        r'^[请帮麻烦能否可否深入详细全面简单大概大致快速仔细认真简单具体综合系统全面'
+        r'你我他她它们看听说想觉认知道讲论述论评议问答哪怎为何什么几谁'
+        r'这那此彼本还又再也都最更很太挺颇较不没无非劳将正已曾'
+        r'忙给让使把教示对跟和与及被]'
+    )
+    if not code and not name:
+        _generic_match = re.match(_GENERIC_STARTS, question)
+        _extract_text = question[_generic_match.end():] if _generic_match else question
+        if _extract_text:
+            # 主题关键词优先：如果文本以已知主题关键词开头，直接使用完整主题名
+            # （处理"人工智能"被"能"触发词截断为"人工智"等情况）
+            for _topic, _info in TOPIC_STOCK_MAP.items():
+                for _kw in _info["keywords"]:
+                    if _extract_text.startswith(_kw):
+                        name = _kw
+                        break
+                if name:
+                    break
+            if not name:
+                name_match = re.match(
+                    r'^([一-鿿·]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|能|该|值得|可以|是不是|表现|业绩|价格|涨|跌)',
+                    _extract_text)
+                if name_match:
+                    candidate = name_match.group(1)
+                    if not _FALSE_NAME_PATTERN.match(candidate):
+                        name = candidate
+        if not name and not _generic_match and re.match(r'^[一-鿿·]{2,4}$', question):
             name = question
 
     # 标准化代码格式（仅限合法A股前缀: 6=沪市, 0/3=深市, 688=科创板, BSE=北交所）

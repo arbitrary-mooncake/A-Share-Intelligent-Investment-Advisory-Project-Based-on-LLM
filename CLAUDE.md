@@ -316,7 +316,9 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 
 - **Do NOT add new agents without signal_pack output** — every analysis agent must produce `<SIGNAL_PACK>` JSON
 - **Do NOT skip tool_cache in _call_tool_safe** — all agents that call MCP tools must use tool-level cache
-- **Do NOT add new AkShare tool dependencies** — migrate to Tushare equivalents; AkShare tools are deprecated
+- **A股数据优先 Tushare，不要为已有 Tushare 覆盖的 A 股数据新增 AKShare 依赖。**
+  但国际市场/宏观/商品数据（美国CPI/PMI/非农、COMEX库存、国际期货等）Tushare 无覆盖，
+  可使用 AKShare 对应函数 + Yahoo Finance + Web Search 补充。
 - **Do NOT assume LLM JSON is perfectly typed** — always normalize `strength→int`, `confidence→float`, `data_quality_score→float`
 - **Do NOT hardcode model names** — use `get_model_config_for_agent()` from `model_config.py`
 - **Do NOT skip the cache-hit signal_pack fallback** — every agent must restore signal_pack on cache hit (try `read_signal_pack_cache` → regex re-extraction → `text_to_signal_pack`)

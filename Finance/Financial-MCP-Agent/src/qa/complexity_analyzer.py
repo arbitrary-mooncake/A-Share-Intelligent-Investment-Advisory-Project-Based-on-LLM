@@ -243,8 +243,8 @@ def _score_question(question: str) -> ComplexityResult:
         triggers=[f"评分={score}"],
         score_detail=detail,
         need_clarify=(detail.get("歧义程度", 0) >= 8),
-        recommended_model="mimo-v2.5-pro" if level in ("L3", "L4") else "mimo-v2.5",
-        recommended_thinking=(level == "L4"),
+        recommended_model="mimo-v2.5-pro" if level in ("L2", "L3", "L4") else "mimo-v2.5",
+        recommended_thinking=(level in ("L3", "L4")),
         recommended_react=(level in ("L3", "L4")),
         recommended_template="quick" if level == "L1" else ("standard" if level == "L2" else "deep"),
     )
@@ -311,9 +311,9 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
             score_detail={"硬触发": hard_level},
             need_clarify=False,
             recommended_model="mimo-v2.5-pro" if hard_level in ("L3", "L4") else "mimo-v2.5",
-            recommended_thinking=(hard_level == "L4"),
+            recommended_thinking=(hard_level in ("L3", "L4")),
             recommended_react=(hard_level in ("L3", "L4")),
-            recommended_template="deep" if hard_level == "L4" else "standard",
+            recommended_template="deep",
         )
 
     # Layer 2: 加权打分
@@ -422,8 +422,8 @@ def try_runtime_upgrade(
     if warranted and level_idx.get(warranted, 0) > current_idx:
         result.level = warranted
         result.recommended_model = "mimo-v2.5-pro"
-        result.recommended_thinking = (warranted == "L4")
-        result.recommended_react = (warranted == "L4")
+        result.recommended_thinking = (warranted in ("L3", "L4"))
+        result.recommended_react = (warranted in ("L3", "L4"))
         result.triggers.append(f"运行时升级: 实际{actual_domain_count}个数据域 → {warranted}")
 
     # 触发4: L2+但关键数据缺失 → 开启 thinking 弥补

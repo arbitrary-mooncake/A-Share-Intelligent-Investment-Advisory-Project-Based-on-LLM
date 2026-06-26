@@ -37,5 +37,23 @@ SERVER_CONFIGS = {
         ],
         "transport": "stdio",
         "env": _ENV
-    }
+    },
+    "web_search": {
+        "command": PYTHON_EXE,
+        "args": [
+            "-u",
+            os.path.join(MCP_SERVER_DIR, "web_search_mcp_server.py")
+        ],
+        "transport": "stdio",
+        "env": _ENV
+    },
+    "yfinance": {
+        "command": PYTHON_EXE,
+        "args": [
+            "-u",
+            os.path.join(MCP_SERVER_DIR, "yfinance_mcp_server.py")
+        ],
+        "transport": "stdio",
+        "env": _ENV
+    },
 }

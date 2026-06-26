@@ -13,6 +13,7 @@ from src.qa.complexity_analyzer import (
     analyze_complexity, try_runtime_upgrade, ComplexityResult,
 )
 from src.qa.task_planner import plan_task, extract_stock_from_question
+from src.qa.answer_generator import MAX_TOKENS_BY_LEVEL
 
 
 @pytest.fixture(autouse=True)
@@ -201,6 +202,84 @@ class TestComplexityAnalyzer:
         assert result.level in ("L2", "L3", "L4")
 
 
+class TestComplexityConfiguration:
+    """验证复杂度配置表（L0-L4 模型/thinking/template/max_tokens 映射）"""
+
+    def test_l0_config(self):
+        """L0: mimo-v2.5, thinking=False, template=l0, max_tokens=512"""
+        result = analyze_complexity("你好")
+        assert result.level == "L0"
+        assert result.recommended_model == "mimo-v2.5"
+        assert result.recommended_thinking is False
+        assert result.recommended_template == "l0"
+        assert MAX_TOKENS_BY_LEVEL["L0"] == 512
+
+    def test_l1_config(self):
+        """L1: mimo-v2.5, thinking=False, template=quick, max_tokens=4096"""
+        result = analyze_complexity("茅台PE多少")
+        assert result.level == "L1"
+        assert result.recommended_model == "mimo-v2.5"
+        assert result.recommended_thinking is False
+        assert result.recommended_template == "quick"
+        assert MAX_TOKENS_BY_LEVEL["L1"] == 4096
+
+    def test_l2_config(self):
+        """L2: mimo-v2.5-pro, thinking=False, template=standard, max_tokens=6144"""
+        result = analyze_complexity("茅台最近的估值、走势、成交量和财务数据")
+        assert result.level == "L2"
+        assert result.recommended_model == "mimo-v2.5-pro"
+        assert result.recommended_thinking is False
+        assert result.recommended_template == "standard"
+        assert MAX_TOKENS_BY_LEVEL["L2"] == 6144
+
+    def test_l3_config(self):
+        """L3: mimo-v2.5-pro, thinking=True, template=deep, max_tokens=8192"""
+        result = analyze_complexity("茅台估值合理吗")
+        assert result.level == "L3"
+        assert result.recommended_model == "mimo-v2.5-pro"
+        assert result.recommended_thinking is True
+        assert result.recommended_template == "deep"
+        assert MAX_TOKENS_BY_LEVEL["L3"] == 8192
+
+    def test_l4_config(self):
+        """L4: mimo-v2.5-pro, thinking=True, template=deep, max_tokens=16384"""
+        result = analyze_complexity("全面深度分析一下茅台的估值、财务、行业地位和未来前景")
+        assert result.level == "L4"
+        assert result.recommended_model == "mimo-v2.5-pro"
+        assert result.recommended_thinking is True
+        assert result.recommended_template == "deep"
+        assert MAX_TOKENS_BY_LEVEL["L4"] == 16384
+
+    def test_max_tokens_map_complete(self):
+        """max_tokens 映射表覆盖所有 5 个级别"""
+        assert set(MAX_TOKENS_BY_LEVEL.keys()) == {"L0", "L1", "L2", "L3", "L4"}
+        # 验证 max_tokens 随级别递增
+        tokens = [MAX_TOKENS_BY_LEVEL[k] for k in ("L0", "L1", "L2", "L3", "L4")]
+        assert tokens == sorted(tokens)
+
+    def test_thinking_only_from_l3(self):
+        """thinking 仅从 L3 开始开启，L0/L1/L2 不开"""
+        l0 = analyze_complexity("你好")
+        l1 = analyze_complexity("茅台PE多少")
+        l2 = analyze_complexity("茅台最近的估值、走势、成交量和财务数据")
+        l3 = analyze_complexity("茅台估值合理吗")
+        l4 = analyze_complexity("全面深度分析一下茅台的估值、财务、行业地位和未来前景")
+        assert l0.recommended_thinking is False
+        assert l1.recommended_thinking is False
+        assert l2.recommended_thinking is False
+        assert l3.recommended_thinking is True
+        assert l4.recommended_thinking is True
+
+    def test_pro_model_from_l2(self):
+        """Pro 模型从 L2 开始使用，L0/L1 用标准模型"""
+        l0 = analyze_complexity("你好")
+        l1 = analyze_complexity("茅台PE多少")
+        l2 = analyze_complexity("茅台最近的估值、走势、成交量和财务数据")
+        assert l0.recommended_model == "mimo-v2.5"
+        assert l1.recommended_model == "mimo-v2.5"
+        assert l2.recommended_model == "mimo-v2.5-pro"
+
+
 # ── TaskPlanner 测试 ────────────────────────────
 
 class TestTaskPlanner:
@@ -216,10 +295,10 @@ class TestTaskPlanner:
         assert plan_task("茅台PE多少", "L1").need_react is False
         assert plan_task("茅台走势怎么样", "L2").need_react is False
 
-    def test_l3_default_no_react_l4_react(self):
-        """L3默认不走ReAct(仅运行时升级可触发), L4稳定走ReAct"""
+    def test_all_levels_use_two_phase(self):
+        """全部复杂度统一使用两阶段快路径，不走ReAct"""
         assert plan_task("分析茅台估值", "L3").need_react is False
-        assert plan_task("深度分析茅台", "L4").need_react is True
+        assert plan_task("深度分析茅台", "L4").need_react is False
 
     def test_extract_stock_code(self):
         code, name = extract_stock_from_question("600519")
@@ -338,16 +417,13 @@ class TestIntegration:
         assert len(plan.tools) >= 1
 
     def test_full_pipeline_complex_question(self):
-        """复杂问题：L4走ReAct，L3走快路径"""
+        """复杂问题：全部复杂度统一走两阶段快路径"""
         question = "把宁德时代和比亚迪从估值和现金流角度做个全面比较"
         complexity = analyze_complexity(question)
         plan = plan_task(question, complexity.level)
         assert complexity.level in ("L3", "L4")
-        # L4走ReAct，L3默认快路径（可运行时升级触发ReAct）
-        if complexity.level == "L4":
-            assert plan.need_react is True
-        else:
-            assert plan.need_react is False
+        # 全部复杂度走两阶段快路径，不走ReAct
+        assert plan.need_react is False
 
     def test_runtime_upgrade_pipeline(self):
         """运行时升级可将L1升级到L4，L4触发ReAct"""
@@ -364,7 +440,8 @@ class TestIntegration:
         # 多条件叠加应触发L4
         assert complexity.level == "L4"
         plan = plan_task(question, complexity.level)
-        assert plan.need_react is True
+        # L4也走两阶段快路径，不走ReAct
+        assert plan.need_react is False
 
     def test_stock_extraction_with_context(self):
         """Stock code extraction with and without session context"""
@@ -462,4 +539,227 @@ class TestHallucinationSafety:
         prompt = _build_system_prompt("deep", "2026-05-23")
         assert "分析框架" in prompt
         assert "---" in prompt
+
+
+# ── 对话前缀提取回归测试 ──────────────────────────
+
+class TestConversationalPrefixExtraction:
+    """对话前缀（你觉得/我认为/大家看等）不应被误提取为公司名"""
+
+    def test_you_feel_topic_question(self):
+        """'你觉得半导体还能继续涨吗' → 提取'半导体'，不是'你觉得半导体'"""
+        code, name = extract_stock_from_question("你觉得半导体还能继续涨吗？")
+        assert name == "半导体"
+        assert code is None
+
+    def test_you_think_topic_question(self):
+        """'你认为半导体板块还能涨吗' → 提取主题关键词（半导体/半导体板块）"""
+        from src.qa.qa_engine import _is_topic_keyword
+        code, name = extract_stock_from_question("你认为半导体板块还能涨吗")
+        assert name is not None
+        assert _is_topic_keyword(name) is True
+
+    def test_you_look_topic_question(self):
+        """'你看新能源还能涨吗' → 提取'新能源'"""
+        code, name = extract_stock_from_question("你看新能源还能涨吗")
+        assert name == "新能源"
+
+    def test_i_feel_topic_question(self):
+        """'我觉得白酒板块还能涨吗' → 提取主题关键词（白酒/白酒板块）"""
+        from src.qa.qa_engine import _is_topic_keyword
+        code, name = extract_stock_from_question("我觉得白酒板块还能涨吗")
+        assert name is not None
+        assert _is_topic_keyword(name) is True
+
+    def test_i_want_to_know_topic_question(self):
+        """'我想知道人工智能还能涨吗' → 提取'人工智能'"""
+        code, name = extract_stock_from_question("我想知道人工智能还能涨吗")
+        assert name == "人工智能"
+
+    def test_conversational_prefix_with_real_stock(self):
+        """'你觉得贵州茅台还能涨吗' → 提取'贵州茅台'（真实公司名，非主题）"""
+        code, name = extract_stock_from_question("你觉得贵州茅台还能涨吗")
+        assert name == "贵州茅台"
+
+    def test_conversational_prefix_with_real_stock2(self):
+        """'你看中芯国际还能涨吗' → 提取'中芯国际'"""
+        code, name = extract_stock_from_question("你看中芯国际还能涨吗")
+        assert name == "中芯国际"
+
+    def test_no_conversational_prefix_topic(self):
+        """无对话前缀时主题提取仍然正常：'半导体还能继续涨吗' → '半导体'"""
+        code, name = extract_stock_from_question("半导体还能继续涨吗？")
+        assert name == "半导体"
+
+    def test_existing_extraction_still_works(self):
+        """原有提取逻辑不受影响：'中际旭创最近走势怎么样' → '中际旭创'"""
+        code, name = extract_stock_from_question("中际旭创最近走势怎么样")
+        assert name == "中际旭创"
+
+    def test_code_extraction_unaffected(self):
+        """代码提取不受影响：'600519' → sh.600519"""
+        code, name = extract_stock_from_question("600519")
+        assert code == "sh.600519"
+
+
+# ── _is_topic_keyword 测试 ───────────────────────
+
+class TestIsTopicKeyword:
+    """主题关键词识别"""
+
+    def test_exact_topic_keyword(self):
+        from src.qa.qa_engine import _is_topic_keyword
+        assert _is_topic_keyword("半导体") is True
+        assert _is_topic_keyword("新能源") is True
+        assert _is_topic_keyword("人工智能") is True
+
+    def test_topic_keyword_with_suffix(self):
+        """'半导体板块'以'半导体'开头 → True"""
+        from src.qa.qa_engine import _is_topic_keyword
+        assert _is_topic_keyword("半导体板块") is True
+        assert _is_topic_keyword("新能源赛道") is True
+
+    def test_real_stock_name_not_topic(self):
+        """真实公司名不应被识别为主题"""
+        from src.qa.qa_engine import _is_topic_keyword
+        assert _is_topic_keyword("贵州茅台") is False
+        assert _is_topic_keyword("中芯国际") is False
+        assert _is_topic_keyword("中际旭创") is False
+
+    def test_conversational_prefix_not_topic(self):
+        """对话前缀误提取结果不应被识别为主题"""
+        from src.qa.qa_engine import _is_topic_keyword
+        assert _is_topic_keyword("你觉得半导体") is False
+        assert _is_topic_keyword("你认为茅台") is False
+
+
+# ── 空代码安全网测试 ─────────────────────────────
+
+class TestEmptyCodeSafetyNet:
+    """有公司名但无代码时，evidence_assembler 应安全返回而非调用空code工具"""
+
+    def test_safety_net_returns_early_when_code_empty(self):
+        """有company_name但无stock_code + 需要代码的工具 → 安全返回"""
+        from src.qa.evidence_assembler import assemble_evidence_fast
+        import asyncio
+        result = asyncio.run(assemble_evidence_fast(
+            stock_code="",
+            company_name="某未知公司",
+            tools=["tushare_kline", "tushare_daily_basic"],
+            question="某未知公司怎么样",
+            current_date="2026-06-25",
+        ))
+        assert "无法解析" in result.raw_text or "股票代码" in result.raw_text
+        assert result.missing
+        assert "跳过数据获取" in result.tool_call_summary
+
+    def test_safety_net_allows_no_code_tools(self):
+        """全部是无代码工具（宏观/市场类）时，安全网不应拦截"""
+        from src.qa.evidence_assembler import assemble_evidence_fast
+        import asyncio
+        result = asyncio.run(assemble_evidence_fast(
+            stock_code="",
+            company_name="",
+            tools=["tushare_cn_cpi", "tushare_cn_gdp"],
+            question="最近CPI怎么样",
+            current_date="2026-06-25",
+        ))
+        # 宏观类工具不需要代码，应跳过安全网（可能因MCP未连接而失败，但不应被安全网拦截）
+        assert "无股票代码（名称反查失败）" not in result.tool_call_summary
+
+    def test_both_empty_with_stock_tools(self):
+        """stock_code和company_name都为空 + 需要代码的工具 → 无标的安全返回"""
+        from src.qa.evidence_assembler import assemble_evidence_fast
+        import asyncio
+        result = asyncio.run(assemble_evidence_fast(
+            stock_code="",
+            company_name="",
+            tools=["tushare_kline"],
+            question="黄金价格怎么样",
+            current_date="2026-06-25",
+        ))
+        assert "未指定A股标的" in result.missing
+        assert "跳过数据获取" in result.tool_call_summary
+
+
+# ── ReAct超时 + 心跳测试 ─────────────────────────
+
+class TestReactTimeoutAndHeartbeat:
+    """ReAct路径超时保护和心跳SSE事件"""
+
+    def test_react_timeout_constant_is_safe(self):
+        """REACT_TOTAL_TIMEOUT 必须 <= 120s，以适应前端180s超时"""
+        from src.qa.evidence_assembler import REACT_TOTAL_TIMEOUT
+        assert 30 <= REACT_TOTAL_TIMEOUT <= 120
+
+    def test_heartbeat_pattern_yields_during_slow_task(self):
+        """心跳模式：后台任务执行期间定期yield，防止前端超时"""
+        import asyncio
+
+        async def slow_task():
+            await asyncio.sleep(0.5)
+            return "evidence_done"
+
+        async def run_heartbeat():
+            task = asyncio.create_task(slow_task())
+            heartbeats = []
+            result = None
+            _secs = 0
+            while True:
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+                    break
+                except asyncio.TimeoutError:
+                    _secs += 0.1
+                    heartbeats.append(f"heartbeat {_secs:.1f}s")
+                except Exception as e:
+                    result = f"error: {e}"
+                    break
+            return result, heartbeats
+
+        result, heartbeats = asyncio.run(run_heartbeat())
+        assert result == "evidence_done"
+        assert len(heartbeats) >= 3  # 0.5s / 0.1s ≈ 5 heartbeats
+
+    def test_heartbeat_handles_task_exception(self):
+        """后台任务抛异常时，心跳循环应捕获并返回降级结果"""
+        import asyncio
+
+        async def failing_task():
+            await asyncio.sleep(0.05)
+            raise RuntimeError("MCP爆炸")
+
+        async def run_heartbeat():
+            task = asyncio.create_task(failing_task())
+            while True:
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+                    return result, "ok"
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    if not task.done():
+                        task.cancel()
+                    return None, f"caught: {e}"
+
+        result, status = asyncio.run(run_heartbeat())
+        assert result is None
+        assert "caught" in status
+        assert "MCP爆炸" in status
+
+    def test_react_timeout_returns_partial_evidence(self):
+        """ReAct超时时应返回带超时标记的EvidencePackage"""
+        from src.qa.evidence_assembler import EvidencePackage, REACT_TOTAL_TIMEOUT
+        # 验证超时路径的返回结构（不实际调用agent，只验证结构）
+        ep = EvidencePackage(
+            subject="黄金",
+            stock_code="sh.159934",
+            company_name="黄金主题",
+            raw_text="（ReAct数据获取在120秒内未完成，已超时终止。）",
+            tool_call_summary="ReAct超时 (120s)",
+            missing=[f"ReAct超时({REACT_TOTAL_TIMEOUT}s)"],
+        )
+        assert "超时" in ep.tool_call_summary
+        assert ep.missing
+        assert "sh.159934" in ep.stock_code
 

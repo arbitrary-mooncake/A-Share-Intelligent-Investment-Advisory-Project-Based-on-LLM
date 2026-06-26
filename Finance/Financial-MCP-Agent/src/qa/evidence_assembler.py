@@ -20,6 +20,7 @@ logger = setup_logger(__name__)
 
 TOOL_TIMEOUT = 30  # 单个工具超时（秒）
 MAX_CONCURRENT_TOOLS = 4  # 最大并发工具调用数（防止 Windows 子进程竞争）
+REACT_TOTAL_TIMEOUT = 120  # ReAct路径总超时（秒），防止LLM迭代过久导致前端断连
 
 
 @dataclass
@@ -112,6 +113,15 @@ async def assemble_evidence_fast(
         "tushare_cn_ppi", "tushare_cn_m", "tushare_shibor",
         "tushare_fx_daily", "tushare_eco_cal",
         "tushare_latest_trading_date", "tushare_top_list",
+        # Phase 1: Web Search (no code needed)
+        "web_search", "web_fetch",
+        # Phase 1: AKShare international (no code needed)
+        "get_us_cpi", "get_us_pmi", "get_us_non_farm",
+        "get_us_unemployment", "get_us_gdp", "get_us_retail_sales",
+        "get_comex_inventory", "get_spot_gold_sge",
+        # Phase 2: Yahoo Finance (no code needed)
+        "get_commodity_price", "get_us_treasury_yield",
+        "get_dollar_index", "get_gold_etf",
     }
     if not stock_code and not company_name:
         if tools and all(t in _NO_CODE_TOOLS for t in tools):
@@ -124,6 +134,22 @@ async def assemble_evidence_fast(
             )
             evidence.tool_call_summary = "无股票代码，跳过数据获取"
             evidence.missing.append("未指定A股标的")
+            return evidence
+
+    # 安全网：有公司名但无代码（名称反查失败）→ 不用空code调个股工具，避免全部失败
+    if not stock_code and company_name:
+        needs_code = any(t not in _NO_CODE_TOOLS for t in tools) if tools else True
+        if needs_code:
+            logger.warning(
+                f"QA Evidence: 有公司名'{company_name}'但无代码，且名称反查失败，"
+                f"避免用空code调用个股工具导致全部失败"
+            )
+            evidence.raw_text = (
+                f"已识别到查询对象「{company_name}」，但当前无法解析其对应的A股股票代码。"
+                f"请尝试提供股票代码（6位数字，如600519）或使用更完整的公司全称。"
+            )
+            evidence.tool_call_summary = "无股票代码（名称反查失败），跳过数据获取"
+            evidence.missing.append(f"未解析到股票代码: {company_name}")
             return evidence
 
     # 获取 MCP 工具（含重试）
@@ -404,10 +430,27 @@ async def assemble_evidence_react(
         f"请使用可用的工具获取实际数据，基于数据回答，不要编造。"
     )
 
-    response = await agent.ainvoke(
-        {"messages": [HumanMessage(content=agent_input)]},
-        config={"recursion_limit": 20}
-    )
+    try:
+        response = await asyncio.wait_for(
+            agent.ainvoke(
+                {"messages": [HumanMessage(content=agent_input)]},
+                config={"recursion_limit": 20}
+            ),
+            timeout=REACT_TOTAL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        logger.warning(
+            f"QA Evidence: ReAct路径超时({REACT_TOTAL_TIMEOUT}s)，返回部分证据"
+        )
+        evidence.raw_text = (
+            f"（ReAct数据获取在{REACT_TOTAL_TIMEOUT}秒内未完成，已超时终止。"
+            f"以下基于已有信息和行业知识分析。）"
+        )
+        evidence.tool_call_summary = f"ReAct超时 ({elapsed:.0f}s)"
+        evidence.missing.append(f"ReAct超时({REACT_TOTAL_TIMEOUT}s)")
+        evidence.elapsed_seconds = elapsed
+        return evidence
 
     if "messages" in response and isinstance(response["messages"], list):
         ai_msgs = [m for m in response["messages"] if isinstance(m, AIMessage)]
@@ -481,6 +524,23 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         "tushare_search_stock": {"keyword": company_name or clean_code or question},
         # 龙虎榜
         "tushare_top_list": {"date": end_date.replace("-", "")},
+        # 国际宏观（AKShare — 无需参数）
+        "get_us_cpi": {},
+        "get_us_pmi": {},
+        "get_us_non_farm": {},
+        "get_us_unemployment": {},
+        "get_us_gdp": {},
+        "get_us_retail_sales": {},
+        "get_comex_inventory": {},
+        "get_spot_gold_sge": {},
+        # Web Search（使用问题文本作为查询）
+        "web_search": {"query": question},
+        "web_fetch": {"url": ""},
+        # Yahoo Finance（国际商品/利率）
+        "get_commodity_price": {"symbol": "GC=F"},
+        "get_us_treasury_yield": {"tenor": "10y"},
+        "get_dollar_index": {},
+        "get_gold_etf": {"symbol": "GLD"},
     }
 
     if tool_name in tool_kwargs_map:

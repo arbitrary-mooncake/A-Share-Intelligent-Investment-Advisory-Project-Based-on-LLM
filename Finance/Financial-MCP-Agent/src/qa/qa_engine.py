@@ -7,6 +7,7 @@ Phase 3: 增加结构化监控日志。
 import os
 import time
 import json
+import asyncio
 from datetime import datetime
 from typing import AsyncGenerator, Optional
 
@@ -17,10 +18,10 @@ from src.qa.complexity_analyzer import (
 from src.qa.task_planner import plan_task, extract_stock_from_question, match_topic
 from src.qa.evidence_assembler import (
     assemble_evidence_fast,
-    assemble_evidence_react,
     EvidencePackage,
 )
 from src.qa.answer_generator import generate_answer_stream, format_answer
+from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 
 logger = setup_logger(__name__)
@@ -73,36 +74,80 @@ async def process_question(
         session_company_name=session.last_company_name or "",
     )
 
-    # 无股票代码时尝试主题匹配
-    # 当 company_name 实际上是主题关键词（如"半导体板块"→提取出"半导体"）时，
-    # 优先走主题匹配路径，因为主题匹配能提供ETF+代表股，比纯公司名搜索更有效
+    # 无股票代码时的三层标的解析：
+    #   层1 — company_name 为空或是主题关键词 → 直接主题匹配（ETF+代表股）
+    #   层2 — company_name 存在且非主题关键词 → tushare_search_stock 名称反查代码
+    #   层3 — 名称反查失败 → 回退到主题匹配
     topic_context = ""
     matched_topic_name = ""
     topic_rep_stocks: list = []  # [(code, name), ...] 代表性个股供并行拉取数据
-    _should_try_topic = not stock_code and (not company_name or _is_topic_keyword(company_name))
-    if _should_try_topic:
-        topic_info = match_topic(question)
-        if topic_info:
-            matched_topic_name, topic_data = topic_info
-            etf = topic_data["etfs"][0]
-            stock_code = etf[0]
-            company_name = f"{matched_topic_name}主题({etf[1]})"
-            topic_rep_stocks = topic_data["stocks"][:5]  # 最多5只代表股
-            # 构建主题上下文供LLM参考
-            related = [f"{c}({n})" for c, n in topic_rep_stocks]
-            topic_context = (
-                f"[主题匹配] 用户询问{matched_topic_name}板块/赛道。"
-                f"使用代表性ETF {stock_code} 作为基准数据源，"
-                f"代表性个股: {', '.join(related)}。"
-                f"请优先使用已获取的ETF行情数据和板块成分股数据进行客观分析，"
-                f"辅以行业常识，避免仅凭旧知识即兴发挥。"
-                f"如板块成分股数据已获取，请从中选取龙头标的重点分析。"
-                f"\n⚠️ ETF特殊说明：{stock_code}是ETF/指数基金，不是个股。"
-                f"ETF没有ROE、毛利率、净利率、营收增速、负债率、分红、EV/EBITDA等个股财务指标。"
-                f"这些字段缺失是正常现象，不代表'数据获取不足'。"
-                f"请基于ETF的行情走势、成交量、资金流向、板块景气度进行分析。"
-            )
-            logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")
+
+    def _apply_topic(topic_info):
+        nonlocal stock_code, company_name, matched_topic_name, topic_rep_stocks, topic_context
+        matched_topic_name, topic_data = topic_info
+        etf = topic_data["etfs"][0]
+        stock_code = etf[0]
+        company_name = f"{matched_topic_name}主题({etf[1]})"
+        topic_rep_stocks = topic_data["stocks"][:5]
+        related = [f"{c}({n})" for c, n in topic_rep_stocks]
+        topic_context = (
+            f"[主题匹配] 用户询问{matched_topic_name}板块/赛道。"
+            f"使用代表性ETF {stock_code} 作为基准数据源，"
+            f"代表性个股: {', '.join(related)}。"
+            f"请优先使用已获取的ETF行情数据和板块成分股数据进行客观分析，"
+            f"辅以行业常识，避免仅凭旧知识即兴发挥。"
+            f"如板块成分股数据已获取，请从中选取龙头标的重点分析。"
+            f"\n⚠️ ETF特殊说明：{stock_code}是ETF/指数基金，不是个股。"
+            f"ETF没有ROE、毛利率、净利率、营收增速、负债率、分红、EV/EBITDA等个股财务指标。"
+            f"这些字段缺失是正常现象，不代表'数据获取不足'。"
+            f"请基于ETF的行情走势、成交量、资金流向、板块景气度进行分析。"
+        )
+        # 追加：宏观/商品主题额外注入国际数据使用提示
+        macro_topic_hints = {
+            "黄金": (
+                "\n\n[国际数据源] 本主题涉及国际定价资产。"
+                "请优先使用 web_search 工具获取最新的美联储政策声明、地缘政治事件、"
+                "美债收益率变化等驱动金价的关键信息。"
+                "结合 get_us_cpi/get_us_pmi 等美国宏观数据、"
+                "get_commodity_price(GC=F) 的COMEX黄金期货价格、"
+                "get_dollar_index 的美元指数进行综合分析。"
+                "A股黄金ETF和黄金股作为国内市场的辅助参考。"
+                "\n⚠️ 黄金价格的核心驱动因素（按重要性）："
+                "1) 美联储货币政策预期 2) 美元指数 3) 美国实际利率（TIPS）"
+                "4) 地缘政治风险 5) 央行购金 6) 通胀预期"
+            ),
+            "白银": (
+                "\n\n[国际数据源] 白银定价同时受贵金属属性和工业需求影响。"
+                "请使用 web_search 获取最新宏观事件，结合 get_commodity_price(SI=F) 获取国际银价。"
+            ),
+            "原油": (
+                "\n\n[国际数据源] 原油是全球定价大宗商品。"
+                "请使用 web_search 获取OPEC+决策、地缘政治事件，"
+                "结合 get_commodity_price(CL=F) 获取WTI原油期货价格。"
+            ),
+        }
+        if matched_topic_name in macro_topic_hints:
+            topic_context += macro_topic_hints[matched_topic_name]
+
+        logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")
+
+    if not stock_code:
+        # 层1: company_name 为空或主题关键词 → 直接主题匹配
+        if not company_name or _is_topic_keyword(company_name):
+            topic_info = match_topic(question)
+            if topic_info:
+                _apply_topic(topic_info)
+        # 层2: 有 company_name 但不是主题关键词 → 名称反查
+        if not stock_code and company_name:
+            resolved_code, resolved_name = await _resolve_stock_code_by_name(company_name)
+            if resolved_code:
+                stock_code = resolved_code
+                company_name = resolved_name
+            else:
+                # 层3: 反查失败 → 回退到主题匹配
+                topic_info = match_topic(question)
+                if topic_info:
+                    _apply_topic(topic_info)
 
     # 澄清检查：已尝试所有消歧手段（问题文本+会话上下文+主题匹配）仍无标的时才反问
     if complexity.need_clarify and not stock_code and not company_name:
@@ -151,12 +196,39 @@ async def process_question(
             "message": f"正在获取数据（涉及{len(task_plan.domains)}个数据域）..."
         })
 
-        evidence = await _assemble_with_fallback(
-        task_plan, complexity, stock_code or "", company_name or "",
-        question, current_date, current_time_info, actual_session_id,
-        topic_name=matched_topic_name,
-        representative_stocks=topic_rep_stocks,
-    )
+        # 后台运行证据装配，定期发送心跳SSE事件防止前端超时断连
+        evidence_task = asyncio.create_task(
+            _assemble_with_fallback(
+                task_plan, complexity, stock_code or "", company_name or "",
+                question, current_date, current_time_info, actual_session_id,
+                topic_name=matched_topic_name,
+                representative_stocks=topic_rep_stocks,
+            )
+        )
+        _heartbeat_secs = 0
+        while True:
+            try:
+                evidence = await asyncio.wait_for(
+                    asyncio.shield(evidence_task), timeout=15.0
+                )
+                break
+            except asyncio.TimeoutError:
+                _heartbeat_secs += 15
+                yield _sse_event("status", {
+                    "message": f"正在获取数据... ({_heartbeat_secs}s)"
+                })
+            except Exception as e:
+                logger.error(f"{ERROR_ICON} QA Engine: 证据装配任务异常: {e}")
+                if not evidence_task.done():
+                    evidence_task.cancel()
+                evidence = EvidencePackage(
+                    subject=company_name or stock_code or question,
+                    stock_code=stock_code or "",
+                    company_name=company_name or "",
+                    missing=["证据装配异常: " + str(e)],
+                    tool_call_summary="装配失败",
+                )
+                break
 
     # ── 运行时升级（Layer 3） ──
     tool_labels = task_plan.tools
@@ -300,32 +372,80 @@ def _is_topic_keyword(name: str) -> bool:
                 return True
     return False
 
+
+async def _resolve_stock_code_by_name(name: str) -> tuple:
+    """通过 tushare_search_stock MCP 工具将公司名反查为股票代码。
+    返回 (normalized_code, official_name) 或 (None, None)。"""
+    if not name or len(name) < 2:
+        return None, None
+    try:
+        all_tools = await get_mcp_tools(tool_filter=["tushare_search_stock"])
+    except Exception as e:
+        logger.warning(f"QA Engine: tushare_search_stock 工具获取失败: {e}")
+        return None, None
+    if not all_tools:
+        logger.warning("QA Engine: tushare_search_stock 工具不可用")
+        return None, None
+    tool = all_tools[0]
+    try:
+        result = await asyncio.wait_for(tool.ainvoke({"keyword": name}), timeout=15.0)
+    except Exception as e:
+        logger.warning(f"QA Engine: tushare_search_stock 调用失败: {e}")
+        return None, None
+    text = str(result).strip()
+    if not text or len(text) < 10:
+        return None, None
+    import re as _re
+    rows = [ln for ln in text.splitlines() if ln.strip().startswith("|") and "-" not in ln]
+    if len(rows) < 2:
+        return None, None
+    header = [c.strip() for c in rows[0].split("|") if c.strip()]
+    data_row = [c.strip() for c in rows[1].split("|") if c.strip()]
+    if len(header) != len(data_row) or len(header) < 2:
+        return None, None
+    row_dict = dict(zip(header, data_row))
+    raw_code = row_dict.get("ts_code") or row_dict.get("code") or ""
+    official_name = row_dict.get("name") or name
+    if not raw_code:
+        return None, None
+    normalized = raw_code.lower().replace(".", "")
+    if normalized.startswith(("sh", "sz", "bj")):
+        pass
+    elif raw_code.endswith((".SH", ".SZ", ".BJ")):
+        exch = raw_code.split(".")[-1].lower()
+        digits = raw_code.split(".")[0]
+        normalized = f"{exch}.{digits}"
+    else:
+        digits = raw_code.replace(".", "")
+        if digits.startswith(("6", "5")):
+            normalized = f"sh.{digits}"
+        elif digits.startswith(("0", "3", "1", "4")):
+            normalized = f"sz.{digits}"
+        elif digits.startswith(("430", "431", "8", "920")):
+            normalized = f"bj.{digits}"
+        else:
+            normalized = digits
+    logger.info(f"QA Engine: 名称反查 '{name}' → {normalized} ({official_name})")
+    return normalized, official_name
+
 async def _assemble_with_fallback(
     task_plan, complexity, stock_code, company_name,
     question, current_date, current_time_info, session_id,
     topic_name: str = "",
     representative_stocks: list = None,
 ) -> EvidencePackage:
-    """证据装配 + 降级保护"""
+    """证据装配 + 降级保护（全部复杂度统一使用两阶段快路径）"""
     try:
-        if task_plan.need_react and complexity.level == "L4":
-            logger.info(f"{WAIT_ICON} QA Engine: 使用 ReAct 路径...")
-            evidence = await assemble_evidence_react(
-                stock_code, company_name,
-                question, current_date, current_time_info,
-            )
-        else:
-            logger.info(f"{WAIT_ICON} QA Engine: 使用快路径并行拉取数据...")
-            evidence = await assemble_evidence_fast(
-                stock_code, company_name,
-                task_plan.tools, question, current_date,
-                session_id=session_id,
-                topic_name=topic_name,
-                representative_stocks=representative_stocks,
-            )
+        logger.info(f"{WAIT_ICON} QA Engine: 使用快路径并行拉取数据 (复杂度={complexity.level})...")
+        evidence = await assemble_evidence_fast(
+            stock_code, company_name,
+            task_plan.tools, question, current_date,
+            session_id=session_id,
+            topic_name=topic_name,
+            representative_stocks=representative_stocks,
+        )
     except Exception as e:
         logger.error(f"{ERROR_ICON} QA Engine: 证据装配失败: {e}")
-        # 降级：返回空证据包
         evidence = EvidencePackage(
             subject=company_name or stock_code or question,
             stock_code=stock_code,

@@ -21,6 +21,14 @@ logger = setup_logger(__name__)
 LLM_TIMEOUT = 60  # 快路径LLM读超时
 DEEP_LLM_TIMEOUT = 120  # 深度分析LLM读超时
 
+MAX_TOKENS_BY_LEVEL = {
+    "L0": 512,
+    "L1": 4096,
+    "L2": 6144,
+    "L3": 8192,
+    "L4": 16384,
+}
+
 
 def _build_system_prompt(template: str, current_date: str) -> str:
     """构建系统提示词，按模板分层"""
@@ -291,8 +299,7 @@ async def generate_answer_stream(
     )
 
     try:
-        max_tokens_map = {"l0": 512, "quick": 4096, "standard": 8192, "deep": 16384}
-        max_tokens = max_tokens_map.get(complexity.recommended_template, 4096)
+        max_tokens = MAX_TOKENS_BY_LEVEL.get(complexity.level, 4096)
 
         stream = await client.chat.completions.create(
             model=model_name,

@@ -320,7 +320,7 @@ DATA_DOMAINS = {
 # L1 精简工具集：每域只保留 1-2 个核心工具，大幅减少数据获取时间
 L1_LITE_TOOLS = {
     "行情": ["tushare_kline", "tushare_daily_basic"],
-    "估值": ["tushare_pe_percentile"],
+    "估值": ["tushare_daily_basic", "tushare_pe_percentile"],
     "财务": ["tushare_fina_indicator"],
     "资金": ["tushare_moneyflow"],
     "行业": ["tushare_stock_info"],

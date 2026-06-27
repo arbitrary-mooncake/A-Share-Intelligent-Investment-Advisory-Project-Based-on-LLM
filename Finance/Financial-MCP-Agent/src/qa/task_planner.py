@@ -317,6 +317,19 @@ DATA_DOMAINS = {
     },
 }
 
+# L1 精简工具集：每域只保留 1-2 个核心工具，大幅减少数据获取时间
+L1_LITE_TOOLS = {
+    "行情": ["tushare_kline", "tushare_daily_basic"],
+    "估值": ["tushare_pe_percentile"],
+    "财务": ["tushare_fina_indicator"],
+    "资金": ["tushare_moneyflow"],
+    "行业": ["tushare_stock_info"],
+    "板块": ["tushare_concept_list"],
+    "新闻": ["tushare_news"],
+    "宏观": ["tushare_cn_cpi", "tushare_cn_pmi"],
+    "国际": ["web_search"],
+}
+
 
 @dataclass
 class TaskPlan:
@@ -358,13 +371,14 @@ def plan_task(question: str, complexity_level: str, history_text: str = "",
     # 兜底：有股票代码/名称但无数据域匹配时，默认查询行情（纯代码查询场景）
     if not domains and (stock_code or company_name):
         domains = ["行情"]
-        pure_code_match = re.search(r'(?<!\d)(\d{5,6})(?!\d)', question)
-        if pure_code_match and not company_name:
-            # 纯代码查询：行情 + 估值可提供更完整的概览
-            domains = ["行情", "估值"]
+        # L1 不自动追加估值域（L2+才追加，避免不必要的数据拉取）
+        if complexity_level not in ("L0", "L1"):
+            pure_code_match = re.search(r'(?<!\d)(\d{5,6})(?!\d)', question)
+            if pure_code_match and not company_name:
+                domains = ["行情", "估值"]
 
-    # 主题/宏观问题自动追加新闻域和宏观域
-    if topic_name:
+    # 主题/宏观问题自动追加新闻域和板块域（L2+ 才追加，L1 只保留核心域）
+    if topic_name and complexity_level not in ("L0", "L1"):
         if "新闻" not in domains:
             domains.append("新闻")
         # 主题/板块问题自动追加板块域（查概念成分股+板块指数）
@@ -377,7 +391,11 @@ def plan_task(question: str, complexity_level: str, history_text: str = "",
         if topic_name in macro_topics and "国际" not in domains:
             domains.append("国际")
 
-    tools = _get_tools_for_domains(domains)
+    # L1 使用精简工具集，L2+ 使用全量工具
+    if complexity_level == "L1":
+        tools = _get_l1_tools_for_domains(domains)
+    else:
+        tools = _get_tools_for_domains(domains)
 
     # 全部复杂度统一使用两阶段快路径（并行拉取+单次LLM），不走ReAct
     # ReAct 串行 LLM-工具迭代导致频繁超时（18工具串行需270-810s），快路径并行+缓存3-15s完成
@@ -451,6 +469,20 @@ def _get_tools_for_domains(domains: List[str]) -> List[str]:
         prioritized.remove("web_search")
         prioritized.insert(0, "web_search")
     return (prioritized + rest)[:MAX_TOOLS_PER_QUERY]
+
+
+def _get_l1_tools_for_domains(domains: List[str]) -> List[str]:
+    """L1 精简版：每域只取1-2个核心工具。去重后返回。
+    未在 L1_LITE_TOOLS 中定义的域，回退到全量工具的第一个。"""
+    tools: Set[str] = set()
+    for domain in domains:
+        if domain in L1_LITE_TOOLS:
+            tools.update(L1_LITE_TOOLS[domain])
+        elif domain in DATA_DOMAINS:
+            full_tools = DATA_DOMAINS[domain]["tools"]
+            if full_tools:
+                tools.add(full_tools[0])
+    return sorted(tools)
 
 
 def extract_stock_from_question(question: str, session_stock_code: str = "",

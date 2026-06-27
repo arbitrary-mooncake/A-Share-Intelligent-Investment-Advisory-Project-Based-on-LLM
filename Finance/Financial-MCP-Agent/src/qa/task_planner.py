@@ -580,19 +580,31 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
         if not name and not _generic_match and re.match(r'^[一-鿿·A-Za-z]{2,4}$', question):
             name = question
 
-    # 标准化代码格式（仅限合法A股前缀: 6=沪市, 0/3=深市, 688=科创板, BSE=北交所）
     if code:
-        if not code.startswith(("sh.", "sz.", "bj.")):
-            _is_bse = (code.startswith(("430", "431", "920")) or
-                       (len(code) >= 3 and code[:3] in
-                        ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
-                         "870", "871", "872", "873")))
-            if _is_bse:
-                code = f"bj.{code}"
-            elif code.startswith(("6", "688", "5")):
-                code = f"sh.{code}"
-            elif code.startswith(("0", "3", "1", "4")):
-                code = f"sz.{code}"
-            # 其他前缀（如999）不添加交易所前缀，保持原样
+        code = normalize_stock_code(code)
 
     return code, name
+
+
+def normalize_stock_code(code: str) -> str:
+    """标准化A股代码格式：为纯数字代码添加交易所前缀。
+    6/688/5开头→sh., 0/3/1/4开头→sz., 430/431/8/920开头→bj.。
+    已有前缀的代码原样返回。非标准格式原样返回。"""
+    if not code or not isinstance(code, str):
+        return code
+    code = code.strip()
+    if not code:
+        return code
+    if code.startswith(("sh.", "sz.", "bj.")):
+        return code
+    _is_bse = (code.startswith(("430", "431", "920")) or
+               (len(code) >= 3 and code[:3] in
+                ("830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+                 "870", "871", "872", "873")))
+    if _is_bse:
+        return f"bj.{code}"
+    elif code.startswith(("6", "688", "5")):
+        return f"sh.{code}"
+    elif code.startswith(("0", "3", "1", "4")):
+        return f"sz.{code}"
+    return code  # 非标准前缀原样返回

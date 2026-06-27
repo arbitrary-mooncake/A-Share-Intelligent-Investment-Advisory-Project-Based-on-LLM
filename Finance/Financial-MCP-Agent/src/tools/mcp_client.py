@@ -85,7 +85,7 @@ async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
 
         if _mcp_tools is None:
             _record_mcp_failure()
-            _mcp_tools = []
+            _mcp_tools = None  # 保持 None 以便下次调用触发重试
             return []
 
     # 从缓存过滤

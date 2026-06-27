@@ -15,7 +15,7 @@ from src.qa.session_manager import get_session_manager, QASession
 from src.qa.complexity_analyzer import (
     analyze_complexity, try_runtime_upgrade, ComplexityResult,
 )
-from src.qa.task_planner import plan_task, extract_stock_from_question, match_topic
+from src.qa.task_planner import plan_task, extract_stock_from_question, match_topic, normalize_stock_code
 from src.qa.evidence_assembler import (
     assemble_evidence_fast,
     EvidencePackage,
@@ -80,7 +80,7 @@ async def process_question(
         if llm_name:
             company_name = llm_name
         if llm_code:
-            stock_code = llm_code
+            stock_code = normalize_stock_code(llm_code)
 
     # 无股票代码时的三层标的解析：
     #   层1 — company_name 为空或是主题关键词 → 直接主题匹配（ETF+代表股）

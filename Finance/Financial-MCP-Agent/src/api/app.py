@@ -1334,6 +1334,7 @@ async def _run_fund_analysis_pipeline(task_id: str, fund_code: str, fund_name: s
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _pool_manager, _scoring_engine
+    import time
     logger.info(f"{SUCCESS_ICON} 启动 FastAPI 后端...")
     _pool_manager = StockPoolManager()
     _scoring_engine = ScoringEngine(pool_manager=_pool_manager)
@@ -1346,6 +1347,22 @@ async def lifespan(app: FastAPI):
         pass
     # 预加载名称缓存（阻塞至加载完成，避免请求在缓存未就绪时到达导致名称查找失败）
     await asyncio.get_running_loop().run_in_executor(_thread_pool, _ensure_name_cache)
+    # MCP 预热：后台预初始化 MCP 客户端，消除首问 3-10s 启动延迟
+    try:
+        from src.tools.mcp_client import get_mcp_tools
+        logger.info(f"{WAIT_ICON} 预初始化 MCP 客户端（后台预热）...")
+        warmup_start = time.time()
+        warmup_tools = await get_mcp_tools()
+        if warmup_tools:
+            logger.info(
+                f"{SUCCESS_ICON} MCP 预热完成 — "
+                f"已加载 {len(warmup_tools)} 个工具 "
+                f"(耗时 {time.time() - warmup_start:.1f}s)"
+            )
+        else:
+            logger.warning(f"{ERROR_ICON} MCP 预热返回空工具列表，首问将触发懒加载")
+    except Exception as e:
+        logger.warning(f"{ERROR_ICON} MCP 预热失败（不影响正常使用，首问将触发懒加载）: {e}")
     yield
     logger.info(f"{WAIT_ICON} 关闭 FastAPI 后端...")
 

@@ -16,6 +16,8 @@ import httpx
 
 from api_client import APIError
 from config import API_BASE_URL
+from theme import inject_global_styles, page_title
+from components.common import safe_str
 
 
 # ──────────────────────────────────────────────
@@ -26,6 +28,8 @@ st.set_page_config(
     page_icon="🏦",
     layout="wide",
 )
+
+inject_global_styles()
 
 # ──────────────────────────────────────────────
 # 自定义样式
@@ -390,26 +394,13 @@ if "_fund_pool_action_msg" not in st.session_state:
 # ──────────────────────────────────────────────
 # 页面标题
 # ──────────────────────────────────────────────
-st.markdown(
-    '<div style="margin-bottom:4px;">'
-    '<span style="font-size:1.7em;font-weight:800;color:#0f172a;">🏦 基金专区</span>'
-    '</div>',
-    unsafe_allow_html=True,
-)
+page_title("🏦 基金专区")
 st.caption("快速查询基金关键指标与同类基准，基金池支持深度打分与报告生成。")
 
 # ──────────────────────────────────────────────
 # 渲染辅助函数
 # ──────────────────────────────────────────────
 
-def _safe_str(val) -> str:
-    """安全转换：None/空 → \"N/A\" """
-    if val is None:
-        return "N/A"
-    s = str(val).strip()
-    if s == "" or s == "None":
-        return "N/A"
-    return s
 
 
 def _render_fund_query_result(data: dict) -> None:
@@ -434,15 +425,15 @@ def _render_fund_query_result(data: dict) -> None:
     # ── 关键指标卡片 ──
     st.markdown("#### 关键指标")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("最新净值", _safe_str(metrics.get("latest_nav", analysis.get("latest_nav", ""))))
-    col2.metric("近1年收益", _safe_str(metrics.get("return_1y", analysis.get("return_1y", ""))))
-    col3.metric("年化波动率", _safe_str(metrics.get("annual_volatility", analysis.get("annual_volatility", ""))))
-    col4.metric("最大回撤(1Y)", _safe_str(metrics.get("max_drawdown_1y", analysis.get("max_drawdown_1y", ""))))
+    col1.metric("最新净值", safe_str(metrics.get("latest_nav", analysis.get("latest_nav", ""))))
+    col2.metric("近1年收益", safe_str(metrics.get("return_1y", analysis.get("return_1y", ""))))
+    col3.metric("年化波动率", safe_str(metrics.get("annual_volatility", analysis.get("annual_volatility", ""))))
+    col4.metric("最大回撤(1Y)", safe_str(metrics.get("max_drawdown_1y", analysis.get("max_drawdown_1y", ""))))
     col5, col6, col7, col8 = st.columns(4)
-    col5.metric("夏普比率", _safe_str(metrics.get("sharpe_ratio", analysis.get("sharpe_ratio", ""))))
-    col6.metric("管理费率", _safe_str(metrics.get("m_fee", analysis.get("m_fee", ""))))
-    col7.metric("托管费率", _safe_str(metrics.get("c_fee", analysis.get("c_fee", ""))))
-    col8.metric("成立日期", _safe_str(metrics.get("found_date", analysis.get("found_date", ""))))
+    col5.metric("夏普比率", safe_str(metrics.get("sharpe_ratio", analysis.get("sharpe_ratio", ""))))
+    col6.metric("管理费率", safe_str(metrics.get("m_fee", analysis.get("m_fee", ""))))
+    col7.metric("托管费率", safe_str(metrics.get("c_fee", analysis.get("c_fee", ""))))
+    col8.metric("成立日期", safe_str(metrics.get("found_date", analysis.get("found_date", ""))))
 
     # ── 同类基准对比 ──
     if benchmark and benchmark.get("type_name"):
@@ -735,8 +726,7 @@ with tab2:
 
         # 操作行标题
         st.markdown(
-            f'<div style="background:#f0f7ff;border-radius:10px;padding:0.8rem 1rem;'
-            f'margin-bottom:0.5rem;border:1px solid #b8daff;">'
+            f'<div class="theme-action-row">'
             f'<span style="font-weight:700;font-size:1.05em;">已选：{sf_name}</span> &nbsp; '
             f'<code>{sf_code}</code> &nbsp; '
             f'{get_score_badge_html(sf_score)}'
@@ -747,14 +737,7 @@ with tab2:
         # ── 删除确认弹窗 ──
         if st.session_state.get("_fund_confirm_delete") == sf_code:
             st.markdown(
-                '<div style="'
-                'border:1.5px solid #fca5a5;'
-                'border-radius:12px;'
-                'padding:16px 20px;'
-                'background: linear-gradient(145deg, #fff5f5 0%, #fef2f2 100%);'
-                'box-shadow: 0 4px 12px rgba(220,38,38,0.08);'
-                'margin-bottom:10px;'
-                '">',
+                '<div class="theme-confirm-box">',
                 unsafe_allow_html=True,
             )
             st.markdown(

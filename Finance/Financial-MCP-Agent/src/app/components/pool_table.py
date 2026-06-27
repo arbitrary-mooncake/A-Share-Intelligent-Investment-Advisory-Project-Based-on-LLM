@@ -6,6 +6,8 @@
 from typing import Optional, Dict, Any, List
 
 import streamlit as st
+from theme import score_color, score_bg
+from components.common import fmt_time
 
 
 def render_add_stock_form(
@@ -57,53 +59,6 @@ def render_add_stock_form(
         on_add(stock_code.strip(), stock_name.strip())
 
 
-def _score_color(score) -> str:
-    """根据分数返回颜色"""
-    if score is None:
-        return "#9ca3af"
-    try:
-        s = float(score)
-    except (ValueError, TypeError):
-        return "#9ca3af"
-    if s >= 80:
-        return "#059669"
-    elif s >= 60:
-        return "#d97706"
-    else:
-        return "#dc2626"
-
-
-def _score_bg(score) -> str:
-    """根据分数返回背景色（带透明度）"""
-    if score is None:
-        return "#f3f4f6"
-    try:
-        s = float(score)
-    except (ValueError, TypeError):
-        return "#f3f4f6"
-    if s >= 80:
-        return "#d1fae5"
-    elif s >= 60:
-        return "#fef3c7"
-    else:
-        return "#fee2e2"
-
-
-def _fmt_time(t: str) -> str:
-    """把时间格式化为 yyyy-mm-dd hh:mm，去掉 T 和微秒"""
-    if not t:
-        return "—"
-    t = t.replace("T", " ")
-    if "." in t:
-        t = t.split(".")[0]
-    if " " in t:
-        date_part, time_part = t.split(" ", 1)
-        time_parts = time_part.split(":")
-        if len(time_parts) >= 2:
-            return f"{date_part} {time_parts[0]}:{time_parts[1]}"
-    return t
-
-
 def render_display_row(
     stock: dict,
     term_key: str,
@@ -117,10 +72,10 @@ def render_display_row(
     code = stock.get("stock_code", "")
     name = stock.get("company_name", "")
     score = stock.get("score")
-    score_time = _fmt_time(stock.get("score_time", ""))
+    score_time = fmt_time(stock.get("score_time", ""))
 
-    color = _score_color(score)
-    bg = _score_bg(score)
+    color = score_color(score)
+    bg = score_bg(score)
 
     # ── 精致卡片容器 ──
     st.markdown(
@@ -211,8 +166,8 @@ def _render_score_badge(score, label=""):
             unsafe_allow_html=True,
         )
         return
-    color = _score_color(score)
-    bg = _score_bg(score)
+    color = score_color(score)
+    bg = score_bg(score)
     try:
         s = float(score)
     except (ValueError, TypeError):
@@ -245,7 +200,7 @@ def render_fine_display_row(
     short_s = scores.get("short", {})
     medium_s = scores.get("medium", {})
     long_s = scores.get("long", {})
-    score_time = _fmt_time(stock.get("last_updated", ""))
+    score_time = fmt_time(stock.get("last_updated", ""))
 
     st.markdown(
         '<div style="'
@@ -378,8 +333,8 @@ def render_fine_pool_list(
                 ts = scores.get(term, {})
                 sc = ts.get("score")
                 if sc is not None:
-                    color = _score_color(sc)
-                    bg = _score_bg(sc)
+                    color = score_color(sc)
+                    bg = score_bg(sc)
                     st.markdown(
                         f'<div style="display:inline-block;padding:2px 8px;'
                         f'background:{bg};color:{color};border-radius:10px;'
@@ -432,7 +387,7 @@ def render_pool_list(
         code = s.get("stock_code", "")
         name = s.get("company_name", "")
         score = s.get("score")
-        score_time = _fmt_time(s.get("score_time", ""))
+        score_time = fmt_time(s.get("score_time", ""))
 
         is_selected = (code == selected_code)
 
@@ -478,8 +433,8 @@ def render_pool_list(
 
         with cols[1]:
             if score is not None:
-                color = _score_color(score)
-                bg = _score_bg(score)
+                color = score_color(score)
+                bg = score_bg(score)
                 st.markdown(
                     f'<div style="display:inline-block;padding:3px 12px;'
                     f'background:{bg};color:{color};border-radius:12px;'

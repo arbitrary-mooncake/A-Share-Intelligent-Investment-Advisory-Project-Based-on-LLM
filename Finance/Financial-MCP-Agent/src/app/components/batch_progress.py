@@ -4,6 +4,7 @@
 import html as _html
 import streamlit as st
 import pandas as pd
+from theme import COLORS
 
 
 # 5 级颜色映射（与后端 LEVELS 一致）

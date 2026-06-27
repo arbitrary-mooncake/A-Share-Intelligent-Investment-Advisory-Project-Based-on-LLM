@@ -28,6 +28,7 @@ from components.batch_progress import (
 from config import (
     BATCH_POLL_INTERVAL,
 )
+from theme import inject_global_styles
 from api_client import (
     APIError,
     upload_excel,
@@ -115,6 +116,8 @@ def _stock_key(stock: dict) -> str:
 # 页面配置
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="批量打分", page_icon="📋", layout="wide")
+
+inject_global_styles()
 
 # ──────────────────────────────────────────────
 # 自定义样式：DataFrame 多选框勾选颜色改为红色

@@ -3,45 +3,7 @@
 """
 
 import streamlit as st
-
-
-def _safe_str(val) -> str:
-    """安全转换：None/空/占位文本 → "N/A"，否则返回清理后的值"""
-    if val is None:
-        return "N/A"
-    s = str(val).strip()
-    if s == "" or s == "None" or s == "数据待查询":
-        return "N/A"
-    s = s.replace("…", "").replace("...", "").strip()
-    return s if s else "N/A"
-
-
-def _safe_float(val):
-    """安全转换为 float，失败返回 None"""
-    if val is None:
-        return None
-    try:
-        return float(str(val).replace("%", "").replace("倍", "").strip())
-    except (ValueError, TypeError):
-        return None
-
-
-def _strip_exchange_prefix(code: str) -> str:
-    """去除交易所前缀，如 sh.688256 → 688256"""
-    if code.startswith("sh.") or code.startswith("sz."):
-        return code[3:]
-    return code
-
-
-def _price_color(val) -> str:
-    """涨跌幅正负颜色"""
-    if val == "N/A":
-        return "#888"
-    try:
-        num = float(val.replace("%", ""))
-        return "#dc3545" if num < 0 else "#28a745" if num > 0 else "#888"
-    except (ValueError, TypeError):
-        return "#888"
+from components.common import safe_str, safe_float, strip_exchange_prefix, format_price_change, format_turnover, price_color
 
 
 def _valuation_level_html(current_val, cheap_threshold, expensive_threshold) -> str:
@@ -76,7 +38,7 @@ def render_result_card(data: dict) -> None:
             - industry, industry_intro, company_intro
             - industry_benchmark: {industry_name, pe_reasonable_range, pb_reasonable_range, ...}
     """
-    stock_code = _strip_exchange_prefix(data.get("stock_code", ""))
+    stock_code = strip_exchange_prefix(data.get("stock_code", ""))
     stock_name = data.get("stock_name", "未知")
 
     if stock_name.isdigit() or not stock_name:
@@ -96,15 +58,15 @@ def render_result_card(data: dict) -> None:
     # ── 基本信息 ──
     st.markdown("#### 基本信息")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("总市值", _safe_str(data.get("market_cap")))
-    col2.metric("市盈率 PE", _safe_str(data.get("pe")))
-    col3.metric("市净率 PB", _safe_str(data.get("pb")))
-    col4.metric("换手率", _format_turnover(data.get("turnover_rate")))
+    col1.metric("总市值", safe_str(data.get("market_cap")))
+    col2.metric("市盈率 PE", safe_str(data.get("pe")))
+    col3.metric("市净率 PB", safe_str(data.get("pb")))
+    col4.metric("换手率", format_turnover(data.get("turnover_rate")))
 
     # ── 行业 + 估值基准 + 公司简介 ──
     benchmark = data.get("industry_benchmark") or {}
-    raw_pe = _safe_float(data.get("pe"))
-    raw_pb = _safe_float(data.get("pb"))
+    raw_pe = safe_float(data.get("pe"))
+    raw_pb = safe_float(data.get("pb"))
 
     if benchmark and benchmark.get("pe_reasonable_range"):
         # 有行业基准 → 三栏布局：行业 | PE/PB 估值基准 | 公司简介
@@ -163,33 +125,10 @@ def render_result_card(data: dict) -> None:
     cols = st.columns([1, 1, 1, 1, 1, 1.35, 1])
     for idx, (key, label) in enumerate(periods):
         val = price_changes.get(key)
-        display_val = _format_price_change(val)
-        color = _price_color(display_val)
+        display_val = format_price_change(val)
+        color = price_color(display_val)
         cols[idx].markdown(
             f'<div style="font-size:0.8em;color:#888;margin-bottom:2px;">{label}</div>'
             f'<div style="font-size:1.05em;font-weight:600;color:{color};">{display_val}</div>',
             unsafe_allow_html=True,
         )
-
-
-
-def _format_price_change(val) -> str:
-    """格式化涨跌幅，统一保留一位小数"""
-    if val is None or val == "N/A" or val == "" or val == "数据待查询":
-        return "N/A"
-    s = str(val).replace("…", "").replace("...", "").strip()
-    if s == "数据待查询":
-        return "N/A"
-    try:
-        num = float(s.replace("%", ""))
-        return f"{num:.1f}%"
-    except (ValueError, TypeError):
-        return s if s else "N/A"
-
-
-def _format_turnover(val) -> str:
-    """格式化换手率"""
-    if val is None or val == "N/A" or val == "" or val == "数据待查询":
-        return "N/A"
-    s = str(val).replace("…", "").replace("...", "").strip()
-    return s if s else "N/A"

@@ -40,12 +40,15 @@ from api_client import (
     poll_report_status,
 )
 from config import POOL_TERMS
+from theme import inject_global_styles, page_title
 
 
 # ──────────────────────────────────────────────
 # 页面配置
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="股票池", page_icon="📊", layout="wide")
+
+inject_global_styles()
 
 
 # ──────────────────────────────────────────────
@@ -251,12 +254,7 @@ def _on_deselect(tk):
 # ──────────────────────────────────────────────
 # 页面标题
 # ──────────────────────────────────────────────
-st.markdown(
-    '<div style="margin-bottom:4px;">'
-    '<span style="font-size:1.7em;font-weight:800;color:#0f172a;">📊 股票池</span>'
-    '</div>',
-    unsafe_allow_html=True,
-)
+page_title("📊 股票池")
 st.caption("点击列表行选中股票 → 显示行进行打分/报告/删除。✕ 关闭显示行，股票仍在列表中。")
 
 # ──────────────────────────────────────────────
@@ -344,14 +342,7 @@ for tab, tk in zip(tabs, TERM_KEYS):
                     dn = ds.get("company_name", dc)
                     break
             st.markdown(
-                '<div style="'
-                'border:1.5px solid #fca5a5;'
-                'border-radius:12px;'
-                'padding:16px 20px;'
-                'background: linear-gradient(145deg, #fff5f5 0%, #fef2f2 100%);'
-                'box-shadow: 0 4px 12px rgba(220,38,38,0.08);'
-                'margin-bottom:10px;'
-                '">',
+                '<div class="theme-confirm-box">',
                 unsafe_allow_html=True,
             )
             st.markdown(

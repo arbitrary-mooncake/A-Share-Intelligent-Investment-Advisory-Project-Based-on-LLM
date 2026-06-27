@@ -6,52 +6,8 @@
 from typing import Optional, Dict, Any, List
 
 import streamlit as st
-
-
-def _score_color(score) -> str:
-    if score is None:
-        return "#9ca3af"
-    try:
-        s = float(score)
-    except (ValueError, TypeError):
-        return "#9ca3af"
-    if s >= 80:
-        return "#059669"
-    elif s >= 60:
-        return "#d97706"
-    else:
-        return "#dc2626"
-
-
-def _score_bg(score) -> str:
-    """根据分数返回背景色"""
-    if score is None:
-        return "#f3f4f6"
-    try:
-        s = float(score)
-    except (ValueError, TypeError):
-        return "#f3f4f6"
-    if s >= 80:
-        return "#d1fae5"
-    elif s >= 60:
-        return "#fef3c7"
-    else:
-        return "#fee2e2"
-
-
-def _fmt_time(t: str) -> str:
-    """把时间格式化为 yyyy-mm-dd hh:mm，去掉 T 和微秒"""
-    if not t:
-        return "—"
-    t = t.replace("T", " ")
-    if "." in t:
-        t = t.split(".")[0]
-    if " " in t:
-        date_part, time_part = t.split(" ", 1)
-        time_parts = time_part.split(":")
-        if len(time_parts) >= 2:
-            return f"{date_part} {time_parts[0]}:{time_parts[1]}"
-    return t
+from theme import score_color, score_bg
+from components.common import fmt_time
 
 
 def render_quick_display_row(
@@ -103,9 +59,9 @@ def render_quick_display_row(
     for idx, (t, label) in enumerate([("short", "短线"), ("medium", "中线"), ("long", "长线")]):
         ts = scores.get(t, {})
         sv = ts.get("score")
-        st_time = _fmt_time(ts.get("score_time", ""))
-        color = _score_color(sv)
-        bg = _score_bg(sv)
+        st_time = fmt_time(ts.get("score_time", ""))
+        color = score_color(sv)
+        bg = score_bg(sv)
 
         with sc_cols[idx]:
             if sv is not None:
@@ -264,8 +220,8 @@ def render_quick_list(
             with cols[idx + 1]:
                 sv = scores.get(t, {}).get("score")
                 if sv is not None:
-                    color = _score_color(sv)
-                    bg = _score_bg(sv)
+                    color = score_color(sv)
+                    bg = score_bg(sv)
                     st.markdown(
                         f'<div style="display:inline-block;padding:3px 10px;'
                         f'background:{bg};color:{color};border-radius:10px;'

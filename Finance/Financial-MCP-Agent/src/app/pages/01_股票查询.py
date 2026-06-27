@@ -21,6 +21,7 @@ from api_client import (
     trigger_report,
     poll_report_status,
 )
+from theme import inject_global_styles
 
 # ──────────────────────────────────────────────
 # 页面配置
@@ -31,21 +32,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown(
-    """
-    <style>
-    .stMetric { background: #f8f9fa; border-radius: 8px; padding: 0.5rem; }
-    .stExpander ul ul, .stExpander ol ul, .stExpander ul ol {
-        margin-top: 0.25rem;
-        margin-bottom: 0.25rem;
-        padding-left: 1.5rem;
-    }
-    .stExpander li { margin-bottom: 0.2rem; }
-    .stExpander li > p { margin-bottom: 0.1rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+inject_global_styles()
 
 
 def handle_quick_query(stock_input: str):

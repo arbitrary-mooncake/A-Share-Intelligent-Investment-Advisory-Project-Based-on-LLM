@@ -3,6 +3,7 @@
 """
 
 import streamlit as st
+from theme import card_container, card_end
 
 
 def render_query_form(
@@ -17,20 +18,7 @@ def render_query_form(
         on_report: 点击"生成报告"按钮时的回调函数
         disabled: 是否禁用按钮（正在执行中时）
     """
-    st.markdown(
-        """
-        <style>
-        .query-section {
-            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-            padding: 1.5rem;
-            border-radius: 12px;
-            margin-bottom: 1.5rem;
-        }
-        </style>
-        <div class="query-section"></div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(card_container(2), unsafe_allow_html=True)
 
     st.markdown("### 输入股票代码或名称")
 
@@ -64,6 +52,8 @@ def render_query_form(
             disabled=disabled or not stock_input.strip(),
             key="btn_generate_report",
         )
+
+    st.markdown(card_end(), unsafe_allow_html=True)
 
     # 按钮点击触发回调
     if query_clicked:

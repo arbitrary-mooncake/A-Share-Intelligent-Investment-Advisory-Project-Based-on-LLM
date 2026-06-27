@@ -11,7 +11,11 @@ if _app_dir not in sys.path:
 
 import streamlit as st
 
+from theme import inject_global_styles
+
 st.set_page_config(page_title="AI 智能问答", page_icon="💬", layout="wide")
+
+inject_global_styles()
 
 # ──────────────────────────────────────────────
 # 样式

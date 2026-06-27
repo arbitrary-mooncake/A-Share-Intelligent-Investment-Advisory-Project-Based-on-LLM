@@ -127,7 +127,7 @@ async def process_question(
                 "结合 get_global_futures_spot 获取WTI/布伦特原油期货价格。"
             ),
         }
-        if matched_topic_name in macro_topic_hints:
+        if matched_topic_name in macro_topic_hints and complexity.level != "L1":
             topic_context += macro_topic_hints[matched_topic_name]
 
         logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")

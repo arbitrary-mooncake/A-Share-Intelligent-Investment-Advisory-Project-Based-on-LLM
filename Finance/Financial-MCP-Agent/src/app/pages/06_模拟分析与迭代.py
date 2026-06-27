@@ -54,6 +54,7 @@ try:
 except Exception:
     eval_ready = False
     status = {}
+    orch = None
 
 # ── 顶部状态栏 ──
 st.markdown("---")

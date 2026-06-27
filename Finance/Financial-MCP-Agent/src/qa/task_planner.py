@@ -515,6 +515,7 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
     # 排除以通用疑问词/时间词/礼貌用语/对话前缀开头的搜索性问题
     _generic_prefixes = [
         "现在", "哪些", "什么", "怎么", "如何", "为什么", "最近", "当前", "目前",
+        "去年", "今年", "明年", "本季度", "上季度", "上半年", "下半年",
         "哪只", "哪个", "哪家", "哪类", "怎样", "何时", "多少", "有没有", "是否",
         "请", "帮", "麻烦", "能否", "可否",
         "你觉得", "你认为", "你看", "你说", "你想", "你估计", "你猜", "你看呢", "你觉得呢",
@@ -551,7 +552,7 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
             if not name:
                 # A-Za-z 支持 A/B/C/H 股后缀（如"万科A"、"国新B"、"中集H"）
                 name_match = re.match(
-                    r'^([一-鿿·A-Za-z]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|该|值得|可以|是不是|表现|业绩|价格|涨|跌|的|了|是|和|与|及)',
+                    r'^([一-鿿·A-Za-z]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|该|值得|可以|是不是|表现|业绩|价格|涨|跌|的|了|是|和|与|及|去年|今年|明年|本季|上季|本期|上年|本年)',
                     _extract_text)
                 if name_match:
                     candidate = name_match.group(1)
@@ -570,7 +571,7 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
             if _remaining and _remaining != _extract_text:
                 # A-Za-z 支持 A/B/C/H 股后缀
                 _name_match = re.match(
-                    r'^([一-鿿·A-Za-z]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|该|值得|可以|是不是|表现|业绩|价格|涨|跌|的|了|是|和|与|及)',
+                    r'^([一-鿿·A-Za-z]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|该|值得|可以|是不是|表现|业绩|价格|涨|跌|的|了|是|和|与|及|去年|今年|明年|本季|上季|本期|上年|本年)',
                     _remaining)
                 if _name_match:
                     _candidate = _name_match.group(1)

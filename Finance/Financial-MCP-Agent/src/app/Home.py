@@ -2,15 +2,12 @@
 Streamlit 入口页 — 五大功能导航中心
 """
 import streamlit as st
-from theme import inject_global_styles
 
 st.set_page_config(
     page_title="AI 投资研究助手",
     page_icon="📈",
     layout="wide",
 )
-
-inject_global_styles()
 
 st.title("📈 AI 投资研究助手")
 st.caption("A股智能分析平台 — AI驱动，数据支撑，仅供参考")

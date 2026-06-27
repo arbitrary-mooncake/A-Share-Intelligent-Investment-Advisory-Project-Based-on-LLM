@@ -28,7 +28,6 @@ from components.batch_progress import (
 from config import (
     BATCH_POLL_INTERVAL,
 )
-from theme import inject_global_styles
 from api_client import (
     APIError,
     upload_excel,
@@ -117,21 +116,17 @@ def _stock_key(stock: dict) -> str:
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="批量打分", page_icon="📋", layout="wide")
 
-inject_global_styles()
-
 # ──────────────────────────────────────────────
 # 自定义样式：DataFrame 多选框勾选颜色改为红色
 # ──────────────────────────────────────────────
 st.markdown("""
 <style>
-/* 覆盖 Streamlit dataframe 多选框的勾选颜色为红色 */
 [data-testid="stDataFrame"] [role="checkbox"][aria-checked="true"] svg,
 [data-testid="stDataFrame"] [data-checked="true"] svg,
 [data-testid="stDataFrame"] .glide-cell [role="checkbox"] svg[data-checked="true"] {
     fill: #dc2626 !important;
     color: #dc2626 !important;
 }
-/* 勾选框外框也改为红色 */
 [data-testid="stDataFrame"] [role="checkbox"][aria-checked="true"] {
     border-color: #dc2626 !important;
 }

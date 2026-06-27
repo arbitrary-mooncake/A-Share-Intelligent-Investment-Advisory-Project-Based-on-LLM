@@ -16,7 +16,7 @@ import httpx
 
 from api_client import APIError
 from config import API_BASE_URL
-from theme import inject_global_styles, page_title
+from theme import page_title
 from components.common import safe_str
 
 
@@ -28,8 +28,6 @@ st.set_page_config(
     page_icon="🏦",
     layout="wide",
 )
-
-inject_global_styles()
 
 # ──────────────────────────────────────────────
 # 自定义样式

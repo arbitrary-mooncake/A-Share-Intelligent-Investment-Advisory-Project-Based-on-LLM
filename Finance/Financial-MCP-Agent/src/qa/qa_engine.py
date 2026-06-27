@@ -203,7 +203,7 @@ async def process_question(
                 task_plan, complexity, stock_code or "", company_name or "",
                 question, current_date, current_time_info, actual_session_id,
                 topic_name=matched_topic_name,
-                representative_stocks=topic_rep_stocks,
+                representative_stocks=topic_rep_stocks if complexity.level != "L1" else [],
             )
         )
         _heartbeat_secs = 0
@@ -444,6 +444,7 @@ async def _assemble_with_fallback(
             session_id=session_id,
             topic_name=topic_name,
             representative_stocks=representative_stocks,
+            complexity_level=complexity.level,
         )
     except Exception as e:
         logger.error(f"{ERROR_ICON} QA Engine: 证据装配失败: {e}")

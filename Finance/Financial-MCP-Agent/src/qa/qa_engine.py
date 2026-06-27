@@ -153,10 +153,26 @@ async def process_question(
                 stock_code = resolved_code
                 company_name = resolved_name
             else:
-                # 层3: 反查失败 → 回退到主题匹配
-                topic_info = match_topic(question)
-                if topic_info:
-                    _apply_topic(topic_info)
+                # 层2b: 正则名称反查失败 → LLM 语义提取兜底
+                # （正则可能提取了垃圾名如"有个中际旭创这"，LLM可以正确理解）
+                llm_code, llm_name = await _extract_stock_by_llm(question)
+                if llm_name and llm_name != company_name:
+                    logger.info(
+                        f"QA Engine: 正则名称'{company_name}'反查失败，"
+                        f"LLM兜底提取 → '{llm_name}'"
+                    )
+                    company_name = llm_name
+                    resolved_code, resolved_name = await _resolve_stock_code_by_name(llm_name)
+                    if resolved_code:
+                        stock_code = resolved_code
+                        company_name = resolved_name
+                if llm_code and not stock_code:
+                    stock_code = normalize_stock_code(llm_code)
+                # 层3: LLM 也失败 → 回退到主题匹配
+                if not stock_code:
+                    topic_info = match_topic(question)
+                    if topic_info:
+                        _apply_topic(topic_info)
 
     # 澄清检查：已尝试所有消歧手段（问题文本+会话上下文+主题匹配）仍无标的时才反问
     if complexity.need_clarify and not stock_code and not company_name:

@@ -520,6 +520,22 @@ def _get_l1_tools_for_domains(domains: List[str]) -> List[str]:
     return sorted(tools)
 
 
+# 非股票实体名（国家/地区/城市等），正则可能误匹配为股票名
+_NON_STOCK_ENTITIES = {
+    "中国", "美国", "日本", "欧洲", "德国", "法国", "英国", "印度",
+    "俄罗斯", "韩国", "澳洲", "巴西", "加拿大", "意大利", "香港",
+    "台湾", "新加坡", "泰国", "越南", "印尼", "马来西亚", "菲律宾",
+    "北京", "上海", "深圳", "广州", "杭州", "南京", "成都", "武汉",
+}
+
+
+def _is_valid_stock_name(name: str) -> bool:
+    """检查提取的名称是否为有效的股票名称（非国家/地区/城市等）"""
+    if not name:
+        return False
+    return name not in _NON_STOCK_ENTITIES
+
+
 def extract_stock_from_question(question: str, session_stock_code: str = "",
                                  session_company_name: str = "") -> tuple:
     """
@@ -617,6 +633,10 @@ def extract_stock_from_question(question: str, session_stock_code: str = "",
 
     if code:
         code = normalize_stock_code(code)
+
+    # 过滤非股票实体（国家/地区/城市名），防止"中国"被误识别为股票名
+    if name and not _is_valid_stock_name(name):
+        name = None
 
     return code, name
 

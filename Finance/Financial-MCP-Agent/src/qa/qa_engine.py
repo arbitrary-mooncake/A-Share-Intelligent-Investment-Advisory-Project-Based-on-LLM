@@ -74,6 +74,14 @@ async def process_question(
         session_company_name=session.last_company_name or "",
     )
 
+    # LLM 兜底：正则未能提取时，用语义理解提取（替代硬编码边界词列表）
+    if not stock_code and not company_name:
+        llm_code, llm_name = await _extract_stock_by_llm(question)
+        if llm_name:
+            company_name = llm_name
+        if llm_code:
+            stock_code = llm_code
+
     # 无股票代码时的三层标的解析：
     #   层1 — company_name 为空或是主题关键词 → 直接主题匹配（ETF+代表股）
     #   层2 — company_name 存在且非主题关键词 → tushare_search_stock 名称反查代码
@@ -428,6 +436,73 @@ async def _resolve_stock_code_by_name(name: str) -> tuple:
             normalized = digits
     logger.info(f"QA Engine: 名称反查 '{name}' → {normalized} ({official_name})")
     return normalized, official_name
+
+
+async def _extract_stock_by_llm(question: str) -> tuple:
+    """LLM 语义提取：从自然语言问题中识别A股股票名称和代码。
+    作为正则提取的兜底，用语义理解替代硬编码边界词列表。
+    使用 Model 2 (Qwen3.6-Flash)，最快最便宜。
+    返回 (code, name) 或 (None, None)。
+    """
+    import re as _re
+    from openai import AsyncOpenAI
+    import httpx
+
+    api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY_2", "")
+    base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_2", "")
+    model_name = os.getenv("OPENAI_COMPATIBLE_MODEL_2", "")
+
+    if not all([api_key, base_url, model_name]):
+        return None, None
+
+    prompt = (
+        '从用户问题中提取A股股票信息。返回纯JSON，不要任何其他内容。\n'
+        f'问题：「{question}」\n'
+        '格式：{"name":"公司简称或全称","code":"6位数字代码"}\n'
+        '- 提到公司名但未提代码 → code填null\n'
+        '- 都没提到 → name和code都填null\n'
+        '- 示例: "茅台今天多少钱" → {"name":"贵州茅台","code":null}\n'
+        '- 示例: "帮我看看万科A估值" → {"name":"万科A","code":null}\n'
+        '- 示例: "600519估值高吗" → {"name":null,"code":"600519"}\n'
+        '- 示例: "今天天气不错" → {"name":null,"code":null}'
+    )
+
+    try:
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(connect=5, read=5, write=5, pool=5),
+        )
+        resp = await client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=128,
+            temperature=0,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        text = resp.choices[0].message.content.strip()
+        json_match = _re.search(r'\{[^}]+\}', text)
+        if json_match:
+            import json as _json
+            data = _json.loads(json_match.group())
+            llm_name = data.get("name")
+            llm_code = data.get("code")
+            if isinstance(llm_name, str) and llm_name.strip() and llm_name.strip().lower() != "null":
+                llm_name = llm_name.strip()
+            else:
+                llm_name = None
+            if isinstance(llm_code, str) and llm_code.strip() and llm_code.strip().lower() != "null":
+                llm_code = llm_code.strip()
+            else:
+                llm_code = None
+            if llm_code or llm_name:
+                logger.info(f"QA Engine: LLM语义提取 → code={llm_code}, name={llm_name}")
+            return llm_code, llm_name
+    except Exception as e:
+        logger.warning(f"QA Engine: LLM股票提取失败（回退到正则结果）: {e}")
+
+    return None, None
+
 
 async def _assemble_with_fallback(
     task_plan, complexity, stock_code, company_name,

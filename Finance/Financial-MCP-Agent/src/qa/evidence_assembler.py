@@ -130,9 +130,9 @@ async def assemble_evidence_fast(
         "get_dollar_index", "get_gold_etf",
     }
     if not stock_code and not company_name:
-        if tools and all(t in _NO_CODE_TOOLS for t in tools):
-            pass  # 宏观/市场类查询，无需股票代码，继续执行
-        else:
+        # 过滤：只保留不需要股票代码的工具（宏观数据、Web Search、国际数据等）
+        _no_code_tools = [t for t in tools if t in _NO_CODE_TOOLS]
+        if not _no_code_tools:
             evidence.raw_text = (
                 "当前问题未指定具体的A股股票或公司，且A股数据工具主要覆盖个股、行业和板块数据。"
                 "对于黄金、商品期货、宏观经济等非A股标的的问题，请基于现有知识和行业理解作答，"
@@ -141,6 +141,11 @@ async def assemble_evidence_fast(
             evidence.tool_call_summary = "无股票代码，跳过数据获取"
             evidence.missing.append("未指定A股标的")
             return evidence
+        logger.info(
+            f"QA Evidence: 无股票代码，从{len(tools)}个工具中筛选"
+            f"{len(_no_code_tools)}个代码无关工具继续执行"
+        )
+        tools = _no_code_tools
 
     # 安全网：有公司名但无代码（名称反查失败）→ 不用空code调个股工具，避免全部失败
     if not stock_code and company_name:

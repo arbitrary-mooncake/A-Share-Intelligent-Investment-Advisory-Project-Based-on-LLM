@@ -15,7 +15,7 @@ from src.qa.session_manager import get_session_manager, QASession
 from src.qa.complexity_analyzer import (
     analyze_complexity, try_runtime_upgrade, ComplexityResult,
 )
-from src.qa.task_planner import plan_task, extract_stock_from_question, match_topic, normalize_stock_code
+from src.qa.task_planner import plan_task, extract_stock_from_question, match_topic, normalize_stock_code, resolve_index_name
 from src.qa.evidence_assembler import (
     assemble_evidence_fast,
     EvidencePackage,
@@ -168,7 +168,16 @@ async def process_question(
                         company_name = resolved_name
                 if llm_code and not stock_code:
                     stock_code = normalize_stock_code(llm_code)
-                # 层3: LLM 也失败 → 回退到主题匹配
+                # 层2c: 个股反查失败 → 尝试指数代码匹配
+                # （如"上证指数"、"沪深300"等不是个股，tushare_search_stock查不到）
+                if not stock_code and company_name:
+                    index_code = resolve_index_name(company_name)
+                    if index_code:
+                        logger.info(
+                            f"QA Engine: 指数匹配 → '{company_name}' → {index_code}"
+                        )
+                        stock_code = index_code
+                # 层3: 全部失败 → 回退到主题匹配
                 if not stock_code:
                     topic_info = match_topic(question)
                     if topic_info:

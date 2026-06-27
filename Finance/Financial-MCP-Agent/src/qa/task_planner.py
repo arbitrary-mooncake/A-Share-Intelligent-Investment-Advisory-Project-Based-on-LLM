@@ -317,6 +317,41 @@ DATA_DOMAINS = {
     },
 }
 
+# ── 指数代码映射（非个股，tushare_search_stock 无法查到）──
+INDEX_CODE_MAP = {
+    "上证指数": "sh.000001",
+    "上证综指": "sh.000001",
+    "上证": "sh.000001",
+    "大盘": "sh.000001",
+    "深证成指": "sz.399001",
+    "深成指": "sz.399001",
+    "深证": "sz.399001",
+    "创业板指": "sz.399006",
+    "创业板": "sz.399006",
+    "沪深300": "sh.000300",
+    "科创50": "sh.000688",
+    "科创板": "sh.000688",
+    "中证500": "sh.000905",
+    "上证50": "sh.000016",
+    "北证50": "bj.899050",
+}
+
+
+def resolve_index_name(name: str) -> Optional[str]:
+    """将常见指数名称解析为标准化代码。用于个股名称反查失败后的兜底。"""
+    if not name:
+        return None
+    clean = name.strip()
+    # 精确匹配
+    if clean in INDEX_CODE_MAP:
+        return INDEX_CODE_MAP[clean]
+    # 包含匹配（如"上证指数走势" → 匹配"上证指数"）
+    for key, code in INDEX_CODE_MAP.items():
+        if len(key) >= 3 and key in clean:
+            return code
+    return None
+
+
 # L1 精简工具集：每域只保留 1-2 个核心工具，大幅减少数据获取时间
 L1_LITE_TOOLS = {
     "行情": ["tushare_kline", "tushare_daily_basic"],

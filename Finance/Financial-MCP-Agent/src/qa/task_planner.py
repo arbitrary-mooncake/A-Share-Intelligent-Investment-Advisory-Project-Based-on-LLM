@@ -520,125 +520,31 @@ def _get_l1_tools_for_domains(domains: List[str]) -> List[str]:
     return sorted(tools)
 
 
-# 非股票实体名（国家/地区/城市等），正则可能误匹配为股票名
-_NON_STOCK_ENTITIES = {
-    "中国", "美国", "日本", "欧洲", "德国", "法国", "英国", "印度",
-    "俄罗斯", "韩国", "澳洲", "巴西", "加拿大", "意大利", "香港",
-    "台湾", "新加坡", "泰国", "越南", "印尼", "马来西亚", "菲律宾",
-    "北京", "上海", "深圳", "广州", "杭州", "南京", "成都", "武汉",
-}
-
-
-def _is_valid_stock_name(name: str) -> bool:
-    """检查提取的名称是否为有效的股票名称（非国家/地区/城市等）"""
-    if not name:
-        return False
-    return name not in _NON_STOCK_ENTITIES
-
-
 def extract_stock_from_question(question: str, session_stock_code: str = "",
                                  session_company_name: str = "") -> tuple:
     """
-    从问题中提取股票代码和公司名称。
-    优先使用问题中的信息，其次使用会话上下文。
+    从问题中提取股票代码和公司名称（仅处理确定性结构化输入）。
+    纯数字代码、括号格式、会话引用。自然语言提取由 LLM 完成。
     """
-    code = None
-    name = None
-
-    # 提取股票代码（用数字边界而非\b，因中文也是\w，\b不生效）
-    code_match = re.search(r'(?<!\d)(\d{5,6})(?!\d)', question)
-    if code_match:
-        code = code_match.group(1)
-
-    # 括号内提取: 嘉友国际(603871)
+    # 1. 括号格式：公司名(代码)（如 "嘉友国际(603871)"）
     paren_match = re.search(r'([^（(]+?)\s*[（(](\d{5,6})[)）]', question)
     if paren_match:
         name = paren_match.group(1).strip()
-        code = paren_match.group(2)
+        code = normalize_stock_code(paren_match.group(2))
+        return code, name
 
-    # 引用前文主语
+    # 2. 纯数字股票代码（如 "603871"）——括号内的代码已在上面处理
+    code_match = re.search(r'(?<!\d)(\d{5,6})(?!\d)', question)
+    if code_match:
+        code = normalize_stock_code(code_match.group(1))
+        return code, None
+
+    # 3. 会话上下文引用（如 "它"、"这个股票"）
     ref_pattern = r'(?:它|这个|那个|这只|那家|刚才|上次)(?:股票|公司|股|标的)?'
-    if re.search(ref_pattern, question) and not code:
-        code = session_stock_code
-        name = session_company_name
+    if re.search(ref_pattern, question) and session_stock_code:
+        return session_stock_code, session_company_name
 
-    # 纯公司名称提取（无代码时的兜底）：问题开头/整体为中文名称
-    # 排除以通用疑问词/时间词/礼貌用语/对话前缀开头的搜索性问题
-    _generic_prefixes = [
-        "现在", "哪些", "什么", "怎么", "如何", "为什么", "最近", "当前", "目前",
-        "去年", "今年", "明年", "本季度", "上季度", "上半年", "下半年",
-        "哪只", "哪个", "哪家", "哪类", "怎样", "何时", "多少", "有没有", "是否",
-        "请", "帮", "麻烦", "能否", "可否",
-        "你觉得", "你认为", "你看", "你说", "你想", "你估计", "你猜", "你看呢", "你觉得呢",
-        "我觉得", "我认为", "我看", "我说", "我想", "我知道", "我想知道", "我估计", "我猜",
-        "大家觉得", "大家认为", "大家看", "大家说",
-        "诸位觉得", "诸位认为", "诸位看",
-        "咱们看", "咱们说", "咱们觉得",
-        "看看", "看一下", "看一", "听说", "说一说", "聊一聊", "来聊聊", "来谈谈", "来说说",
-        # 口语化前缀组合（如"帮我看看"→剥离"帮"→"我看看"→再剥离"我看看"→得到纯名称）
-        "我看看", "帮我看", "帮我看看", "分析一下", "介绍一下", "说下", "说说",
-        "我分析一下", "我分析", "我说说", "我想了解", "我想知道", "帮我查", "查一下",
-    ]
-    _generic_prefixes.sort(key=len, reverse=True)
-    _GENERIC_STARTS = r'^(?:' + '|'.join(_generic_prefixes) + ')'
-    _FALSE_NAME_PATTERN = re.compile(
-        r'^[请帮麻烦能否可否深入详细全面简单大概大致快速仔细认真简单具体综合系统全面'
-        r'你我他她它们看听说想觉认知道讲论述论评议问答哪怎为何什么几谁'
-        r'这那此彼本还又再也都最更很太挺颇较不没无非劳将正已曾'
-        r'忙给让使把教示对跟和与及被]'
-    )
-    if not code and not name:
-        _generic_match = re.match(_GENERIC_STARTS, question)
-        _extract_text = question[_generic_match.end():] if _generic_match else question
-        if _extract_text:
-            # 主题关键词优先：如果文本以已知主题关键词开头，直接使用完整主题名
-            # （处理"人工智能"被"能"触发词截断为"人工智"等情况）
-            for _topic, _info in TOPIC_STOCK_MAP.items():
-                for _kw in _info["keywords"]:
-                    if _extract_text.startswith(_kw):
-                        name = _kw
-                        break
-                if name:
-                    break
-            if not name:
-                # A-Za-z 支持 A/B/C/H 股后缀（如"万科A"、"国新B"、"中集H"）
-                name_match = re.match(
-                    r'^([一-鿿·A-Za-z]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|该|值得|可以|是不是|表现|业绩|价格|涨|跌|的|了|是|和|与|及|去年|今年|明年|本季|上季|本期|上年|本年)',
-                    _extract_text)
-                if name_match:
-                    candidate = name_match.group(1)
-                    if not _FALSE_NAME_PATTERN.match(candidate):
-                        name = candidate
-        # 兜底：逐轮剥离通用前缀后再提取（处理"帮我看看万科A"等口语化表达）
-        if not code and not name and _generic_match:
-            _remaining = _extract_text
-            _stripped_any = True
-            while _stripped_any:
-                _stripped_any = False
-                _gm = re.match(_GENERIC_STARTS, _remaining)
-                if _gm:
-                    _remaining = _remaining[_gm.end():]
-                    _stripped_any = True
-            if _remaining and _remaining != _extract_text:
-                # A-Za-z 支持 A/B/C/H 股后缀
-                _name_match = re.match(
-                    r'^([一-鿿·A-Za-z]{2,8}?)(?:这只|那家|股票|公司|最近|现在|走势|行情|分析|PE|PB|估值|财务|怎么|如何|还|该|值得|可以|是不是|表现|业绩|价格|涨|跌|的|了|是|和|与|及|去年|今年|明年|本季|上季|本期|上年|本年)',
-                    _remaining)
-                if _name_match:
-                    _candidate = _name_match.group(1)
-                    if _candidate and not _FALSE_NAME_PATTERN.match(_candidate):
-                        name = _candidate
-        if not name and not _generic_match and re.match(r'^[一-鿿·A-Za-z]{2,4}$', question):
-            name = question
-
-    if code:
-        code = normalize_stock_code(code)
-
-    # 过滤非股票实体（国家/地区/城市名），防止"中国"被误识别为股票名
-    if name and not _is_valid_stock_name(name):
-        name = None
-
-    return code, name
+    return None, None
 
 
 def normalize_stock_code(code: str) -> str:

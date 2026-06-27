@@ -67,14 +67,14 @@ async def process_question(
         f"触发={complexity.triggers}, ReAct={complexity.recommended_react}"
     )
 
-    # Step 2: 提取股票信息（优先于澄清检查，因会话上下文可消歧）
+    # Step 2: 提取标的（结构化提取 → LLM 语义提取 → 名称反查 → 指数/主题兜底）
     stock_code, company_name = extract_stock_from_question(
         question,
         session_stock_code=session.last_stock_code or "",
         session_company_name=session.last_company_name or "",
     )
 
-    # LLM 兜底：正则未能提取时，用语义理解提取（替代硬编码边界词列表）
+    # 结构化提取未命中 → LLM 语义提取（主力路径）
     if not stock_code and not company_name:
         llm_code, llm_name = await _extract_stock_by_llm(question)
         if llm_name:
@@ -82,106 +82,55 @@ async def process_question(
         if llm_code:
             stock_code = normalize_stock_code(llm_code)
 
-    # 无股票代码时的三层标的解析：
-    #   层1 — company_name 为空或是主题关键词 → 直接主题匹配（ETF+代表股）
-    #   层2 — company_name 存在且非主题关键词 → tushare_search_stock 名称反查代码
-    #   层3 — 名称反查失败 → 回退到主题匹配
     topic_context = ""
     matched_topic_name = ""
-    topic_rep_stocks: list = []  # [(code, name), ...] 代表性个股供并行拉取数据
+    topic_rep_stocks: list = []
 
-    def _apply_topic(topic_info):
-        nonlocal stock_code, company_name, matched_topic_name, topic_rep_stocks, topic_context
-        matched_topic_name, topic_data = topic_info
-        etf = topic_data["etfs"][0]
-        stock_code = etf[0]
-        company_name = f"{matched_topic_name}主题({etf[1]})"
-        topic_rep_stocks = topic_data["stocks"][:5]
-        related = [f"{c}({n})" for c, n in topic_rep_stocks]
-        topic_context = (
-            f"[主题匹配] 用户询问{matched_topic_name}板块/赛道。"
-            f"使用代表性ETF {stock_code} 作为基准数据源，"
-            f"代表性个股: {', '.join(related)}。"
-            f"请优先使用已获取的ETF行情数据和板块成分股数据进行客观分析，"
-            f"辅以行业常识，避免仅凭旧知识即兴发挥。"
-            f"如板块成分股数据已获取，请从中选取龙头标的重点分析。"
-            f"\n⚠️ ETF特殊说明：{stock_code}是ETF/指数基金，不是个股。"
-            f"ETF没有ROE、毛利率、净利率、营收增速、负债率、分红、EV/EBITDA等个股财务指标。"
-            f"这些字段缺失是正常现象，不代表'数据获取不足'。"
-            f"请基于ETF的行情走势、成交量、资金流向、板块景气度进行分析。"
-        )
-        # 追加：宏观/商品主题额外注入国际数据使用提示
-        macro_topic_hints = {
-            "黄金": (
-                "\n\n[国际数据源] 本主题涉及国际定价资产。"
-                "请优先使用 web_search 获取最新的美联储政策声明、地缘政治事件。"
-                "使用 get_global_futures_spot 获取 COMEX 黄金期货实时价格，"
-                "使用 get_sge_spot_prices 获取上海黄金交易所 Au99.99 现货报价，"
-                "使用 get_fx_rates 获取美元/人民币汇率，"
-                "结合 get_us_cpi/get_us_pmi 等美国宏观数据分析通胀和货币政策预期。"
-                "A股黄金ETF和黄金股作为国内市场的辅助参考。"
-                "\n⚠️ 黄金价格的核心驱动因素（按重要性）："
-                "1) 美联储货币政策预期 2) 美元走势 3) 美国实际利率"
-                "4) 地缘政治风险 5) 央行购金 6) 通胀预期"
-            ),
-            "白银": (
-                "\n\n[国际数据源] 白银定价同时受贵金属属性和工业需求影响。"
-                "请使用 web_search 获取最新宏观事件，"
-                "结合 get_global_futures_spot 和 get_sge_spot_prices 获取国际银价。"
-            ),
-            "原油": (
-                "\n\n[国际数据源] 原油是全球定价大宗商品。"
-                "请使用 web_search 获取OPEC+决策、地缘政治事件，"
-                "结合 get_global_futures_spot 获取WTI/布伦特原油期货价格。"
-            ),
-        }
-        if matched_topic_name in macro_topic_hints and complexity.level != "L1":
-            topic_context += macro_topic_hints[matched_topic_name]
+    # 名称反查：LLM 提取的名称 → tushare_search_stock 查代码
+    if not stock_code and company_name and not _is_topic_keyword(company_name):
+        resolved_code, resolved_name = await _resolve_stock_code_by_name(company_name)
+        if resolved_code:
+            stock_code = resolved_code
+            company_name = resolved_name
+        else:
+            # 个股反查失败 → 尝试指数代码匹配
+            index_code = resolve_index_name(company_name)
+            if index_code:
+                logger.info(f"QA Engine: 指数匹配 → '{company_name}' → {index_code}")
+                stock_code = index_code
 
-        logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")
-
+    # 主题匹配兜底：无标的时候尝试匹配投资主题（黄金/原油/半导体等）
     if not stock_code:
-        # 层1: company_name 为空或主题关键词 → 直接主题匹配
-        if not company_name or _is_topic_keyword(company_name):
-            topic_info = match_topic(question)
-            if topic_info:
-                _apply_topic(topic_info)
-        # 层2: 有 company_name 但不是主题关键词 → 名称反查
-        if not stock_code and company_name:
-            resolved_code, resolved_name = await _resolve_stock_code_by_name(company_name)
-            if resolved_code:
-                stock_code = resolved_code
-                company_name = resolved_name
-            else:
-                # 层2b: 正则名称反查失败 → LLM 语义提取兜底
-                # （正则可能提取了垃圾名如"有个中际旭创这"，LLM可以正确理解）
-                llm_code, llm_name = await _extract_stock_by_llm(question)
-                if llm_name and llm_name != company_name:
-                    logger.info(
-                        f"QA Engine: 正则名称'{company_name}'反查失败，"
-                        f"LLM兜底提取 → '{llm_name}'"
-                    )
-                    company_name = llm_name
-                    resolved_code, resolved_name = await _resolve_stock_code_by_name(llm_name)
-                    if resolved_code:
-                        stock_code = resolved_code
-                        company_name = resolved_name
-                if llm_code and not stock_code:
-                    stock_code = normalize_stock_code(llm_code)
-                # 层2c: 个股反查失败 → 尝试指数代码匹配
-                # （如"上证指数"、"沪深300"等不是个股，tushare_search_stock查不到）
-                if not stock_code and company_name:
-                    index_code = resolve_index_name(company_name)
-                    if index_code:
-                        logger.info(
-                            f"QA Engine: 指数匹配 → '{company_name}' → {index_code}"
-                        )
-                        stock_code = index_code
-                # 层3: 全部失败 → 回退到主题匹配
-                if not stock_code:
-                    topic_info = match_topic(question)
-                    if topic_info:
-                        _apply_topic(topic_info)
+        topic_info = match_topic(question)
+        if topic_info:
+            matched_topic_name, topic_data = topic_info
+            etf = topic_data["etfs"][0]
+            stock_code = etf[0]
+            company_name = f"{matched_topic_name}主题({etf[1]})"
+            topic_rep_stocks = topic_data["stocks"][:5]
+            related = [f"{c}({n})" for c, n in topic_rep_stocks]
+            topic_context = (
+                f"[主题匹配] 用户询问{matched_topic_name}板块/赛道。"
+                f"使用代表性ETF {stock_code} 作为基准数据源，"
+                f"代表性个股: {', '.join(related)}。"
+                f"请优先使用已获取的ETF行情数据和板块成分股数据进行客观分析，"
+                f"辅以行业常识，避免仅凭旧知识即兴发挥。"
+                f"\n⚠️ ETF特殊说明：{stock_code}是ETF/指数基金，不是个股。"
+                f"ETF没有ROE、毛利率、净利率、营收增速、负债率、分红、EV/EBITDA等个股财务指标。"
+                f"这些字段缺失是正常现象，不代表'数据获取不足'。"
+                f"请基于ETF的行情走势、成交量、资金流向、板块景气度进行分析。"
+            )
+            macro_topic_hints = {
+                "黄金": (
+                    "\n\n[国际数据源] 本主题涉及国际定价资产。"
+                    "请优先使用 web_search 获取最新的美联储政策声明、地缘政治事件。"
+                ),
+                "白银": "\n\n[国际数据源] 白银定价同时受贵金属属性和工业需求影响。",
+                "原油": "\n\n[国际数据源] 原油是全球定价大宗商品。",
+            }
+            if matched_topic_name in macro_topic_hints and complexity.level != "L1":
+                topic_context += macro_topic_hints[matched_topic_name]
+            logger.info(f"QA Engine: 主题匹配 → {matched_topic_name}, 使用ETF {stock_code}")
 
     # 澄清检查：已尝试所有消歧手段（问题文本+会话上下文+主题匹配）仍无标的时才反问
     if complexity.need_clarify and not stock_code and not company_name:

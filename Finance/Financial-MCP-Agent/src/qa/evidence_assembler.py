@@ -22,6 +22,10 @@ TOOL_TIMEOUT = 30  # 单个工具超时（秒）
 MAX_CONCURRENT_TOOLS = 4  # 最大并发工具调用数（防止 Windows 子进程竞争）
 REACT_TOTAL_TIMEOUT = 120  # ReAct路径总超时（秒），防止LLM迭代过久导致前端断连
 
+# L1 快速通道常量
+L1_TOOL_TIMEOUT = 12   # L1 单工具超时（秒），简单查询应快速返回
+L1_MAX_RETRIES = 1     # L1 单工具最多重试 1 次
+
 
 @dataclass
 class EvidencePackage:
@@ -91,6 +95,7 @@ async def assemble_evidence_fast(
     session_id: str = "",
     topic_name: str = "",
     representative_stocks: list = None,
+    complexity_level: str = "",
 ) -> EvidencePackage:
     """
     快路径：并行拉取所有所需工具的数据，组装为证据包。
@@ -192,14 +197,25 @@ async def assemble_evidence_fast(
         "tushare_fina_indicator": None,  # AkShare 有 get_profit_data 等但参数不兼容
     }
 
-    logger.info(f"{WAIT_ICON} QA Evidence: 并行调用 {len(all_mcp_tools)} 个工具 (并发上限={MAX_CONCURRENT_TOOLS}), stock_code={stock_code}...")
+    is_l1 = (complexity_level == "L1")
+    tool_timeout = L1_TOOL_TIMEOUT if is_l1 else TOOL_TIMEOUT
+    tool_retries = L1_MAX_RETRIES if is_l1 else 2
+
+    logger.info(
+        f"{WAIT_ICON} QA Evidence: 并行调用 {len(all_mcp_tools)} 个工具 "
+        f"(并发上限={MAX_CONCURRENT_TOOLS}, 复杂度={complexity_level or 'L2+'}, "
+        f"超时={tool_timeout}s, 重试={tool_retries}), stock_code={stock_code}..."
+    )
 
     # 使用信号量限制并发，防止 Windows 上同时启动过多 MCP 子进程
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
 
     async def _sem_tool_call(tool, kwargs, label):
         async with semaphore:
-            return await _call_tool_safe(tool, kwargs, TOOL_TIMEOUT, label, session_id)
+            return await _call_tool_safe(
+                tool, kwargs, tool_timeout, label, session_id,
+                max_retries=tool_retries,
+            )
 
     # 并行调用所有工具
     tasks = []
@@ -211,8 +227,8 @@ async def assemble_evidence_fast(
 
     results = await asyncio.gather(*tasks)
 
-    # 板块/主题查询：并行拉取代表性个股的估值+基本信息+近K线
-    if representative_stocks:
+    # 板块/主题查询：L2+ 才拉取代表性个股数据（L1 精简路径跳过）
+    if representative_stocks and not is_l1:
         _REP_TOOLS = ["tushare_stock_info", "tushare_daily_basic", "tushare_kline"]
         rep_tool_map = {t.name: t for t in all_mcp_tools}
         rep_tasks = []
@@ -229,10 +245,10 @@ async def assemble_evidence_fast(
             labels.extend(rep_labels)
             results = list(results) + list(rep_results)
 
-    # ── 托底：Tushare 工具成功率低于 50% 时，回退到 AkShare（旧 mcp_server.py）──
+    # ── 托底：Tushare 工具成功率低于 50% 时，回退到 AkShare（L2+ 专属，L1 跳过）──
     total_called = len(labels)
     initial_success = sum(1 for t in results if t)
-    if total_called > 0 and initial_success / total_called < 0.5 and stock_code:
+    if not is_l1 and total_called > 0 and initial_success / total_called < 0.5 and stock_code:
         fallback_tools_to_try = []
         fallback_tool_objs = {}
         # 先加载全部旧工具供回退
@@ -258,11 +274,11 @@ async def assemble_evidence_fast(
             labels = list(labels) + fb_labels
             results = list(results) + list(fb_results)
 
-    # ── ETF 专属托底：MCP工具使用stock API对ETF代码无效，需用fund API ──
+    # ── ETF 专属托底（L2+ 专属，L1 跳过）──
     # 即使MCP工具"成功"返回了数据，也是stock类API的无效数据（ETF无ROE/PE等个股指标）
     # 因此ETF查询一律补充fund_basic/fund_daily/fund_adj直连数据
     _is_etf = stock_code and stock_code.replace("sh.", "").replace("sz.", "").startswith(("51", "58", "15", "16", "18"))
-    if _is_etf and stock_code:
+    if _is_etf and stock_code and not is_l1:
         logger.info(f"{WAIT_ICON} QA Evidence: ETF标的，补充fund_daily/fund_basic直连数据...")
         try:
             from src.utils.tushare_client import get_fund_basic, get_fund_daily, get_fund_adj

@@ -228,7 +228,7 @@ def _score_question(question: str) -> ComplexityResult:
     score += detail["输出要求"]
 
     # 分级
-    if score <= 24:
+    if score <= 20:
         level = "L1"
     elif score <= 49:
         level = "L2"

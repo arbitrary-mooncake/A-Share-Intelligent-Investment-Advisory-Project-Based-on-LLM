@@ -302,7 +302,7 @@ DATA_DOMAINS = {
                        "（Tushare中国宏观 + AKShare美国宏观 + Web Search国际事件）",
     },
     "国际": {
-        "keywords": ["国际", "全球", "美元", "美联储", "美债", "COMEX",
+        "keywords": ["国际", "全球", "美国", "美元", "美联储", "美债", "COMEX",
                      "伦敦金", "纽约", "欧央行", "日央行", "OPEC",
                      "地缘", "制裁", "贸易战", "关税", "冲突"],
         "tools": ["web_search",

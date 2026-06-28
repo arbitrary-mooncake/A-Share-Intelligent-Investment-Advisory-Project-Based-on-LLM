@@ -487,19 +487,41 @@ async def assemble_evidence_react(
 
 
 def _build_search_query(question: str, topic_name: str) -> str:
-    """从用户问题中提取核心关键词构建搜索查询"""
+    """从用户问题中提取核心关键词构建搜索查询。
+    去口语化 + 注入英文金融术语提高搜索质量。"""
+    import re
     if topic_name:
-        # 宏观主题：主题名 + 去噪后的问题关键部分
-        # 去除常见的噪音前缀和语气词
-        import re
         cleaned = re.sub(r'(深度|详细|全面|系统)?(分析一下|分析|帮我)?(最近|当前|未来)?(的)?', '', question)
         cleaned = cleaned.strip()
         if len(cleaned) > 60:
-            # 截断过长查询，保留核心
             return f"{topic_name} {cleaned[:40]}"
         return f"{topic_name} {cleaned}" if cleaned else topic_name
-    # 无主题时直接用问题
-    return question[:100]
+
+    # 无主题：去口语化 + 补英文关键词
+    q = question
+    # 去掉口语前缀和疑问语气词
+    q = re.sub(r'^(最近|当前|目前|帮我|请|麻烦|能否|怎么|如何|为什么|什么是|是多少)', '', q)
+    q = re.sub(r'(分析一下|分析|看看|查询|查一下|了解|说一下|介绍|讲讲)?(的)?(各自)?(是)?(多少|什么|怎么样|如何|吗)?[？?！!。，,、\s]*$', '', q)
+    q = re.sub(r'[？?！!。，,、]+', ' ', q).strip()
+
+    # 注入英文关键词提高搜索质量
+    _EN_TERMS = {
+        '通货膨胀': 'CPI inflation rate', '通胀': 'CPI inflation',
+        'GDP': 'GDP', 'PMI': 'PMI', 'PPI': 'PPI',
+        '失业': 'unemployment rate', '就业': 'employment data',
+        '非农': 'nonfarm payroll', '利率': 'interest rate',
+        '汇率': 'exchange rate', '零售': 'retail sales',
+        'M2': 'M2 money supply', 'M1': 'M1 money supply',
+        '贸易': 'trade data', '关税': 'tariff',
+    }
+    en_terms = []
+    for cn_term, en_term in _EN_TERMS.items():
+        if cn_term in question:
+            en_terms.append(en_term)
+    if en_terms:
+        q = f"{q} {' '.join(en_terms)}"
+
+    return q[:150]
 
 
 def _topic_to_commodity_symbol(topic_name: str) -> str:

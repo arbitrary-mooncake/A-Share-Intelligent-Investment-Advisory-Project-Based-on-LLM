@@ -281,7 +281,7 @@ DATA_DOMAINS = {
     "新闻": {
         "keywords": ["新闻", "公告", "消息", "事件", "发布", "披露", "分红方案",
                      "回购", "减持", "增持", "业绩预告", "ST", "风险警示"],
-        "tools": ["tushare_news", "tushare_st_status", "web_search"],
+        "tools": ["tushare_news", "tushare_st_status", "tushare_major_news", "web_search"],
         "description": "新闻公告、ST风险、重大事件等舆情数据（Tushare+Web Search）",
     },
     "宏观": {
@@ -361,7 +361,7 @@ L1_LITE_TOOLS = {
     "资金": ["tushare_moneyflow"],
     "行业": ["tushare_stock_info"],
     "板块": ["tushare_concept_list"],
-    "新闻": ["tushare_news"],
+    "新闻": ["tushare_news", "tushare_major_news"],
     "宏观": ["tushare_cn_cpi", "tushare_cn_pmi"],
     "国际": ["web_search", "get_us_cpi"],
 }

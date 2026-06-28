@@ -118,6 +118,7 @@ async def assemble_evidence_fast(
         "tushare_cn_ppi", "tushare_cn_m", "tushare_shibor",
         "tushare_fx_daily", "tushare_eco_cal",
         "tushare_latest_trading_date", "tushare_top_list",
+        "tushare_major_news",  # keyword-based news search, no code needed
         # Phase 1: Web Search (no code needed)
         "web_search", "web_fetch",
         # Phase 1: AKShare international (no code needed)
@@ -588,6 +589,7 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         # 新闻/风险类
         "tushare_st_status": {"code": code},
         "tushare_news": {"code": code},
+        "tushare_major_news": {"keyword": _build_search_query(question, topic_name), "days": 30},
         # 板块/概念类
         "tushare_concept_list": {"keyword": topic_name or company_name or question},
         "tushare_concept_detail": {"concept_code": topic_name or company_name or question},

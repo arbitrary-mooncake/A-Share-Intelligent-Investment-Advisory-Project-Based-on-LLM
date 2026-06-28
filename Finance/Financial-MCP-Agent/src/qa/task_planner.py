@@ -363,7 +363,7 @@ L1_LITE_TOOLS = {
     "板块": ["tushare_concept_list"],
     "新闻": ["tushare_news"],
     "宏观": ["tushare_cn_cpi", "tushare_cn_pmi"],
-    "国际": ["web_search"],
+    "国际": ["web_search", "get_us_cpi"],
 }
 
 

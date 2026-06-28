@@ -34,7 +34,9 @@ def _to_markdown_table(data, title: str) -> str:
     headers = list(df.columns)
     lines.append("| " + " | ".join(str(h) for h in headers) + " |")
     lines.append("| " + " | ".join("---" for _ in headers) + " |")
-    for _, row in df.head(50).iterrows():
+    # 优先展示最新数据：取最后50行（用户关心当前值，不关心10年前的历史）
+    rows_to_show = min(50, len(df))
+    for _, row in df.tail(rows_to_show).iterrows():
         cells = [str(v) if v is not None else "" for v in row.values]
         lines.append("| " + " | ".join(cells) + " |")
 

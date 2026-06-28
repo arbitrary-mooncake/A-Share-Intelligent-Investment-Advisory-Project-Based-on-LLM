@@ -74,6 +74,12 @@ AGENT_CACHE_TTL = {
     "event_analysis": 1,            # Event/news data needs daily freshness
     "quality_risk_analysis": 7,     # Financial quality data is quarterly, 7-day window
     "moneyflow_analysis": 1,        # Daily market data
+    # Scorers — 1-day TTL: every scorer depends on ≥1 agent with 1-day TTL
+    "short_term_scorer": 1,
+    "medium_term_scorer": 1,
+    "long_term_scorer": 1,
+    # Full pipeline result cache (pool_screening uses this to skip entire pipeline)
+    "full_pool_analysis": 1,
     # Fund agents
     "fund_product_doc": 30,      # Fund basic info rarely changes
     "fund_perf_risk": 3,         # NAV updates daily, analysis is heavy

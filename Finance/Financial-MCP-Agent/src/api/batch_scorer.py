@@ -98,27 +98,43 @@ def _prefetch_tushare_batch(
     except Exception as e:
         logger.warning(f"  预取 Step A 失败: {e}")
 
-    # ── Step B: daily_basic 逐只 (不能批量) ──
-    est_minutes = total * 0.35 / 60
-    logger.info(f"  预取 Step B: daily_basic 逐只 ({total} 次, ~{est_minutes:.0f}分)")
-    done_b = 0
-    for tc in ts_codes:
-        done_b += 1
-        if done_b % 200 == 0:
-            logger.info(f"  预取 Step B 进度: {done_b}/{total}")
-        if on_progress and done_b % 100 == 0:
-            on_progress(done_b * 4 // 5, total)
-        try:
-            basics = get_daily_basic(tc, days=5)
-            if basics and isinstance(basics, list) and basics:
-                latest = basics[0]
-                cache[tc]["pe"] = str(latest.get("pe_ttm", "") or "")
-                cache[tc]["pb"] = str(latest.get("pb", "") or "")
-                cache[tc]["ps"] = str(latest.get("ps_ttm", "") or "")
-        except Exception:
-            pass
+    # ── Step B: daily_basic 批量 (按交易日查全市场, 替代逐只查询) ──
+    logger.info(f"  预取 Step B: daily_basic 批量 (按交易日查全市场)")
+    from src.utils.tushare_client import _call
+    # 获取最近的交易日
+    today = datetime.now().strftime("%Y%m%d")
+    trade_cal = _call("trade_cal", {
+        "exchange": "SSE",
+        "start_date": (datetime.now() - timedelta(days=10)).strftime("%Y%m%d"),
+        "end_date": today,
+    }, fields="cal_date,is_open")
+    latest_trade_date = today
+    if trade_cal and "items" in trade_cal:
+        fc = trade_cal["fields"]
+        for row in reversed(trade_cal["items"]):
+            item = dict(zip(fc, row))
+            if item.get("is_open") == 1:
+                latest_trade_date = item["cal_date"]
+    logger.info(f"  最新交易日: {latest_trade_date}")
+
+    # 批量查全市场 daily_basic (1次调用替代 {total} 次)
+    try:
+        bulk = _call("daily_basic", {
+            "trade_date": latest_trade_date,
+        }, "ts_code,pe_ttm,pb,ps_ttm")
+        if bulk and "items" in bulk:
+            fc = bulk["fields"]
+            for row in bulk["items"]:
+                item = dict(zip(fc, row))
+                tc = item.get("ts_code", "")
+                if tc in cache:
+                    cache[tc]["pe"] = str(item.get("pe_ttm", "") or "")
+                    cache[tc]["pb"] = str(item.get("pb", "") or "")
+                    cache[tc]["ps"] = str(item.get("ps_ttm", "") or "")
+    except Exception as e:
+        logger.warning(f"  预取 Step B 批量查询失败: {e}")
     pe_hit = sum(1 for tc in ts_codes if cache[tc].get("pe"))
-    logger.info(f"  预取 Step B 完成: PE 命中 {pe_hit}/{total}")
+    logger.info(f"  预取 Step B 完成: PE 命中 {pe_hit}/{total} (批量查询模式)")
 
     # ── Step C: fina_indicator 批量 (每批40只) ──
     batch_count = (total + 39) // 40

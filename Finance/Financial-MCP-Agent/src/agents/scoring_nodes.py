@@ -6,6 +6,7 @@ Scoring Nodes: LangGraph wrapper for 3 scoring agents (v2 — structured evidenc
   - medium_term + long_term: all 7 analysis agents
   - 每个node先构建AnalysisPackage → 传给scorer → apply risk_gate
 """
+import json
 from typing import Dict, Any
 
 from src.utils.state_definition import AgentState
@@ -18,15 +19,36 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
     from src.agents.short_term_scorer import short_term_scorer
     from src.utils.analysis_package_builder import build_analysis_package
     from src.utils.risk_gate import apply_risk_gate
+    from src.utils.cache_utils import read_cache, write_cache
 
     data = state.get("data", {})
     stock_code = data.get("stock_code", "")
     company_name = data.get("company_name", "")
     as_of_date = data.get("current_date", "")
+    skip_cache = data.get("skip_cache", False)
 
     logger.info(f"{WAIT_ICON} ShortTermScorerNode: {company_name}({stock_code}) 短线打分")
 
     try:
+        # 缓存检查: 1天TTL，同一天同股票不重复打分
+        if not skip_cache and stock_code and as_of_date:
+            cached = read_cache("short_term_scorer", stock_code, as_of_date)
+            if cached:
+                result = json.loads(cached)
+                pkg = build_analysis_package(data, as_of_date)
+                gate = apply_risk_gate(pkg, "short", result["score"])
+                if gate.score_cap is not None:
+                    result["score"] = min(result["score"], gate.score_cap)
+                result["risk_gate"] = {
+                    "risk_level": gate.risk_level,
+                    "risk_flags": gate.risk_flags_found,
+                    "score_cap": gate.score_cap,
+                    "abstain": gate.abstain,
+                    "data_quality_score": gate.data_quality_score,
+                }
+                logger.info(f"{SUCCESS_ICON} ShortTermScorerNode: {company_name} 短线={result['score']} (缓存命中)")
+                return {"data": {"short_term_score": result}}
+
         pkg = build_analysis_package(data, as_of_date)
 
         result = await short_term_scorer(
@@ -56,6 +78,19 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             "data_quality_score": gate.data_quality_score,
         }
 
+        # 写入缓存 (1天TTL，与子Agent最短TTL一致)
+        if not skip_cache and stock_code and as_of_date:
+            write_cache("short_term_scorer", stock_code, as_of_date, json.dumps({
+                "score": result["score"],
+                "reasoning": result.get("reasoning", ""),
+                "recommendation": result.get("recommendation", ""),
+                "sub_scores": result.get("sub_scores", {}),
+                "confidence": result.get("confidence", 0),
+                "suggested_action": result.get("suggested_action", ""),
+                "risk_warning": result.get("risk_warning", ""),
+                "data_quality_score": result.get("data_quality_score", 0),
+            }, ensure_ascii=False))
+
         logger.info(f"{SUCCESS_ICON} ShortTermScorerNode: {company_name} 短线={result['score']} (gate={gate.risk_level})")
         return {"data": {"short_term_score": result}}
 
@@ -68,15 +103,35 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
     from src.agents.medium_term_scorer import medium_term_scorer
     from src.utils.analysis_package_builder import build_analysis_package
     from src.utils.risk_gate import apply_risk_gate
+    from src.utils.cache_utils import read_cache, write_cache
 
     data = state.get("data", {})
     stock_code = data.get("stock_code", "")
     company_name = data.get("company_name", "")
     as_of_date = data.get("current_date", "")
+    skip_cache = data.get("skip_cache", False)
 
     logger.info(f"{WAIT_ICON} MediumTermScorerNode: {company_name}({stock_code}) 中线打分")
 
     try:
+        if not skip_cache and stock_code and as_of_date:
+            cached = read_cache("medium_term_scorer", stock_code, as_of_date)
+            if cached:
+                result = json.loads(cached)
+                pkg = build_analysis_package(data, as_of_date)
+                gate = apply_risk_gate(pkg, "medium", result["score"])
+                if gate.score_cap is not None:
+                    result["score"] = min(result["score"], gate.score_cap)
+                result["risk_gate"] = {
+                    "risk_level": gate.risk_level,
+                    "risk_flags": gate.risk_flags_found,
+                    "score_cap": gate.score_cap,
+                    "abstain": gate.abstain,
+                    "data_quality_score": gate.data_quality_score,
+                }
+                logger.info(f"{SUCCESS_ICON} MediumTermScorerNode: {company_name} 中线={result['score']} (缓存命中)")
+                return {"data": {"medium_term_score": result}}
+
         pkg = build_analysis_package(data, as_of_date)
 
         result = await medium_term_scorer(
@@ -99,6 +154,8 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
         )
 
         gate = apply_risk_gate(pkg, "medium", result["score"])
+        if gate.score_cap is not None:
+            result["score"] = min(result["score"], gate.score_cap)
         result["risk_gate"] = {
             "risk_level": gate.risk_level,
             "risk_flags": gate.risk_flags_found,
@@ -106,6 +163,19 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             "abstain": gate.abstain,
             "data_quality_score": gate.data_quality_score,
         }
+
+        if not skip_cache and stock_code and as_of_date:
+            write_cache("medium_term_scorer", stock_code, as_of_date, json.dumps({
+                "score": result["score"],
+                "reasoning": result.get("reasoning", ""),
+                "rating": result.get("rating", ""),
+                "sub_scores": result.get("sub_scores", {}),
+                "confidence": result.get("confidence", 0),
+                "time_horizon": result.get("time_horizon", ""),
+                "suggested_action": result.get("suggested_action", ""),
+                "risk_warning": result.get("risk_warning", ""),
+                "data_quality_score": result.get("data_quality_score", 0),
+            }, ensure_ascii=False))
 
         logger.info(f"{SUCCESS_ICON} MediumTermScorerNode: {company_name} 中线={result['score']} (gate={gate.risk_level})")
         return {"data": {"medium_term_score": result}}
@@ -119,15 +189,35 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
     from src.agents.long_term_scorer import long_term_scorer
     from src.utils.analysis_package_builder import build_analysis_package
     from src.utils.risk_gate import apply_risk_gate
+    from src.utils.cache_utils import read_cache, write_cache
 
     data = state.get("data", {})
     stock_code = data.get("stock_code", "")
     company_name = data.get("company_name", "")
     as_of_date = data.get("current_date", "")
+    skip_cache = data.get("skip_cache", False)
 
     logger.info(f"{WAIT_ICON} LongTermScorerNode: {company_name}({stock_code}) 长线打分")
 
     try:
+        if not skip_cache and stock_code and as_of_date:
+            cached = read_cache("long_term_scorer", stock_code, as_of_date)
+            if cached:
+                result = json.loads(cached)
+                pkg = build_analysis_package(data, as_of_date)
+                gate = apply_risk_gate(pkg, "long", result["score"])
+                if gate.score_cap is not None:
+                    result["score"] = min(result["score"], gate.score_cap)
+                result["risk_gate"] = {
+                    "risk_level": gate.risk_level,
+                    "risk_flags": gate.risk_flags_found,
+                    "score_cap": gate.score_cap,
+                    "abstain": gate.abstain,
+                    "data_quality_score": gate.data_quality_score,
+                }
+                logger.info(f"{SUCCESS_ICON} LongTermScorerNode: {company_name} 长线={result['score']} (缓存命中)")
+                return {"data": {"long_term_score": result}}
+
         pkg = build_analysis_package(data, as_of_date)
 
         result = await long_term_scorer(
@@ -150,6 +240,8 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
         )
 
         gate = apply_risk_gate(pkg, "long", result["score"])
+        if gate.score_cap is not None:
+            result["score"] = min(result["score"], gate.score_cap)
         result["risk_gate"] = {
             "risk_level": gate.risk_level,
             "risk_flags": gate.risk_flags_found,
@@ -157,6 +249,19 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
             "abstain": gate.abstain,
             "data_quality_score": gate.data_quality_score,
         }
+
+        if not skip_cache and stock_code and as_of_date:
+            write_cache("long_term_scorer", stock_code, as_of_date, json.dumps({
+                "score": result["score"],
+                "reasoning": result.get("reasoning", ""),
+                "rating": result.get("rating", ""),
+                "sub_scores": result.get("sub_scores", {}),
+                "confidence": result.get("confidence", 0),
+                "time_horizon": result.get("time_horizon", ""),
+                "suggested_action": result.get("suggested_action", ""),
+                "risk_warning": result.get("risk_warning", ""),
+                "data_quality_score": result.get("data_quality_score", 0),
+            }, ensure_ascii=False))
 
         logger.info(f"{SUCCESS_ICON} LongTermScorerNode: {company_name} 长线={result['score']} (gate={gate.risk_level})")
         return {"data": {"long_term_score": result}}

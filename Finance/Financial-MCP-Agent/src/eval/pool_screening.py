@@ -8,6 +8,7 @@
   Layer 3: 1:1.2差额精筛 (白名单+初筛通过→正式7Agent+3Scorer→LLM动态阈值→最终精筛池)
 """
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -113,34 +114,61 @@ async def hard_screen() -> List[Dict[str, Any]]:
     today_str = datetime.now().strftime("%Y%m%d")
     start_str = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
 
-    logger.info("  成交量筛选: %d只 → 过滤日均成交额<%d万",
+    logger.info("  成交量筛选: %d只 → 过滤日均成交额<%d万 (批量查询模式)",
                 len(filtered), min_daily_amount // 10000)
 
-    volume_filtered = []
-    for i, s in enumerate(filtered):
-        if i % 500 == 0:
-            logger.info("  成交量筛选进度: %d/%d", i, len(filtered))
-        ts_code = s.get("ts_code", "")
+    # 获取近20个交易日
+    trade_cal = tushare_call("trade_cal", {
+        "exchange": "SSE",
+        "start_date": start_str,
+        "end_date": today_str,
+    }, fields="cal_date,is_open")
+    trading_days = []
+    if trade_cal and "items" in trade_cal:
+        for row in trade_cal["items"]:
+            item = dict(zip(trade_cal["fields"], row))
+            if item.get("is_open") == 1:
+                trading_days.append(item["cal_date"])
+    trading_days.sort(reverse=True)
+    trading_days = trading_days[:20]  # 最多取最近20个交易日
+    logger.info("  近20个交易日: %s", trading_days[:5] if trading_days else "空")
+
+    # 批量查询: 按交易日逐日查 daily（每只股票单日一行，替代逐只查询）
+    volume_map: Dict[str, List[float]] = {}  # {ts_code: [amount1, amount2, ...]}
+    for day_idx, day in enumerate(trading_days):
+        if day_idx % 5 == 0:
+            logger.info("  批量成交量查询进度: %d/%d 天", day_idx, len(trading_days))
         try:
-            daily = tushare_call("daily", {
-                "ts_code": ts_code,
-                "start_date": start_str,
-                "end_date": today_str,
-            }, fields="trade_date,amount")
-            if daily and "items" in daily and len(daily["items"]) >= 5:
-                amounts = []
-                for row in daily["items"][:20]:
-                    item = dict(zip(daily["fields"], row))
+            daily_bulk = tushare_call("daily", {
+                "trade_date": day,
+            }, fields="ts_code,amount")
+            if daily_bulk and "items" in daily_bulk:
+                fields_d = daily_bulk["fields"]
+                for row in daily_bulk["items"]:
+                    item = dict(zip(fields_d, row))
+                    code = item.get("ts_code", "")
                     try:
-                        amounts.append(float(item.get("amount", 0)))
+                        amt = float(item.get("amount", 0))
                     except (ValueError, TypeError):
-                        pass
-                if not _is_low_volume(amounts, min_daily_amount):
-                    volume_filtered.append(s)
-            else:
-                volume_filtered.append(s)  # 无足够交易记录, 保守保留
+                        continue
+                    if code not in volume_map:
+                        volume_map[code] = []
+                    volume_map[code].append(amt)
         except Exception:
-            volume_filtered.append(s)  # 查询失败, 保守保留
+            pass
+
+    logger.info("  成交量批量查询完成: %d只股票有数据", len(volume_map))
+
+    # 基于内存 map 筛选
+    volume_filtered = []
+    for s in filtered:
+        ts_code = s.get("ts_code", "")
+        amounts = volume_map.get(ts_code, [])
+        if len(amounts) >= 5:
+            if not _is_low_volume(amounts, min_daily_amount):
+                volume_filtered.append(s)
+        else:
+            volume_filtered.append(s)  # 无足够交易记录, 保守保留
 
     logger.info("  成交量筛选后: %d只 (剔除%d只低成交额)",
                 len(volume_filtered), len(filtered) - len(volume_filtered))
@@ -508,22 +536,71 @@ async def formal_score_layer3(
     if on_progress:
         on_progress(0, len(candidates))
 
-    # Step C: 逐只运行正式7Agent+3Scorer
-    engine = ScoringEngine()
+    # Step C: 分批并发运行正式7Agent+3Scorer
+    # 每批至多20只, semaphore=3并发, 批次间汇报进度, 支持增量展示
+    BATCH_SIZE = 20
     scored_candidates = []
     whitelist_final = []
     blacklist_final = []
+    candidates_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(3)
+    completed_count = 0
 
     term_key = {"short": "short_term_score", "medium": "medium_term_score", "long": "long_term_score"}
 
-    for i, stock in enumerate(candidates):
+    async def _score_one(stock: Dict[str, Any]) -> None:
+        nonlocal completed_count
+        from src.utils.cache_utils import read_cache, write_cache
         code = stock.get("code", "")
         name = stock.get("name", code)
+        safe_code = code.replace(".", "_").replace("/", "_")
+        entry = {**stock, "final_score": 50, "recommendation": ""}
+
+        # 检查 full_analysis 缓存 (1天TTL)
+        cache_date = datetime.now().strftime("%Y-%m-%d")
+        cached_full = None
         try:
-            result = await engine.score_stock(code, name)
+            cached_full = read_cache("full_pool_analysis", safe_code, cache_date)
+        except Exception:
+            pass
+        if cached_full:
+            try:
+                cache_data = json.loads(cached_full)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                cache_data = None
+            sd = cache_data.get("score_data", {}) if cache_data else {}
+            if sd:
+                term_score = sd.get(term_key.get(term, "medium_term_score"), {})
+                actual_score = term_score.get("score") if isinstance(term_score, dict) else sd.get("score", 50)
+                if actual_score is None:
+                    actual_score = sd.get("score", 50)
+                rec = sd.get("recommendation", "")
+                entry = {**stock, "final_score": actual_score or 50,
+                         "recommendation": rec}
+                logger.info("  %s 命中full_analysis缓存, score=%s", code, actual_score)
+                async with candidates_lock:
+                    if "强烈推荐" in str(rec) or (actual_score or 0) >= 85:
+                        whitelist_final.append(entry)
+                    elif "卖出" in str(rec) or (actual_score or 50) < 30:
+                        blacklist_final.append(entry)
+                    scored_candidates.append(entry)
+                    completed_count += 1
+                return
+
+        engine = ScoringEngine()
+        try:
+            async with sem:
+                result = await engine.score_stock(code, name)
             if result and result.get("score_data"):
+                # 写入 full_analysis 缓存
+                try:
+                    write_cache("full_pool_analysis", safe_code, cache_date,
+                                json.dumps({"score_data": result["score_data"]},
+                                           ensure_ascii=False, default=str))
+                except Exception:
+                    pass
                 sd = result["score_data"]
-                score = sd.get("score") or 50  # 防止 None: key存在但值为None时用50
+                score = sd.get("score") or 50
 
                 term_score = sd.get(term_key.get(term, "medium_term_score"), {})
                 actual_score = term_score.get("score") if isinstance(term_score, dict) else score
@@ -532,22 +609,34 @@ async def formal_score_layer3(
                 recommendation = sd.get("recommendation", "")
 
                 entry = {**stock, "final_score": actual_score, "recommendation": recommendation}
-
-                if "强烈推荐" in str(recommendation) or actual_score >= 85:
-                    whitelist_final.append(entry)
-                    scored_candidates.append(entry)
-                elif "卖出" in str(recommendation) or actual_score < 30:
-                    blacklist_final.append(entry)
-                else:
-                    scored_candidates.append(entry)
-            else:
-                scored_candidates.append({**stock, "final_score": 50, "recommendation": ""})
         except Exception as e:
             logger.warning("  正式评分失败 %s: %s", code, e)
-            scored_candidates.append({**stock, "final_score": 40, "recommendation": ""})
+            entry = {**stock, "final_score": 40, "recommendation": ""}
 
-        if on_progress and (i + 1) % 10 == 0:
-            on_progress(i + 1, len(candidates))
+        async with candidates_lock:
+            if "强烈推荐" in str(entry.get("recommendation", "")) or entry.get("final_score", 0) >= 85:
+                whitelist_final.append(entry)
+                scored_candidates.append(entry)
+            elif "卖出" in str(entry.get("recommendation", "")) or entry.get("final_score", 50) < 30:
+                blacklist_final.append(entry)
+            else:
+                scored_candidates.append(entry)
+            completed_count += 1
+            if on_progress and completed_count % 5 == 0:
+                on_progress(completed_count, len(candidates))
+
+    # 分批执行: 每批 BATCH_SIZE 只, 批次间汇报进度
+    total_candidates = len(candidates)
+    for batch_start in range(0, total_candidates, BATCH_SIZE):
+        batch = candidates[batch_start:batch_start + BATCH_SIZE]
+        batch_idx = batch_start // BATCH_SIZE + 1
+        total_batches = (total_candidates + BATCH_SIZE - 1) // BATCH_SIZE
+        logger.info("  精筛批次 %d/%d: %d只 (%d~%d)",
+                    batch_idx, total_batches, len(batch),
+                    batch_start + 1, min(batch_start + BATCH_SIZE, total_candidates))
+        await asyncio.gather(*[_score_one(s) for s in batch])
+        if on_progress:
+            on_progress(min(batch_start + BATCH_SIZE, total_candidates), total_candidates)
 
     if on_progress:
         on_progress(len(candidates), len(candidates))

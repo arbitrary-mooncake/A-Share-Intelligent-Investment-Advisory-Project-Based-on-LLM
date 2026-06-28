@@ -487,6 +487,29 @@ async def assemble_evidence_react(
     return evidence
 
 
+# 已知行业/概念关键词（与 TOPIC_STOCK_MAP 对齐，用于 tushare_concept_list 搜索）
+_CONCEPT_KEYWORDS = [
+    "半导体", "芯片", "新能源", "光伏", "锂电池", "储能", "新能源车",
+    "人工智能", "AI", "机器人", "算力", "CPO", "PCB", "低空经济",
+    "创新药", "中药", "医药", "医疗器械", "白酒", "消费", "家电",
+    "汽车", "军工", "银行", "证券", "保险", "房地产", "煤炭",
+    "有色金属", "化工", "钢铁", "建材", "电力", "传媒", "游戏",
+    "农业", "旅游", "通信", "计算机", "软件", "消费电子",
+    "黄金", "白银", "原油",
+]
+
+
+def _extract_concept_keyword(question: str, topic_name: str) -> str:
+    """从问题中提取行业/概念关键词，用于 tushare_concept_list 搜索。
+    匹配已知概念名，取第一个匹配项；无匹配时回退到 topic_name 或问题本身。"""
+    if topic_name:
+        return topic_name
+    for kw in sorted(_CONCEPT_KEYWORDS, key=len, reverse=True):
+        if kw in question:
+            return kw
+    return _build_search_query(question, "")
+
+
 def _build_search_query(question: str, topic_name: str) -> str:
     """从用户问题中提取核心关键词构建搜索查询。
     去口语化 + 注入英文金融术语提高搜索质量。"""
@@ -591,10 +614,10 @@ def _build_tool_kwargs(tool_name: str, stock_code: str, company_name: str,
         "tushare_news": {"code": code},
         "tushare_major_news": {"keyword": _build_search_query(question, topic_name), "days": 30},
         # 板块/概念类
-        "tushare_concept_list": {"keyword": topic_name or company_name or question},
-        "tushare_concept_detail": {"concept_code": topic_name or company_name or question},
-        "tushare_ths_index": {"keyword": topic_name or company_name or question},
-        "tushare_dc_index": {"keyword": topic_name or company_name or question},
+        "tushare_concept_list": {"keyword": _extract_concept_keyword(question, topic_name)},
+        "tushare_concept_detail": {"concept_code": _extract_concept_keyword(question, topic_name)},
+        "tushare_ths_index": {"keyword": _extract_concept_keyword(question, topic_name)},
+        "tushare_dc_index": {"keyword": _extract_concept_keyword(question, topic_name)},
         # 股票名称搜索
         "tushare_search_stock": {"keyword": company_name or clean_code or question},
         # 龙虎榜

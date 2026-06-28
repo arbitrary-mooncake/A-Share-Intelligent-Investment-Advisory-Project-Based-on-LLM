@@ -165,6 +165,13 @@ async def process_question(
         f"工具数={len(task_plan.tools)}, ReAct={task_plan.need_react}"
     )
 
+    # Step 3.5: LLM 工具过滤 — 裁掉问题不相关的工具，减少无关数据干扰
+    if len(task_plan.tools) > 3 and len(task_plan.domains) > 1:
+        task_plan.tools = await _filter_tools_by_llm(question, task_plan.tools)
+        logger.info(
+            f"QA Engine: LLM过滤后 — 工具数={len(task_plan.tools)}"
+        )
+
     # Step 4: 证据装配（L0跳过）
     if complexity.level == "L0":
         evidence = EvidencePackage(
@@ -476,6 +483,71 @@ async def _extract_stock_by_llm(question: str) -> tuple:
         logger.warning(f"QA Engine: LLM股票提取失败（回退到正则结果）: {e}")
 
     return None, None
+
+
+async def _filter_tools_by_llm(question: str, tools: list) -> list:
+    """用轻量 LLM 过滤工具列表，裁掉与问题不相关的工具。
+    减少无关数据（如CPI/PMI混入业绩预告查询）对LLM回答的干扰。
+    使用 Model 2 (Qwen3.6-Flash)，~0.3s，极低成本。
+    """
+    if len(tools) <= 3:
+        return tools
+
+    import re as _re
+    from openai import AsyncOpenAI
+    import httpx
+
+    api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY_2", "")
+    base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_2", "")
+    model_name = os.getenv("OPENAI_COMPATIBLE_MODEL_2", "")
+    if not all([api_key, base_url, model_name]):
+        return tools
+
+    tool_list = "\n".join(f"- {t}" for t in tools)
+    prompt = (
+        "你是一个工具过滤器。给定用户问题和可用工具列表，只保留与回答问题直接相关的工具。\n\n"
+        f"用户问题：「{question}」\n\n"
+        f"可用工具（{len(tools)}个）：\n{tool_list}\n\n"
+        "规则：\n"
+        "1. 保留所有与问题明确相关的工具\n"
+        "2. 如果问题只涉及某个具体主题（如公司新闻、宏观经济、个股分析），裁掉其他主题的工具\n"
+        "3. web_search 始终保留（万能兜底）\n"
+        "4. 返回纯JSON数组，不要任何其他内容\n"
+        "示例: [\"tushare_major_news\", \"web_search\"]"
+    )
+
+    try:
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(connect=3, read=3, write=3, pool=3),
+        )
+        resp = await client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        text = resp.choices[0].message.content.strip()
+        json_match = _re.search(r'\[.*?\]', text, _re.DOTALL)
+        if json_match:
+            import json as _json
+            filtered = _json.loads(json_match.group())
+            if isinstance(filtered, list) and len(filtered) > 0:
+                # 只保留过滤后仍在原列表中的工具（防止LLM幻觉编造工具名）
+                valid = [t for t in filtered if t in tools]
+                if valid:
+                    removed = set(tools) - set(valid)
+                    if removed:
+                        logger.info(
+                            f"QA Engine: LLM工具过滤 — 裁掉 {len(removed)} 个无关工具: {sorted(removed)}"
+                        )
+                    return valid
+    except Exception as e:
+        logger.warning(f"QA Engine: 工具过滤LLM调用失败，使用原工具列表: {e}")
+
+    return tools
 
 
 async def _assemble_with_fallback(

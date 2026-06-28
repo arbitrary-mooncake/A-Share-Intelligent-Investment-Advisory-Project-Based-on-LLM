@@ -252,9 +252,13 @@ def _get_session_cache_dir(session_id: str) -> str:
     return os.path.join(_QA_DATA_DIR, session_id, "cache")
 
 
+# 缓存版本号：数据格式化逻辑变更时递增，自动失效所有旧缓存
+_CACHE_VERSION = 2
+
+
 def _make_cache_key(tool_name: str, kwargs: dict) -> str:
-    """生成缓存键：工具名 + 参数哈希"""
-    raw = tool_name + json.dumps(kwargs, sort_keys=True, ensure_ascii=False)
+    """生成缓存键：工具名 + 参数哈希 + 版本号"""
+    raw = json.dumps([tool_name, kwargs, _CACHE_VERSION], sort_keys=True, ensure_ascii=False)
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 

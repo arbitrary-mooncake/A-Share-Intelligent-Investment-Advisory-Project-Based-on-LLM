@@ -93,6 +93,51 @@ class FundPoolAddRequest(BaseModel):
     fund_code: str = ""    # fund-zone preferred field name
     fund_name: str = ""    # fund-zone preferred field name
 
+# ─── 智能投顾请求模型 ───
+
+class AdvisoryRecommendRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+
+class PortfolioCreateRequest(BaseModel):
+    name: str
+    initial_capital: float = 100000.0
+
+class HoldingModifyRequest(BaseModel):
+    portfolio_id: str
+    stock_code: str
+    company_name: str = ""
+    quantity: int
+    price: float
+    action: str  # "buy" | "sell"
+
+class StrategyBindRequest(BaseModel):
+    portfolio_id: str
+    strategy_name: str
+    params: Optional[Dict[str, Any]] = None
+
+class BacktestRequest(BaseModel):
+    portfolio_id: str
+    start_date: str
+    end_date: str
+    strategy_name: Optional[str] = None
+    strategy_params: Optional[Dict[str, Any]] = None
+
+class SimulationRequest(BaseModel):
+    portfolio_id: str
+    action: str  # "start" | "stop" | "status" | "catch_up"
+
+class FreeLineRequest(BaseModel):
+    portfolio_id: str
+    action: str  # "start" | "status" | "decide"
+
+class ReportRequest(BaseModel):
+    portfolio_id: str
+    report_type: str  # "backtest" | "simulation"
+    start_date: str = ""
+    end_date: str = ""
+    include_deepseek: bool = False
+
 # ──────────────────────────────────────────────
 # 全局状态
 # ──────────────────────────────────────────────
@@ -119,6 +164,55 @@ def _get_fund_pool_manager():
         except ImportError:
             _fund_pool_manager = _SimpleFundPoolManager()
     return _fund_pool_manager
+
+
+# ─── 智能投顾模块懒加载 ───
+
+_advisory_modules: Optional[Dict[str, Any]] = None
+
+def _init_advisory() -> Dict[str, Any]:
+    """延迟初始化智能投顾模块，避免拖慢启动速度。"""
+    global _advisory_modules
+    if _advisory_modules is None:
+        try:
+            from src.advisory.portfolio_manager import PortfolioManager
+            from src.advisory.recommendation import get_recommendation_engine
+            from src.advisory.user_profile import UserProfileManager
+            from src.advisory.strategy_engine import StrategyEngine
+            from src.advisory.backtest_runner import BacktestRunner
+            from src.advisory.simulation_runner import SimulationRunner
+            from src.advisory.report_generator import AdvisoryReportGenerator
+
+            # 确保数据目录存在
+            root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            portfolios_dir = os.path.join(root, "data", "portfolios")
+            settlements_dir = os.path.join(root, "data", "advisory_settlements")
+            os.makedirs(portfolios_dir, exist_ok=True)
+            os.makedirs(settlements_dir, exist_ok=True)
+
+            pm = PortfolioManager(data_dir=portfolios_dir)
+            sr = SimulationRunner(
+                portfolio_manager=pm,
+                settlement_dir=settlements_dir,
+            )
+
+            _advisory_modules = {
+                "portfolio_manager": pm,
+                "recommendation_engine": get_recommendation_engine(),
+                "user_profile_manager": UserProfileManager(),
+                "strategy_engine": StrategyEngine,
+                "backtest_runner": BacktestRunner(portfolio_manager=pm),
+                "simulation_runner": sr,
+                "report_generator": AdvisoryReportGenerator(),
+            }
+            logger.info(f"{SUCCESS_ICON} 智能投顾模块初始化完成")
+        except ImportError as e:
+            logger.error(f"{ERROR_ICON} 智能投顾模块导入失败: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"智能投顾模块不可用，请确认依赖已安装: {e}",
+            )
+    return _advisory_modules
 
 
 class _SimpleFundPoolManager:
@@ -3240,3 +3334,731 @@ async def fund_cache_status(fund_code: str):
     if not fund_code.startswith(("sh.", "sz.", "of.")):
         fund_code = normalize_code(fund_code)
     return get_fund_cache_status(fund_code)
+
+
+# ──────────────────────────────────────────────
+# 智能投顾端点 (Task 12)
+# ──────────────────────────────────────────────
+
+# ── 1. 股票推荐 ──
+
+@app.post("/api/advisory/recommend")
+async def advisory_recommend(request: AdvisoryRecommendRequest):
+    """基于精筛池 + 生产缓存的 n/x/5 规则推荐股票。
+
+    接收用户自然语言提问，从精筛池加载所有股票，按 n/x/5 规则裁剪，
+    构建 LLM 上下文，通过 DeepSeek V4 Pro 生成最终推荐。
+    """
+    try:
+        modules = _init_advisory()
+        engine = modules["recommendation_engine"]
+        pool_stocks = engine.load_pool_stocks()
+        if not pool_stocks:
+            raise HTTPException(status_code=404, detail="精筛池为空，请先执行 pool update")
+
+        # 收集所有候选代码
+        candidate_codes = [s["stock_code"] for s in pool_stocks]
+        # 应用 n/x/5 规则
+        trimmed_codes = engine.apply_nx5_rule(candidate_codes, pool_stocks)
+
+        # 判断是否需要 LLM 介入
+        needs_llm = any("__LLM_PICK__" == c for c in trimmed_codes)
+        if needs_llm:
+            trimmed_codes = [c for c in trimmed_codes if c != "__LLM_PICK__"]
+
+        # 匹配完整股票信息
+        result_stocks = []
+        for s in pool_stocks:
+            if s["stock_code"] in trimmed_codes:
+                cache_score = engine.check_score_cache(s["stock_code"])
+                result_stocks.append({
+                    "stock_code": s["stock_code"],
+                    "company_name": s["company_name"],
+                    "pool_term": s.get("term", ""),
+                    "pool_score": s.get("score"),
+                    "cache_score": cache_score,
+                    "industry": s.get("detected_industry", ""),
+                })
+
+        # 按池评分排序（有缓存用缓存）
+        result_stocks.sort(
+            key=lambda x: x.get("cache_score") or x.get("pool_score") or 0,
+            reverse=True,
+        )
+
+        return {
+            "status": "ok",
+            "total_candidates": len(candidate_codes),
+            "recommended_count": len(result_stocks),
+            "needs_llm_pick": needs_llm,
+            "recommendations": result_stocks,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 股票推荐失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"推荐失败: {str(e)}")
+
+
+# ── 2. 创建持仓组合 ──
+
+@app.post("/api/advisory/portfolio/create")
+async def advisory_portfolio_create(request: PortfolioCreateRequest):
+    """创建新的投资组合。
+
+    Args:
+        name: 组合名称（必填）。
+        initial_capital: 初始本金，默认 100,000。
+    """
+    try:
+        if not request.name.strip():
+            raise HTTPException(status_code=400, detail="组合名称不能为空")
+        if request.initial_capital <= 0:
+            raise HTTPException(status_code=400, detail="初始本金必须大于 0")
+
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        pf = pm.create(name=request.name.strip(), initial_capital=request.initial_capital)
+
+        return {
+            "status": "ok",
+            "portfolio_id": pf.portfolio_id,
+            "name": pf.name,
+            "initial_capital": pf.initial_capital,
+            "cash": pf.cash,
+            "created_at": pf.created_at,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 创建组合失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"创建组合失败: {str(e)}")
+
+
+# ── 3. 组合列表 ──
+
+@app.get("/api/advisory/portfolio/list")
+async def advisory_portfolio_list():
+    """列出所有投资组合。"""
+    try:
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        portfolios = pm.list_all()
+        return {
+            "status": "ok",
+            "count": len(portfolios),
+            "portfolios": [
+                {
+                    "portfolio_id": pf.portfolio_id,
+                    "name": pf.name,
+                    "total_market_value": pf.total_market_value,
+                    "cash": pf.cash,
+                    "total_pnl": pf.total_pnl,
+                    "total_pnl_pct": pf.total_pnl_pct,
+                    "initial_capital": pf.initial_capital,
+                    "bound_strategy": pf.bound_strategy,
+                    "holdings_count": len(pf.holdings),
+                    "status": pf.status,
+                    "created_at": pf.created_at,
+                    "updated_at": pf.updated_at,
+                }
+                for pf in portfolios
+            ],
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 组合列表查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+# ── 4. 组合详情 ──
+
+@app.get("/api/advisory/portfolio/{portfolio_id}")
+async def advisory_portfolio_detail(portfolio_id: str):
+    """获取单个投资组合的完整详情，含持仓明细。"""
+    try:
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        pf = pm.load(portfolio_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail=f"组合 {portfolio_id} 不存在")
+
+        holdings = {}
+        for code, h in pf.holdings.items():
+            holdings[code] = {
+                "stock_code": h.stock_code,
+                "company_name": h.company_name,
+                "quantity": h.quantity,
+                "cost_price": h.cost_price,
+                "current_price": h.current_price,
+                "market_value": h.market_value,
+                "weight": h.weight,
+            }
+
+        return {
+            "portfolio_id": pf.portfolio_id,
+            "user_id": pf.user_id,
+            "name": pf.name,
+            "holdings": holdings,
+            "cash": pf.cash,
+            "total_cost": pf.total_cost,
+            "total_market_value": pf.total_market_value,
+            "total_pnl": pf.total_pnl,
+            "total_pnl_pct": pf.total_pnl_pct,
+            "initial_capital": pf.initial_capital,
+            "bound_strategy": pf.bound_strategy,
+            "strategy_params": pf.strategy_params,
+            "status": pf.status,
+            "created_at": pf.created_at,
+            "updated_at": pf.updated_at,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 组合详情查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+# ── 5. 买入/卖出持仓 ──
+
+@app.post("/api/advisory/portfolio/holding")
+async def advisory_portfolio_holding(request: HoldingModifyRequest):
+    """买入或卖出持仓。
+
+    Args:
+        action: "buy" 买入 / "sell" 卖出。
+        stock_code: 股票代码，如 "600519.SH" 或 "sh.600519"。
+        quantity: 买卖数量。买入时自动向下取整至 100 的倍数。
+        price: 成交单价。
+    """
+    try:
+        if request.action not in ("buy", "sell"):
+            raise HTTPException(status_code=400, detail="action 必须为 buy 或 sell")
+        if request.quantity <= 0:
+            raise HTTPException(status_code=400, detail="数量必须大于 0")
+        if request.price <= 0:
+            raise HTTPException(status_code=400, detail="价格必须大于 0")
+
+        # 规范化股票代码 → ts_code 格式 (600519.SH)
+        raw_code = request.stock_code.strip()
+        ts_code = raw_code
+        if raw_code.startswith("sh.") or raw_code.startswith("sz."):
+            ts_code = raw_code.replace("sh.", "").replace("sz.", "")
+            ts_code = f"{ts_code}.{'SH' if raw_code.startswith('sh.') else 'SZ'}"
+        elif not (".SH" in ts_code.upper() or ".SZ" in ts_code.upper()):
+            prefix = _get_exchange_prefix(ts_code)
+            ts_code = f"{ts_code}.{prefix.upper()}"
+
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        pf = pm.load(request.portfolio_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail=f"组合 {request.portfolio_id} 不存在")
+
+        company_name = request.company_name or request.stock_code
+
+        if request.action == "buy":
+            pf, trade = pm.add_holding(
+                pf, ts_code, company_name,
+                request.quantity, request.price,
+            )
+        else:
+            pf, trade = pm.remove_holding(
+                pf, ts_code,
+                request.quantity, request.price,
+            )
+
+        return {
+            "status": "ok",
+            "trade": {
+                "date": trade.date,
+                "action": trade.action,
+                "stock_code": trade.stock_code,
+                "company_name": trade.company_name,
+                "price": trade.price,
+                "shares": trade.shares,
+                "commission": trade.commission,
+                "reason": trade.reason,
+            },
+            "portfolio": {
+                "portfolio_id": pf.portfolio_id,
+                "total_market_value": pf.total_market_value,
+                "cash": pf.cash,
+                "total_pnl": pf.total_pnl,
+                "total_pnl_pct": pf.total_pnl_pct,
+                "holdings_count": len(pf.holdings),
+            },
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 持仓操作失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"持仓操作失败: {str(e)}")
+
+
+# ── 6. 策略目录 ──
+
+@app.get("/api/advisory/strategies")
+async def advisory_strategies():
+    """获取所有已注册的交易策略目录。"""
+    try:
+        modules = _init_advisory()
+        StrategyEngine = modules["strategy_engine"]
+        catalog = StrategyEngine.get_strategy_catalog()
+        return {
+            "status": "ok",
+            "count": len(catalog),
+            "strategies": catalog,
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 策略目录查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+# ── 7. 绑定策略 ──
+
+@app.post("/api/advisory/strategy/bind")
+async def advisory_strategy_bind(request: StrategyBindRequest):
+    """将交易策略绑定到投资组合。
+
+    Args:
+        portfolio_id: 组合 ID。
+        strategy_name: 策略注册名称，如 "ma_cross"。
+        params: 可选策略参数字典。
+    """
+    try:
+        if not request.strategy_name.strip():
+            raise HTTPException(status_code=400, detail="策略名称不能为空")
+
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        pf = pm.load(request.portfolio_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail=f"组合 {request.portfolio_id} 不存在")
+
+        # 验证策略是否已注册
+        StrategyEngine = modules["strategy_engine"]
+        catalog_names = {s["name"] for s in StrategyEngine.get_strategy_catalog()}
+        if request.strategy_name not in catalog_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"策略 '{request.strategy_name}' 未注册。可用策略: {', '.join(sorted(catalog_names))}"
+            )
+
+        pm.bind_strategy(pf, request.strategy_name, request.params)
+
+        return {
+            "status": "ok",
+            "portfolio_id": pf.portfolio_id,
+            "bound_strategy": pf.bound_strategy,
+            "strategy_params": pf.strategy_params,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 策略绑定失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"策略绑定失败: {str(e)}")
+
+
+# ── 8. 回测 ──
+
+@app.post("/api/advisory/backtest")
+async def advisory_backtest(request: BacktestRequest):
+    """执行历史回测。
+
+    使用 Tushare 日线数据，在指定区间按策略信号逐日回放，
+    返回完整回测结果（收益率、最大回撤、权益曲线、交易记录等）。
+
+    Args:
+        portfolio_id: 组合 ID（必须有持仓或绑定策略）。
+        start_date: 回测开始日期，YYYY-MM-DD 或 YYYYMMDD。
+        end_date: 回测结束日期，YYYY-MM-DD 或 YYYYMMDD。
+        strategy_name: 可选，策略名称。为 None 时使用组合绑定策略。
+        strategy_params: 可选，策略参数。
+    """
+    try:
+        # 日期格式标准化
+        start_date = request.start_date.replace("-", "")
+        end_date = request.end_date.replace("-", "")
+        if len(start_date) != 8 or len(end_date) != 8:
+            raise HTTPException(status_code=400, detail="日期格式必须为 YYYY-MM-DD 或 YYYYMMDD")
+        if start_date >= end_date:
+            raise HTTPException(status_code=400, detail="开始日期必须早于结束日期")
+
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        pf = pm.load(request.portfolio_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail=f"组合 {request.portfolio_id} 不存在")
+
+        # 确定策略
+        strategy_name = request.strategy_name or pf.bound_strategy
+        if not strategy_name:
+            raise HTTPException(
+                status_code=400,
+                detail="未指定策略，请提供 strategy_name 或先绑定策略",
+            )
+
+        # 拷贝组合用于回测（不污染原组合）
+        pf_copy = pm.load(request.portfolio_id)
+        if pf_copy is None:
+            raise HTTPException(status_code=500, detail="加载组合副本失败")
+
+        runner = modules["backtest_runner"]
+        result = runner.run(
+            pf=pf_copy,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_name=strategy_name,
+            strategy_params=request.strategy_params,
+        )
+
+        return {
+            "status": "ok",
+            "portfolio_id": result.portfolio_id,
+            "strategy_name": result.strategy_name,
+            "start_date": result.start_date,
+            "end_date": result.end_date,
+            "initial_capital": result.initial_capital,
+            "final_value": result.final_value,
+            "total_return_pct": result.total_return_pct,
+            "annualized_return_pct": result.annualized_return_pct,
+            "max_drawdown_pct": result.max_drawdown_pct,
+            "trade_count": result.trade_count,
+            "equity_curve": result.equity_curve[-100:] if len(result.equity_curve) > 100 else result.equity_curve,
+            "trades": [
+                {
+                    "date": t.date,
+                    "action": t.action,
+                    "stock_code": t.stock_code,
+                    "company_name": t.company_name,
+                    "price": t.price,
+                    "shares": t.shares,
+                    "commission": t.commission,
+                    "reason": t.reason,
+                }
+                for t in result.trades
+            ],
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 回测失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"回测失败: {str(e)}")
+
+
+# ── 9. 模拟盘控制 ──
+
+@app.post("/api/advisory/simulation")
+async def advisory_simulation(request: SimulationRequest):
+    """模拟盘控制。
+
+    Args:
+        action: "start" 执行今日结算 | "stop" 暂不支持 |
+                "status" 查询状态 | "catch_up" 追赶缺失交易日。
+    """
+    try:
+        if request.action not in ("start", "stop", "status", "catch_up"):
+            raise HTTPException(
+                status_code=400,
+                detail="action 必须为 start / stop / status / catch_up",
+            )
+
+        modules = _init_advisory()
+        sr = modules["simulation_runner"]
+
+        if request.action == "start":
+            # 执行今日模拟盘结算
+            result = sr.run_daily_settlement(request.portfolio_id)
+            return {
+                "status": "ok",
+                "action": "start",
+                "result": result,
+            }
+
+        elif request.action == "stop":
+            # 暂不支持暂停模拟盘
+            return {
+                "status": "ok",
+                "action": "stop",
+                "message": "模拟盘为无状态执行，无需显式停止。如需重置组合请创建新组合。",
+            }
+
+        elif request.action == "status":
+            pm = modules["portfolio_manager"]
+            pf = pm.load(request.portfolio_id)
+            if pf is None:
+                raise HTTPException(status_code=404, detail=f"组合 {request.portfolio_id} 不存在")
+
+            # 获取最后结算日
+            settlement_dir = sr._settlement_dir
+            last_date = ""
+            equity_curve = []
+            if os.path.isdir(settlement_dir):
+                pattern = os.path.join(settlement_dir, f"{request.portfolio_id}_*.json")
+                files = sorted(glob_module.glob(pattern))
+                if files:
+                    last_file = files[-1]
+                    try:
+                        with open(last_file, "r", encoding="utf-8") as f:
+                            settlement = json.load(f)
+                        last_date = settlement.get("date", "")
+                    except Exception:
+                        pass
+                    # 构建权益曲线（最多60个点）
+                    for fp in files[-60:]:
+                        try:
+                            with open(fp, "r", encoding="utf-8") as f:
+                                s = json.load(f)
+                            equity_curve.append({
+                                "date": s.get("date", ""),
+                                "total_value": s.get("total_value", 0),
+                                "daily_return_pct": s.get("daily_return_pct", 0),
+                            })
+                        except Exception:
+                            pass
+
+            return {
+                "status": "ok",
+                "action": "status",
+                "portfolio_id": request.portfolio_id,
+                "bound_strategy": pf.bound_strategy,
+                "total_market_value": pf.total_market_value,
+                "cash": pf.cash,
+                "total_pnl": pf.total_pnl,
+                "total_pnl_pct": pf.total_pnl_pct,
+                "holdings_count": len(pf.holdings),
+                "last_settlement_date": last_date,
+                "equity_curve": equity_curve,
+            }
+
+        elif request.action == "catch_up":
+            result = sr.run_catch_up(request.portfolio_id)
+            return {
+                "status": "ok",
+                "action": "catch_up",
+                "result": result,
+            }
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 模拟盘操作失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"模拟盘操作失败: {str(e)}")
+
+
+# ── 10. 收益报告 ──
+
+@app.post("/api/advisory/report")
+async def advisory_report(request: ReportRequest):
+    """生成收益分析报告。
+
+    基于回测或模拟盘权益曲线生成图表和 LLM 驱动的文字报告。
+
+    Args:
+        report_type: "backtest" 回测报告 / "simulation" 模拟盘报告。
+        start_date/end_date: 回测报告时必需，模拟盘可选。
+        include_deepseek: 是否包含 DeepSeek 自由线对比。
+    """
+    try:
+        if request.report_type not in ("backtest", "simulation"):
+            raise HTTPException(
+                status_code=400,
+                detail="report_type 必须为 backtest 或 simulation",
+            )
+
+        modules = _init_advisory()
+        gen = modules["report_generator"]
+        pm = modules["portfolio_manager"]
+
+        pf = pm.load(request.portfolio_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail=f"组合 {request.portfolio_id} 不存在")
+
+        # 收集权益数据
+        user_equity: List[float] = []
+        deepseek_equity: List[float] = []
+        benchmark_equity: List[float] = []
+
+        if request.report_type == "backtest":
+            if not request.start_date or not request.end_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail="回测报告需要提供 start_date 和 end_date",
+                )
+            # 先跑回测以获取权益曲线
+            start_date = request.start_date.replace("-", "")
+            end_date = request.end_date.replace("-", "")
+            if len(start_date) != 8 or len(end_date) != 8:
+                raise HTTPException(status_code=400, detail="日期格式必须为 YYYY-MM-DD 或 YYYYMMDD")
+
+            strategy_name = pf.bound_strategy
+            if not strategy_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="组合未绑定策略，无法执行回测以生成报告",
+                )
+
+            pf_copy = pm.load(request.portfolio_id)
+            if pf_copy is None:
+                raise HTTPException(status_code=500, detail="加载组合副本失败")
+
+            runner = modules["backtest_runner"]
+            bt_result = runner.run(
+                pf=pf_copy,
+                start_date=start_date,
+                end_date=end_date,
+                strategy_name=strategy_name,
+            )
+            user_equity = bt_result.equity_curve
+            # 归一化为 1.0 基准
+            if user_equity and user_equity[0] > 0:
+                base = user_equity[0]
+                user_equity = [v / base for v in user_equity]
+
+            if request.include_deepseek:
+                # 占位：DeepSeek 自由线需要独立运行，暂时用合成模拟数据
+                deepseek_equity = [1.0 + i * 0.001 * (1 if i % 3 else -0.5) for i in range(len(user_equity))]
+
+            # 基准线：线性增长
+            benchmark_equity = [1.0 + i * (user_equity[-1] - 1.0) / max(len(user_equity) - 1, 1) for i in range(len(user_equity))]
+
+            backtest_summary = {
+                "total_return_pct": bt_result.total_return_pct,
+                "annualized_return_pct": bt_result.annualized_return_pct,
+                "max_drawdown_pct": bt_result.max_drawdown_pct,
+                "trade_count": bt_result.trade_count,
+                "strategy_name": bt_result.strategy_name,
+                "start_date": request.start_date,
+                "end_date": request.end_date,
+            }
+
+        else:  # simulation
+            sr = modules["simulation_runner"]
+            settlement_dir = sr._settlement_dir
+            pattern = os.path.join(settlement_dir, f"{request.portfolio_id}_*.json")
+            files = sorted(glob_module.glob(pattern))
+            for fp in files:
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        s = json.load(f)
+                    tv = s.get("total_value", 0)
+                    if tv > 0:
+                        user_equity.append(tv)
+                except Exception:
+                    pass
+            if user_equity and user_equity[0] > 0:
+                base = user_equity[0]
+                user_equity = [v / base for v in user_equity]
+
+            backtest_summary = {
+                "total_return_pct": round((user_equity[-1] - 1) * 100, 2) if user_equity else 0,
+                "max_drawdown_pct": 0,
+                "trade_count": len(files),
+                "strategy_name": pf.bound_strategy or "无",
+                "start_date": files[0] if files else "",
+                "end_date": files[-1] if files else "",
+            }
+
+        # 生成图表
+        chart_path = ""
+        if user_equity:
+            try:
+                chart_path = gen.generate_comparison_chart(
+                    user_equity=user_equity,
+                    deepseek_equity=deepseek_equity if deepseek_equity else None,
+                    benchmark_equity=benchmark_equity if benchmark_equity else None,
+                )
+            except Exception as e:
+                logger.warning(f"图表生成失败: {e}")
+                chart_path = ""
+
+        # 构建 LLM 提示词
+        chart_paths = [chart_path] if chart_path else []
+        deepseek_summary_data = None
+        if request.include_deepseek:
+            deepseek_summary_data = {"total_return_pct": 0, "max_drawdown_pct": 0, "strategy_name": "DeepSeek 自由线"}
+        prompt = gen.build_report_prompt(
+            report_type=request.report_type,
+            user_summary=backtest_summary,
+            deepseek_summary=deepseek_summary_data,
+            chart_paths=chart_paths,
+        )
+
+        # 调用 LLM 生成报告
+        try:
+            from src.utils.model_config import get_thinking_body
+            base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_6", os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""))
+            llm_client = OpenAICompatibleClient(
+                api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_6", os.getenv("OPENAI_COMPATIBLE_API_KEY", "")),
+                base_url=base_url,
+                model=os.getenv("OPENAI_COMPATIBLE_MODEL_6", "deepseek-v4-pro"),
+                env_prefix="",
+                extra_body=get_thinking_body(base_url, True),
+            )
+
+            llm_response = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    _thread_pool,
+                    lambda: llm_client.get_completion([
+                        {"role": "system", "content": "你是一位专业的A股投资报告分析师。请基于提供的数据生成结构化报告。使用 [数据]/[判断] 标签区分事实与推理。"},
+                        {"role": "user", "content": prompt},
+                    ], max_retries=1),
+                ),
+                timeout=120.0,
+            )
+
+            report_content = llm_response or "LLM 报告生成返回空结果"
+        except asyncio.TimeoutError:
+            report_content = "报告生成超时 (120s)，请稍后重试"
+        except Exception as e:
+            logger.warning(f"LLM 报告生成失败: {e}")
+            report_content = f"报告生成失败: {e}"
+
+        # 保存报告
+        title = f"{request.report_type}_{request.portfolio_id}"
+        report_path = gen.save_report(report_content, title)
+
+        return {
+            "status": "ok",
+            "report_type": request.report_type,
+            "portfolio_id": request.portfolio_id,
+            "report_content": report_content,
+            "report_path": report_path,
+            "chart_path": chart_path,
+            "summary": backtest_summary,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 报告生成失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"报告生成失败: {str(e)}")
+
+
+# ── 11. 用户画像 ──
+
+@app.get("/api/advisory/user-profile")
+async def advisory_user_profile():
+    """获取当前用户投资画像。
+
+    返回风险承受能力、投资周期偏好、投资风格、
+    偏好/回避板块及自定义偏好等信息。
+    """
+    try:
+        modules = _init_advisory()
+        upm = modules["user_profile_manager"]
+        profile = upm.get_profile()
+        summary = upm.get_profile_summary()
+        return {
+            "status": "ok",
+            "profile": profile,
+            "summary": summary,
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 用户画像查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")

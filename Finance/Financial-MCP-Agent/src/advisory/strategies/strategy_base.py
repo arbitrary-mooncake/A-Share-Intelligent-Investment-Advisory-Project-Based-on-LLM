@@ -77,7 +77,7 @@ class TradingStrategy(ABC):
         """
         return float(params.get("position_fraction", 1.0))
 
-    @classmethod
-    def _na(cls, *values) -> bool:
+    @staticmethod
+    def _na(*values) -> bool:
         """检查任意值是否为 NaN。"""
         return any(pd.isna(v) for v in values)

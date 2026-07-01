@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,8 @@ from src.advisory.portfolio_manager import PortfolioManager
 from src.advisory.strategy_engine import StrategyEngine
 from src.utils.tushare_client import _call, _items_to_dicts
 
+
+logger = logging.getLogger(__name__)
 
 # Tushare daily API 请求字段
 _DAILY_FIELDS = (
@@ -174,12 +177,22 @@ class SimulationRunner:
                     except Exception:
                         sig, reason = 0, "信号计算失败"
 
-                    # 模拟盘以当日开盘价执行（收盘后结算视角，简化处理）
-                    if sig == 1 and position == 0:
-                        company_name = name_map.get(code, code)
+                    # 模型3 时序：T 日收盘信号 → T+1 日开盘价执行
+                    # 尝试获取下一交易日开盘价；实时运行时不可得则退回当日收盘价
+                    next_day_data = self._fetch_single_stock(code, self._next_trade_date(date))
+                    if next_day_data is not None and next_day_data.get("open") is not None:
+                        exec_price = float(next_day_data["open"])
+                    else:
+                        logger.warning(
+                            "模拟盘 %s: %s 下一交易日数据不可得，退回当日收盘价 %.2f 执行",
+                            date, code, today_close or 0.0,
+                        )
                         exec_price = self._safe_float(
                             today_data.get("open"), today_close
                         )
+
+                    if sig == 1 and position == 0:
+                        company_name = name_map.get(code, code)
                         try:
                             pf, trade = self.portfolio_manager.add_holding(
                                 pf, code, company_name, 100, exec_price
@@ -199,9 +212,6 @@ class SimulationRunner:
 
                     elif sig == -1 and position > 0:
                         company_name = name_map.get(code, code)
-                        exec_price = self._safe_float(
-                            today_data.get("open"), today_close
-                        )
                         try:
                             pf, trade = self.portfolio_manager.remove_holding(
                                 pf, code, position, exec_price
@@ -454,3 +464,19 @@ class SimulationRunner:
             return float(value)
         except (ValueError, TypeError):
             return fallback
+
+    @staticmethod
+    def _next_trade_date(date: str) -> str:
+        """推算下一交易日（YYYY-MM-DD）。
+
+        基于日历日递增，最多尝试 5 天以跳过周末/节假日。
+        不保证精确（不调用 trade_cal），仅用于实时模拟的尽力尝试。
+
+        Args:
+            date: 当前日期 YYYY-MM-DD。
+
+        Returns:
+            推测的下一交易日 YYYY-MM-DD。
+        """
+        dt = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
+        return dt.strftime("%Y-%m-%d")

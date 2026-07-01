@@ -108,7 +108,9 @@ class StrategyEngine:
         if position > 0:
             exit_signal = strategy.risk_exit(curr_row, prev_row, params, context)
             if exit_signal == -1:
-                reason = _build_reason(strategy_name, "risk_exit", curr_row, prev_row, params)
+                reason_params = dict(params)
+                reason_params["_reason_risk_exit"] = True
+                reason = _build_reason(strategy_name, -1, curr_row, prev_row, reason_params)
                 return -1, reason
 
         # 6. 计算开仓/平仓信号

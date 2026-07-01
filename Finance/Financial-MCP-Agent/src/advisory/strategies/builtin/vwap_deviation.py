@@ -32,12 +32,15 @@ class VwapDeviation(TradingStrategy):
         if prev_row is None:
             return 0
         deviation = float(params.get("deviation", 0.02))
-        if self._na(row["vwap_approx"], row["close"]):
+        if self._na(row["vwap_approx"], row["close"],
+                     prev_row["vwap_approx"], prev_row["close"]):
             return 0
         buy_threshold = row["vwap_approx"] * (1.0 - deviation)
         sell_threshold = row["vwap_approx"] * (1.0 + deviation)
-        if row["close"] < buy_threshold:
+        # 均线回归交叉触发：仅在价格从阈值上方穿入下方时买入
+        if prev_row["close"] >= buy_threshold and row["close"] < buy_threshold:
             return 1
-        if row["close"] > sell_threshold:
+        # 均线回归交叉触发：仅在价格从阈值下方穿入上方时卖出
+        if prev_row["close"] <= sell_threshold and row["close"] > sell_threshold:
             return -1
         return 0

@@ -53,7 +53,7 @@ class UserProfileManager:
                 if key not in data:
                     data[key] = default[key]
             return data
-        except (json.JSONDecodeError, IOError, Exception):
+        except Exception:
             return self._default_profile()
 
     @staticmethod

@@ -97,6 +97,7 @@ class TradeRecord:
     price: float = 0.0
     shares: int = 0
     commission: float = 0.0
+    stamp_tax: float = 0.0
     reason: str = ""              # 交易原因说明
 
 

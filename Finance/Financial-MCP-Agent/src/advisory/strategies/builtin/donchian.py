@@ -29,7 +29,8 @@ class Donchian(TradingStrategy):
         if prev_row is None:
             return 0
         if self._na(row["dc_upper"], row["dc_lower"],
-                     prev_row["dc_upper"], prev_row["dc_lower"]):
+                     prev_row["dc_upper"], prev_row["dc_lower"],
+                     prev_row["close"], row["close"]):
             return 0
         if prev_row["close"] <= prev_row["dc_upper"] and row["close"] > row["dc_upper"]:
             return 1

@@ -331,6 +331,7 @@ class PortfolioManager:
             price=price,
             shares=quantity,
             commission=commission,
+            stamp_tax=stamp_tax,
             reason=f"卖出 {company_name} ({stock_code}) {quantity}股, "
                    f"成交价 {price:.2f}",
         )

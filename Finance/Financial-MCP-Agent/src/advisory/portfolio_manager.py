@@ -175,6 +175,7 @@ class PortfolioManager:
         company_name: str,
         quantity: int,
         price: float,
+        trade_date: Optional[str] = None,
     ) -> Tuple[AdvisoryPortfolio, TradeRecord]:
         """买入持仓 — 执行买入交易。
 
@@ -193,6 +194,7 @@ class PortfolioManager:
             company_name: 公司名称。
             quantity: 请求买入数量（自动向下取整至 100 的倍数）。
             price: 成交单价。
+            trade_date: 交易日期（YYYY-MM-DD），为 None 时使用系统当前时间。
 
         Returns:
             (更新后的 AdvisoryPortfolio, TradeRecord) 元组。
@@ -246,7 +248,7 @@ class PortfolioManager:
         self.save(pf)
 
         trade = TradeRecord(
-            date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            date=trade_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             action="buy",
             stock_code=stock_code,
             company_name=company_name,
@@ -264,6 +266,7 @@ class PortfolioManager:
         stock_code: str,
         quantity: int,
         price: float,
+        trade_date: Optional[str] = None,
     ) -> Tuple[AdvisoryPortfolio, TradeRecord]:
         """卖出持仓 — 执行卖出交易。
 
@@ -280,6 +283,7 @@ class PortfolioManager:
             stock_code: 股票代码。
             quantity: 卖出数量。
             price: 成交单价。
+            trade_date: 交易日期（YYYY-MM-DD），为 None 时使用系统当前时间。
 
         Returns:
             (更新后的 AdvisoryPortfolio, TradeRecord) 元组。
@@ -308,20 +312,19 @@ class PortfolioManager:
         # 3. 增加现金
         pf.cash = round(pf.cash + net, 2)
 
-        # 4. 减少/删除持仓
+        # 4. 减少/删除持仓，同步更新剩余持仓的现价
         if quantity >= holding.quantity:
             del pf.holdings[stock_code]
         else:
             holding.quantity -= quantity
-
-        # 5. 重算
+            holding.current_price = price  # 以卖出价作为最新市价
         self._recalc_holdings(pf)
 
         # 6. 持久化
         self.save(pf)
 
         trade = TradeRecord(
-            date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            date=trade_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             action="sell",
             stock_code=stock_code,
             company_name=company_name,

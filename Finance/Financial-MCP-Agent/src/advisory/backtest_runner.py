@@ -198,12 +198,16 @@ class BacktestRunner:
                 # T+1 日开盘价执行
                 exec_price = float(next_row.iloc[0]["open"])
 
+                # T+1 日交易日期（TradeRecord 用）
+                trade_date_str = _fmt_ymd(next_date)
+
                 if sig == 1 and position == 0:
                     # 买入信号 & 无持仓 -> 开仓
                     company_name = name_map.get(code, code)
                     try:
                         pf, trade = self.portfolio_manager.add_holding(
-                            pf, code, company_name, 100, exec_price
+                            pf, code, company_name, 100, exec_price,
+                            trade_date=trade_date_str,
                         )
                         all_trades.append(trade)
                     except (ValueError, Exception):
@@ -215,11 +219,23 @@ class BacktestRunner:
                     company_name = name_map.get(code, code)
                     try:
                         pf, trade = self.portfolio_manager.remove_holding(
-                            pf, code, position, exec_price
+                            pf, code, position, exec_price,
+                            trade_date=trade_date_str,
                         )
                         all_trades.append(trade)
                     except (ValueError, Exception):
                         continue
+
+            # Mark-to-market: 将所有持仓按当日收盘价重估
+            # (修复：无交易时 current_price 不更新的 bug)
+            for code, h in list(pf.holdings.items()):
+                close_rows = daily_data[
+                    (daily_data["ts_code"] == code)
+                    & (daily_data["trade_date"] == date)
+                ]
+                if not close_rows.empty:
+                    h.current_price = float(close_rows.iloc[0]["close"])
+            self.portfolio_manager._recalc_holdings(pf)
 
             # 记录当日权益
             daily_value = pf.cash + sum(
@@ -361,6 +377,13 @@ def _shift_date(date_str: str, days: int) -> str:
     """
     dt = datetime.strptime(date_str, "%Y%m%d") + timedelta(days=days)
     return dt.strftime("%Y%m%d")
+
+
+def _fmt_ymd(date_str: str) -> str:
+    """将 YYYYMMDD 转换为 YYYY-MM-DD 格式。"""
+    if len(date_str) != 8 or not date_str.isdigit():
+        return date_str
+    return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
 
 
 def _filter_stock_df(df: pd.DataFrame, ts_code: str) -> pd.DataFrame:

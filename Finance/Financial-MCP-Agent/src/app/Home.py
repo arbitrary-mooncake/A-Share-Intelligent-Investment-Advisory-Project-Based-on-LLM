@@ -1,5 +1,5 @@
 """
-Streamlit 入口页 — 五大功能导航中心
+Streamlit 入口页 — 七大功能导航中心
 """
 import streamlit as st
 
@@ -8,6 +8,18 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
+
+# ── 侧边栏导航 ─────────────────────────────────
+with st.sidebar:
+    st.page_link("Home.py", label="🏠 首页", use_container_width=True)
+    st.markdown("---")
+    st.page_link("pages/01_股票查询.py", label="🔍 股票查询", use_container_width=True)
+    st.page_link("pages/02_股票池.py", label="📊 股票池", use_container_width=True)
+    st.page_link("pages/03_批量打分.py", label="📋 批量打分", use_container_width=True)
+    st.page_link("pages/04_智能问答.py", label="💬 智能问答", use_container_width=True)
+    st.page_link("pages/05_基金专区.py", label="🏦 基金专区", use_container_width=True)
+    st.page_link("pages/06_模拟分析与迭代.py", label="📈 模拟分析与迭代", use_container_width=True)
+    st.page_link("pages/07_智能投顾.py", label="🤖 智能投顾", use_container_width=True)
 
 st.title("📈 AI 投资研究助手")
 st.caption("A股智能分析平台 — AI驱动，数据支撑，仅供参考")

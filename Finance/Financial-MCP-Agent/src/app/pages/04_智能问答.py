@@ -1,5 +1,9 @@
 """
 AI 智能问答 — ChatGPT 风格：左侧会话列表 + 底部输入框 + 自动命名
+
+系统提示词中的智能投顾引导规则定义在 `src/qa/answer_generator.py` 的
+`_build_system_prompt()` 函数中（规则 #10），用于检测持仓组合管理/策略配置/
+回测模拟盘/调仓操作等投顾独占问题，引导用户移步「智能投顾」板块。
 """
 import os
 import sys

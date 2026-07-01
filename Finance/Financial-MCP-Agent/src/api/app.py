@@ -3921,13 +3921,6 @@ async def advisory_report(request: ReportRequest):
                 base = user_equity[0]
                 user_equity = [v / base for v in user_equity]
 
-            if request.include_deepseek:
-                # 占位：DeepSeek 自由线需要独立运行，暂时用合成模拟数据
-                deepseek_equity = [1.0 + i * 0.001 * (1 if i % 3 else -0.5) for i in range(len(user_equity))]
-
-            # 基准线：线性增长
-            benchmark_equity = [1.0 + i * (user_equity[-1] - 1.0) / max(len(user_equity) - 1, 1) for i in range(len(user_equity))]
-
             backtest_summary = {
                 "total_return_pct": bt_result.total_return_pct,
                 "annualized_return_pct": bt_result.annualized_return_pct,
@@ -3969,10 +3962,18 @@ async def advisory_report(request: ReportRequest):
         chart_path = ""
         if user_equity:
             try:
+                # 仅当有真实对照数据时才传入，不合成假数据
+                has_comparison = bool(deepseek_equity or benchmark_equity)
+                chart_title = (
+                    "收益对比图"
+                    if has_comparison
+                    else "收益对比图（无对照数据）"
+                )
                 chart_path = gen.generate_comparison_chart(
                     user_equity=user_equity,
                     deepseek_equity=deepseek_equity if deepseek_equity else None,
                     benchmark_equity=benchmark_equity if benchmark_equity else None,
+                    title=chart_title,
                 )
             except Exception as e:
                 logger.warning(f"图表生成失败: {e}")
@@ -3980,13 +3981,10 @@ async def advisory_report(request: ReportRequest):
 
         # 构建 LLM 提示词
         chart_paths = [chart_path] if chart_path else []
-        deepseek_summary_data = None
-        if request.include_deepseek:
-            deepseek_summary_data = {"total_return_pct": 0, "max_drawdown_pct": 0, "strategy_name": "DeepSeek 自由线"}
         prompt = gen.build_report_prompt(
             report_type=request.report_type,
             user_summary=backtest_summary,
-            deepseek_summary=deepseek_summary_data,
+            deepseek_summary=None,  # 仅在有真实 DeepSeek 自由线数据时传入
             chart_paths=chart_paths,
         )
 

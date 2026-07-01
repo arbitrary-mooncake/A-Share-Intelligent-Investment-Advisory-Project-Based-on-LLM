@@ -340,6 +340,21 @@ class PortfolioManager:
     # Holdings recalculation
     # ------------------------------------------------------------------
 
+    def recalc(self, pf: AdvisoryPortfolio) -> AdvisoryPortfolio:
+        """公开的重算接口 — 委托给 ``_recalc_holdings`` 并返回 pf。
+
+        供 backtest_runner / simulation_runner 等外部调用者使用，
+        避免直接访问私有方法 ``_recalc_holdings``。
+
+        Args:
+            pf: 投资组合（会被原地修改）。
+
+        Returns:
+            原地修改后的同一 AdvisoryPortfolio 引用（便于链式调用）。
+        """
+        self._recalc_holdings(pf)
+        return pf
+
     def _recalc_holdings(self, pf: AdvisoryPortfolio) -> None:
         """重算持仓组合的市值、权重和总体盈亏。
 

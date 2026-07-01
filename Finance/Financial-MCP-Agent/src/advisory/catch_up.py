@@ -19,7 +19,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 
-from src.utils.tushare_client import _call
+from src.utils.tushare_client import _call, _items_to_dicts
 
 
 class CatchUpDetector:
@@ -189,13 +189,12 @@ class CatchUpDetector:
             fields="cal_date,is_open",
         )
 
-        if not result or "items" not in result:
+        items = _items_to_dicts(result)
+        if not items:
             return []
 
-        fields = result.get("fields", [])
         days: List[str] = []
-        for row in result["items"]:
-            item = dict(zip(fields, row))
+        for item in items:
             is_open = item.get("is_open")
             if is_open is not None and int(is_open) == 1:
                 cal_date = str(item.get("cal_date", ""))

@@ -228,7 +228,7 @@ class SimulationRunner:
                     h.current_price = float(close_val)
 
         # 6. 重算组合
-        self.portfolio_manager._recalc_holdings(pf)
+        self.portfolio_manager.recalc(pf)
         self.portfolio_manager.save(pf)
 
         # 7. 计算日收益率

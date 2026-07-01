@@ -77,6 +77,7 @@ class BacktestRunner:
         end_date: str,
         strategy_name: Optional[str] = None,
         strategy_params: Optional[Dict[str, Any]] = None,
+        watchlist_codes: Optional[List[str]] = None,
     ) -> BacktestResult:
         """执行历史回测。
 
@@ -91,6 +92,9 @@ class BacktestRunner:
             strategy_name: 策略注册名称，如 ``"ma_cross"``。
                            None 时尝试使用 ``pf.bound_strategy``。
             strategy_params: 策略参数字典。None 时使用策略默认参数。
+            watchlist_codes: 可交易股票列表（ts_code）。为 None 时从
+                             daily_data 的所有 ts_code 推导，确保策略
+                             买入信号不局限于初始持仓。
 
         Returns:
             BacktestResult 包含完整回测结果。
@@ -111,10 +115,8 @@ class BacktestRunner:
             for k, v in pf.strategy_params.items():
                 strategy_params.setdefault(k, v)
 
-        # ---- 2. 收集持仓股票代码 ----
-        stock_codes = list(pf.holdings.keys())
-        if not stock_codes:
-            raise ValueError("投资组合中无持仓，无法执行回测")
+        # ---- 2. 收集初始持仓股票代码 ----
+        initial_holding_codes = list(pf.holdings.keys())
 
         # 保存公司名称索引（持有被清仓后仍可找回名称）
         name_map: Dict[str, str] = {
@@ -122,10 +124,23 @@ class BacktestRunner:
         }
 
         # ---- 3. 拉取日线数据（含 400 天预热） ----
+        # 使用 watchlist_codes 扩展可交易范围，避免策略买入信号无法交易
+        fetch_codes = list(set(
+            (watchlist_codes or []) + initial_holding_codes
+        ))
+        if not fetch_codes:
+            raise ValueError("watchlist_codes 和持仓均为空，无法执行回测")
+
         warmup_start = _shift_date(start_date, -400)
-        daily_data = self._fetch_daily_data(stock_codes, warmup_start, end_date)
+        daily_data = self._fetch_daily_data(fetch_codes, warmup_start, end_date)
         if daily_data.empty:
             raise ValueError("未能拉取到任何日线数据，请检查 Tushare 连接")
+
+        # 可交易范围：watchlist_codes 或 daily_data 中的所有代码
+        if watchlist_codes:
+            tradeable_codes = list(watchlist_codes)
+        else:
+            tradeable_codes = sorted(daily_data["ts_code"].unique())
 
         # ---- 4. 获取回测区间内的交易日 ----
         all_dates = sorted(daily_data["trade_date"].unique())
@@ -147,13 +162,31 @@ class BacktestRunner:
         all_trades: List[TradeRecord] = []
 
         for i, date in enumerate(target_dates):
-            # 最后一个交易日无法执行次日开盘交易
+            # Mark-to-market：先以当日收盘价重估所有持仓
+            # （修复：无交易时 current_price 不更新的 bug）
+            for code, h in list(pf.holdings.items()):
+                close_rows = daily_data[
+                    (daily_data["ts_code"] == code)
+                    & (daily_data["trade_date"] == date)
+                ]
+                if not close_rows.empty:
+                    h.current_price = float(close_rows.iloc[0]["close"])
+            self.portfolio_manager.recalc(pf)
+
+            # 记录当日权益
+            daily_value = pf.cash + sum(
+                h.quantity * h.current_price
+                for h in pf.holdings.values()
+            )
+            equity_curve.append(daily_value)
+
+            # 最后一个交易日：已完成 mark-to-market，跳过交易执行
             if i >= len(target_dates) - 1:
                 break
             next_date = target_dates[i + 1]
 
-            # 逐股计算信号并交易
-            for code in stock_codes:
+            # 逐股计算信号并交易（使用扩展后的可交易范围）
+            for code in tradeable_codes:
                 stock_df = _filter_stock_df(daily_data, code)
                 if stock_df.empty:
                     continue
@@ -225,24 +258,6 @@ class BacktestRunner:
                         all_trades.append(trade)
                     except (ValueError, Exception):
                         continue
-
-            # Mark-to-market: 将所有持仓按当日收盘价重估
-            # (修复：无交易时 current_price 不更新的 bug)
-            for code, h in list(pf.holdings.items()):
-                close_rows = daily_data[
-                    (daily_data["ts_code"] == code)
-                    & (daily_data["trade_date"] == date)
-                ]
-                if not close_rows.empty:
-                    h.current_price = float(close_rows.iloc[0]["close"])
-            self.portfolio_manager._recalc_holdings(pf)
-
-            # 记录当日权益
-            daily_value = pf.cash + sum(
-                h.quantity * h.current_price
-                for h in pf.holdings.values()
-            )
-            equity_curve.append(daily_value)
 
         # ---- 7. 计算结果指标 ----
         final_value = equity_curve[-1]

@@ -13,11 +13,15 @@ Usage:
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
+from src.advisory.strategies.strategy_base import TradingStrategy
 from src.advisory.strategies.strategy_registry import StrategyRegistry, get_strategy_class
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyEngine:
@@ -66,6 +70,17 @@ class StrategyEngine:
                 f"{', '.join(StrategyRegistry.list_names())}"
             )
         strategy = strategy_cls()
+
+        # 当策略覆盖了 risk_exit 但上下文为空时发出调试日志
+        if (
+            type(strategy).risk_exit is not TradingStrategy.risk_exit
+            and not context.get("position")
+        ):
+            logger.debug(
+                "策略 '%s' 覆盖了 risk_exit，但传入的 context 缺少 position，"
+                "风险退出逻辑可能被静默跳过。",
+                strategy_name,
+            )
 
         # 2. 校验 DataFrame
         if df_daily is None or df_daily.empty:

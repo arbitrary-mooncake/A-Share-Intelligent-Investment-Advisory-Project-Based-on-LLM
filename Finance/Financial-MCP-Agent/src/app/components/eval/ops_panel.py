@@ -139,7 +139,7 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
                                 f"精筛池[{pool_term}]更新完成！"
                                 f"共{job.get('progress', {}).get('result', {}).get('final_pool_size', 0)}只"
                             )
-                            break
+                            st.rerun()
                         if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value):
                             status_box.update(label="更新失败", state="error")
                             st.error(job.get("error") or f"任务状态: {status}")
@@ -148,8 +148,6 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
                             break
 
                         time.sleep(1.0)
-
-                    st.rerun()
                 except Exception as e:
                     progress_bar.progress(100, text="失败")
                     status_box.update(label="更新失败", state="error")

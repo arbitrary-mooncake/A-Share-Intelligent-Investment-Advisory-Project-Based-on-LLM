@@ -84,10 +84,10 @@ def main() -> None:
     result = asyncio.run(
         orch.run_pool_update(term, on_progress=on_progress, on_stage=on_stage)
     )
+    writer.merge_progress({"result": _json_safe(result)})
     writer.update(
         status=JobStatus.COMPLETED.value,
         finished_at=datetime.datetime.now().isoformat(),
-        progress={"result": _json_safe(result)},
     )
     logger.info("pool_update_worker completed: job_id=%s", job_id)
 

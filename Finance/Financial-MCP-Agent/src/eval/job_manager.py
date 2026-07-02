@@ -219,7 +219,6 @@ def _spawn_worker(
         ]
 
     kwargs: Dict[str, Any] = dict(
-        stdout=open(log_path, "w", encoding="utf-8"),
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         close_fds=True,
@@ -233,7 +232,12 @@ def _spawn_worker(
     else:
         kwargs["start_new_session"] = True
 
-    return subprocess.Popen(cmd, **kwargs)
+    log_fh = open(log_path, "w", encoding="utf-8")
+    try:
+        return subprocess.Popen(cmd, stdout=log_fh, **kwargs)
+    except Exception:
+        log_fh.close()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +282,12 @@ class JobManager:
         except Exception:
             return None
         if detect_orphan(data):
-            data["status"] = JobStatus.ORPHANED.value
-            data["finished_at"] = datetime.now().isoformat()
-            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            orphan_writer = AtomicJobWriter(job_id)
+            orphan_writer.update(
+                status=JobStatus.ORPHANED.value,
+                finished_at=datetime.now().isoformat(),
+            )
+            data = orphan_writer.read()
         return data
 
     def find_running(self, term: str) -> Optional[Dict[str, Any]]:
@@ -292,8 +299,11 @@ class JobManager:
                 continue
             if data.get("status") == "running":
                 if detect_orphan(data):
-                    data["status"] = JobStatus.ORPHANED.value
-                    f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    orphan_writer = AtomicJobWriter(data["job_id"])
+                    orphan_writer.update(
+                        status=JobStatus.ORPHANED.value,
+                        finished_at=datetime.now().isoformat(),
+                    )
                     continue
                 return data
         return None

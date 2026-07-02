@@ -190,3 +190,85 @@ def test_detect_orphan_false_for_completed(tmp_path, monkeypatch):
     }
     # 非 running 不应被误判
     assert jm.detect_orphan(job_dict) is False
+
+
+# ---- Task 4: JobManager facade tests ----
+
+
+def test_jobmanager_start_creates_running_job(tmp_path, monkeypatch):
+    import src.eval.job_manager as jm
+    monkeypatch.setattr(jm, "JOB_DIR", tmp_path)
+    jm.ensure_job_dir()
+
+    # 用一个不会真跑 pool_update 的假 worker
+    fake = tmp_path / "fake.py"
+    fake.write_text("import time; time.sleep(2)\n", encoding="utf-8")
+    _orig_spawn = jm._spawn_worker
+    monkeypatch.setattr(
+        jm, "_spawn_worker",
+        lambda job_id, term, log_path, worker_module_override=None:
+            _orig_spawn(job_id, term, log_path, worker_module_override=str(fake))
+    )
+
+    mgr = jm.JobManager()
+    jid = mgr.start_job("medium")
+    assert jid.startswith("pool_update_medium_")
+    job = mgr.poll(jid)
+    assert job["status"] in ("pending", "running")
+
+
+def test_jobmanager_find_running_returns_same(tmp_path, monkeypatch):
+    import src.eval.job_manager as jm
+    monkeypatch.setattr(jm, "JOB_DIR", tmp_path)
+    jm.ensure_job_dir()
+
+    # 手写一个 running job 文件
+    jid = "pool_update_short_20260702_143052_abcd"
+    (tmp_path / f"{jid}.json").write_text(json.dumps({
+        "job_id": jid, "term": "short", "status": "running",
+        "pid": os.getpid(), "parent_pid": os.getpid(),
+        "started_at": "2026-07-02T14:30:52",
+        "progress": {}, "completed_stocks": [],
+    }), encoding="utf-8")
+
+    mgr = jm.JobManager()
+    found = mgr.find_running("short")
+    assert found and found["job_id"] == jid
+
+
+def test_jobmanager_poll_marks_orphan(tmp_path, monkeypatch):
+    import src.eval.job_manager as jm
+    monkeypatch.setattr(jm, "JOB_DIR", tmp_path)
+    jm.ensure_job_dir()
+
+    jid = "pool_update_short_20260702_143052_abcd"
+    (tmp_path / f"{jid}.json").write_text(json.dumps({
+        "job_id": jid, "term": "short", "status": "running",
+        "pid": 999_999_999, "parent_pid": os.getpid(),
+        "started_at": "2026-07-02T14:30:52",
+        "progress": {}, "completed_stocks": [],
+    }), encoding="utf-8")
+
+    mgr = jm.JobManager()
+    job = mgr.poll(jid)
+    assert job["status"] == "orphaned"
+
+
+def test_jobmanager_cleanup_removes_old_files(tmp_path, monkeypatch):
+    import src.eval.job_manager as jm
+    monkeypatch.setattr(jm, "JOB_DIR", tmp_path)
+    jm.ensure_job_dir()
+
+    # 造 2 个文件: 一个新一个旧
+    new_f = tmp_path / "pool_update_short_20260702_143052_new.json"
+    old_f = tmp_path / "pool_update_short_20200101_000000_old.json"
+    new_f.write_text('{"job_id":"x","term":"short","status":"completed"}', encoding="utf-8")
+    old_f.write_text('{"job_id":"y","term":"short","status":"completed"}', encoding="utf-8")
+    # 把 old_f mtime 设到 2 年前
+    old_ts = time.time() - 2 * 365 * 24 * 3600
+    os.utime(old_f, (old_ts, old_ts))
+
+    mgr = jm.JobManager()
+    mgr.cleanup()
+    assert new_f.exists()
+    assert not old_f.exists()

@@ -6,9 +6,12 @@ Worker 侧: AtomicJobWriter.update (2Hz 节流由 worker 自己控制)
 """
 from __future__ import annotations
 
+import argparse
 import json
+import logging
 import os
 import secrets
+import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -230,3 +233,141 @@ def _spawn_worker(
         kwargs["start_new_session"] = True
 
     return subprocess.Popen(cmd, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: JobManager facade + worker-side helpers
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+_JOB_RETENTION_SECONDS = 365 * 24 * 3600  # 1 年
+
+
+class JobManager:
+    """精筛池更新任务管理器 (UI 侧使用)。"""
+
+    def start_job(self, term: str) -> str:
+        existing = self.find_running(term)
+        if existing:
+            return existing["job_id"]
+
+        job_id = new_job_id(term)
+        ensure_job_dir()
+        log_path = str(job_path(job_id).with_suffix(".log"))
+
+        # 先写 pending 文件, 再 spawn worker (worker 自己改成 running)
+        writer = AtomicJobWriter(job_id)
+        writer.update(
+            status=JobStatus.PENDING.value,
+            parent_pid=os.getpid(),
+            started_at=datetime.now().isoformat(),
+        )
+
+        _spawn_worker(job_id=job_id, term=term, log_path=log_path)
+        self.cleanup()
+        return job_id
+
+    def poll(self, job_id: str) -> Optional[Dict[str, Any]]:
+        p = job_path(job_id)
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if detect_orphan(data):
+            data["status"] = JobStatus.ORPHANED.value
+            data["finished_at"] = datetime.now().isoformat()
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return data
+
+    def find_running(self, term: str) -> Optional[Dict[str, Any]]:
+        ensure_job_dir()
+        for f in JOB_DIR.glob(f"pool_update_{term}_*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("status") == "running":
+                if detect_orphan(data):
+                    data["status"] = JobStatus.ORPHANED.value
+                    f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    continue
+                return data
+        return None
+
+    def find_latest(self, term: str) -> Optional[Dict[str, Any]]:
+        ensure_job_dir()
+        candidates = sorted(
+            JOB_DIR.glob(f"pool_update_{term}_*.json"),
+            key=lambda f: f.stat().st_mtime, reverse=True,
+        )
+        for f in candidates:
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+        return None
+
+    def stop(self, job_id: str) -> bool:
+        data = self.poll(job_id)
+        if not data or data.get("status") != "running":
+            return False
+        pid = data.get("pid")
+        if not pid:
+            return False
+        try:
+            if sys.platform == "win32":
+                os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+            else:
+                os.kill(pid, signal.SIGTERM)
+            return True
+        except Exception:
+            return False
+
+    def cleanup(self) -> int:
+        ensure_job_dir()
+        cutoff = time.time() - _JOB_RETENTION_SECONDS
+        removed = 0
+        for f in JOB_DIR.glob("pool_update_*.json"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    log = f.with_suffix(".log")
+                    if log.exists():
+                        log.unlink()
+                    removed += 1
+            except Exception:
+                continue
+        return removed
+
+    def read_log(self, job_id: str, tail: int = 200) -> str:
+        log = job_path(job_id).with_suffix(".log")
+        if not log.exists():
+            return ""
+        try:
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            return "\n".join(lines[-tail:])
+        except Exception:
+            return ""
+
+
+def parse_worker_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="pool_update_worker")
+    parser.add_argument("--job-id", required=True)
+    parser.add_argument("--term", required=True, choices=("short", "medium", "long"))
+    return parser.parse_args()
+
+
+def record_failure(job_id: str, exc: BaseException) -> None:
+    import traceback
+    try:
+        writer = AtomicJobWriter(job_id)
+        writer.update(
+            status=JobStatus.FAILED.value,
+            error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+            finished_at=datetime.now().isoformat(),
+        )
+    except Exception as e:
+        logger.error("record_failure could not write job file: %s", e)

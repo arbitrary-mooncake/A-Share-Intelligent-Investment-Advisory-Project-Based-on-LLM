@@ -147,3 +147,86 @@ def _extract_term(job_id: str) -> str:
     if len(parts) >= 3 and parts[0] == "pool" and parts[1] == "update":
         return parts[2]
     raise PoolUpdateJobError(f"invalid job_id_format: {job_id}")
+
+
+# ---------------------------------------------------------------------------
+# Task 3: cross-platform detached spawn + orphan detection
+# ---------------------------------------------------------------------------
+import subprocess
+import sys
+
+
+def is_pid_alive(pid: Optional[int]) -> bool:
+    """Check whether *pid* refers to a currently-running process."""
+    if pid is None:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                exit_code = ctypes.c_ulong()
+                ctypes.windll.kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code)
+                )
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return exit_code.value == 259  # STILL_ACTIVE
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+
+def detect_orphan(job_dict: Dict[str, Any]) -> bool:
+    """Return True when job claims *running* but its PID is dead."""
+    if job_dict.get("status") != "running":
+        return False
+    return not is_pid_alive(job_dict.get("pid"))
+
+
+def _spawn_worker(
+    job_id: str,
+    term: str,
+    log_path: str,
+    worker_module_override: Optional[str] = None,
+) -> subprocess.Popen:
+    """Launch the pool-update worker as a detached child process.
+
+    *worker_module_override* (test-only): path to a replacement Python script
+    instead of ``-m src.eval.pool_update_worker``.
+    """
+    ensure_job_dir()
+    if worker_module_override:
+        cmd = [sys.executable, worker_module_override]
+    else:
+        cmd = [
+            sys.executable, "-m", "src.eval.pool_update_worker",
+            "--job-id", job_id, "--term", term,
+        ]
+
+    kwargs: Dict[str, Any] = dict(
+        stdout=open(log_path, "w", encoding="utf-8"),
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        env={**os.environ, "POOL_UPDATE_JOB_ID": job_id, "POOL_UPDATE_TERM": term},
+    )
+
+    if sys.platform == "win32":
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        DETACHED_PROCESS = 0x00000008
+        kwargs["creationflags"] = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+
+    return subprocess.Popen(cmd, **kwargs)

@@ -117,3 +117,76 @@ def test_atomic_writer_retries_on_oserror(tmp_path, monkeypatch):
     data = w.read()
     assert data["status"] == "running"
     assert data["pid"] == 99
+
+
+# ---- Task 3: spawn + orphan tests ----
+import subprocess
+import sys
+import time
+
+
+def test_is_pid_alive_current_process():
+    import src.eval.job_manager as jm
+    assert jm.is_pid_alive(os.getpid()) is True
+
+
+def test_is_pid_dead_for_invalid_pid():
+    import src.eval.job_manager as jm
+    # 一个极不可能存在的高 PID
+    assert jm.is_pid_alive(999_999_999) is False
+
+
+def test_spawn_worker_creates_detached_process(tmp_path, monkeypatch):
+    import src.eval.job_manager as jm
+    monkeypatch.setattr(jm, "JOB_DIR", tmp_path)
+    jm.ensure_job_dir()
+    job_id = "pool_update_short_20260702_143052_abcd"
+    log_path = tmp_path / f"{job_id}.log"
+
+    # 用一个极简 worker 替代真实 worker: 写一行就退出
+    fake_worker = tmp_path / "fake_worker.py"
+    fake_worker.write_text(
+        "import os, sys, time\n"
+        f"open(r'{tmp_path}' + '/ran.flag', 'w').write(str(os.getpid()))\n"
+        "time.sleep(0.5)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys, "executable", sys.executable,
+    )
+    proc = jm._spawn_worker(
+        job_id=job_id,
+        term="short",
+        log_path=str(log_path),
+        worker_module_override=str(fake_worker),
+    )
+    # 父进程不 wait; 子进程应独立跑
+    time.sleep(1.0)
+    assert (tmp_path / "ran.flag").exists()
+    # 子进程已退出也无所谓 — 关键是它跑了
+
+
+def test_detect_orphan_flags_dead_pid(tmp_path, monkeypatch):
+    import src.eval.job_manager as jm
+    monkeypatch.setattr(jm, "JOB_DIR", tmp_path)
+    job_dict = {
+        "job_id": "x",
+        "term": "short",
+        "status": "running",
+        "pid": 999_999_999,
+        "started_at": "2026-07-02T14:30:52",
+    }
+    assert jm.detect_orphan(job_dict) is True
+
+
+def test_detect_orphan_false_for_completed(tmp_path, monkeypatch):
+    import src.eval.job_manager as jm
+    monkeypatch.setattr(jm, "JOB_DIR", tmp_path)
+    job_dict = {
+        "job_id": "x",
+        "term": "short",
+        "status": "completed",
+        "pid": 999_999_999,
+    }
+    # 非 running 不应被误判
+    assert jm.detect_orphan(job_dict) is False

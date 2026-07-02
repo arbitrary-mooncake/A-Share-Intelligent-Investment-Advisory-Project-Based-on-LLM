@@ -1,4 +1,6 @@
 """操作面板组件 — 一键检查 / 调仓 / 结算 / 池更新"""
+import time
+
 import streamlit as st
 from datetime import datetime
 
@@ -92,39 +94,66 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
             if eval_ready:
                 status_box = st.status("四层管线初始化...", expanded=True)
                 progress_bar = st.progress(0, text="Layer 0 硬筛...")
+                from src.eval.job_manager import JobManager, JobStatus
+                jm = JobManager()
+
                 try:
-                    def on_stage(stage_name: str, message: str):
-                        progress_map = {
-                            "0_hard_screen": (5, "Layer 0: 硬筛 (去ST/新股/BJ/B股/低流动)"),
-                            "1_batch_score": (20, "Layer 1: M1/M3批量粗筛分档"),
-                            "2_quick_screen": (60, "Layer 2: M2快筛过滤初筛池"),
-                            "3_formal_score": (75, "Layer 3: 7Agent+3Scorer精筛"),
-                            "done": (100, "完成!"),
-                        }
-                        pct, text = progress_map.get(stage_name, (50, message))
-                        progress_bar.progress(pct, text=text[:80])
-                        status_box.update(label=f"{stage_name}: {message[:60]}", state="running")
-
-                    update_result = _run_async(
-                        orch.run_pool_update(pool_term, on_stage=on_stage)
-                    )
-                    progress_bar.progress(100, text="完成!")
-                    status_box.update(label="精筛池更新完成", state="complete")
-
-                    if "error" in update_result:
-                        st.error(update_result["error"])
+                    existing = jm.find_running(pool_term)
+                    if existing:
+                        job_id = existing["job_id"]
+                        st.info(
+                            f"已有正在跑的更新 ({existing.get('started_at', '')}), 自动 attach"
+                        )
                     else:
-                        st.success(f"精筛池[{pool_term}]更新完成！共{update_result.get('final_pool_size', 0)}只")
-                        whitelist = update_result.get('whitelist', [])
-                        blacklist = update_result.get('blacklist', [])
-                        st.text(f"  白名单(强烈推荐): {len(whitelist)}只")
-                        st.text(f"  候选池: {update_result.get('final_pool_size', 0) - len(whitelist)}只")
-                        st.text(f"  黑名单(卖出): {len(blacklist)}只")
-                        st.rerun()
+                        job_id = jm.start_job(pool_term)
+
+                    st.session_state[f"pool_job_{pool_term}"] = job_id
+
+                    # 轮询进度
+                    while True:
+                        job = jm.poll(job_id)
+                        if not job:
+                            st.error("任务信息丢失")
+                            break
+
+                        status = job.get("status")
+                        prog = job.get("progress") or {}
+                        pct = prog.get("overall_pct", 0) / 100.0
+                        eta = prog.get("eta_str", "计算中...")
+                        stall = prog.get("stall_s", 0)
+
+                        progress_bar.progress(
+                            min(pct, 1.0),
+                            f"总进度 {pct*100:.0f}% | ETA: {eta}"
+                            + (f" | ⚠️ 卡顿{stall:.0f}s" if stall > 60 else "")
+                        )
+                        status_box.update(
+                            label=f"running: {prog.get('current_stage_msg', '')[:60]}",
+                            state="running",
+                        )
+
+                        if status == JobStatus.COMPLETED.value:
+                            progress_bar.progress(1.0, text="完成!")
+                            status_box.update(label="精筛池更新完成", state="complete")
+                            st.success(
+                                f"精筛池[{pool_term}]更新完成！"
+                                f"共{job.get('progress', {}).get('result', {}).get('final_pool_size', 0)}只"
+                            )
+                            break
+                        if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value):
+                            status_box.update(label="更新失败", state="error")
+                            st.error(job.get("error") or f"任务状态: {status}")
+                            with st.expander("📋 Worker 日志", expanded=False):
+                                st.code(jm.read_log(job_id, tail=200), language="log")
+                            break
+
+                        time.sleep(1.0)
+
+                    st.rerun()
                 except Exception as e:
                     progress_bar.progress(100, text="失败")
-                    status_box.update(label=f"更新失败", state="error")
-                    st.error(f"精筛池更新失败: {e}")
+                    status_box.update(label="更新失败", state="error")
+                    st.error(f"精筛池更新启动失败: {e}")
         st.caption(
             "\U0001f446 四层筛选管线（总纲§4.1, V3 流式 + L2 pre-fetch 复用）:\n\n"
             "**Layer 0 硬筛**: 去ST/新股/BJ/B股/近20日日均成交额<2000万 → ~4500只\n"

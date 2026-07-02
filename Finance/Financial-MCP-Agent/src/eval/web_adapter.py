@@ -4,10 +4,7 @@ Web API适配器 — 总纲 §17.1
 V3: 支持流式进度回调 + ETA + 阶段展示。
 """
 import asyncio
-import json
-import threading
-import time
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any
 
 
 class WebAdapter:
@@ -61,45 +58,3 @@ class WebAdapter:
             return self._orch.get_status()
         return {"error": "orchestrator not initialized"}
 
-    # ── 带进度回调的池更新 (Streamlit 轮询模式) ──
-
-    def run_pool_update_streaming(
-        self,
-        term: str = "short",
-        on_progress: Optional[Callable] = None,
-        on_stage: Optional[Callable] = None,
-    ) -> Dict[str, Any]:
-        """在后台线程运行精筛池更新, 期间实时回调进度到 Streamlit.
-
-        使用 threading 将异步管线在后台运行, 主线程 (Streamlit) 通过
-        on_progress 回调接收结构化进度数据 {overall_pct, eta_str, stages, ...}
-        来更新进度条和 ETA 显示。
-
-        Returns:
-            更新结果字典 {"pool", "stats", ...} 或 {"error": ...}
-        """
-        if not self._orch:
-            return {"error": "orchestrator not initialized"}
-
-        result_holder = {"result": None, "error": None, "done": False}
-
-        async def _run():
-            try:
-                r = await self._orch.run_pool_update(
-                    term=term,
-                    on_stage=on_stage,
-                    on_progress=on_progress,
-                )
-                result_holder["result"] = r
-            except Exception as e:
-                result_holder["error"] = str(e)
-            finally:
-                result_holder["done"] = True
-
-        def _thread_target():
-            asyncio.run(_run())
-
-        thread = threading.Thread(target=_thread_target, daemon=False)
-        thread.start()
-
-        return result_holder  # caller polls result_holder["done"] for completion

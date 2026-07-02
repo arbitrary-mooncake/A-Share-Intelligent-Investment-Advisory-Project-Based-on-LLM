@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]   # Finance/Financial-MCP-Agent
-JOB_DIR = PROJECT_ROOT / "data" / "pool_update_jobs"
+_default_job_dir = PROJECT_ROOT / "data" / "pool_update_jobs"
+JOB_DIR = Path(os.environ["POOL_UPDATE_JOB_DIR"]) if "POOL_UPDATE_JOB_DIR" in os.environ else _default_job_dir
 
 
 class JobStatus(str, Enum):

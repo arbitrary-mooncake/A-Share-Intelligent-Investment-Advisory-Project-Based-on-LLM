@@ -198,18 +198,94 @@ with tab1:
                           delta=f"目标{pool.get('target_size', '-')}只")
         st.caption("精筛池 = 模拟盘的选股范围。14条线只能从这些池子里选股。")
 
-        with st.expander("📋 精筛池 Top5 成分股", expanded=False):
-            for term, label in [("short", "短线"), ("medium", "中线"), ("long", "长线")]:
-                st.caption(f"**{label}精筛池 Top5:**")
-                pool_data = orch.pool_manager.get_pool_with_scores(term)[:5]
-                if pool_data:
-                    for s in pool_data:
-                        code = s.get("code", "?") if isinstance(s, dict) else s
-                        name = s.get("name", "?") if isinstance(s, dict) else "?"
-                        score = s.get("score", "?") if isinstance(s, dict) else "?"
-                        st.text(f"  {code} ({name}) | {score}分")
-                else:
-                    st.text("  暂无数据")
+        with st.expander("📋 精筛池成分股（按期查看）", expanded=False):
+            # 期限选择器（池数据为空时仍允许切换，便于查看空态提示）
+            _term_options = {
+                "short": "短线精筛池（目标 100 只）",
+                "medium": "中线精筛池（目标 80 只）",
+                "long": "长线精筛池（目标 60 只）",
+            }
+
+            # 默认选中"数据最多"的期限，首次打开就能看到内容
+            def _default_term():
+                _best, _n = "long", -1
+                for _t in _term_options:
+                    try:
+                        _data = orch.pool_manager.get_pool_with_scores(_t)
+                        _sz = len(_data) if isinstance(_data, (list, dict)) else 0
+                    except Exception:
+                        _sz = 0
+                    if _sz > _n:
+                        _best, _n = _t, _sz
+                return _best
+
+            _selected_term = st.selectbox(
+                "选择期限",
+                options=list(_term_options.keys()),
+                format_func=lambda x: _term_options[x],
+                index=list(_term_options.keys()).index(_default_term()),
+                key="refined_pool_term_selector",
+            )
+
+            _pool_stocks = orch.pool_manager.get_pool_with_scores(_selected_term)
+            # 兼容 list / dict 两种返回结构
+            if isinstance(_pool_stocks, dict):
+                _pool_stocks = list(_pool_stocks.values())
+            if not isinstance(_pool_stocks, list):
+                _pool_stocks = []
+
+            # 池级别元信息（打分日期 / 版本号）
+            _pool_meta = orch.pool_manager.pools.get(_selected_term, {}) if hasattr(orch.pool_manager, "pools") else {}
+            _pool_updated_at = str(_pool_meta.get("updated_at") or "")[:10] or "尚未更新"
+            _pool_version = _pool_meta.get("version", 0)
+
+            st.caption(
+                f"**当前 {_term_options[_selected_term]}** · "
+                f"共 {len(_pool_stocks)} 只 · "
+                f"入池日期 {_pool_updated_at} · "
+                f"版本 v{_pool_version}"
+            )
+
+            if not _pool_stocks:
+                st.info("该期限精筛池暂无数据。请在操作面板点击「🎯 更新精筛池」启动 V3 四层管线。")
+            else:
+                import pandas as pd
+
+                _rows = []
+                for _idx, _s in enumerate(_pool_stocks, start=1):
+                    if not isinstance(_s, dict):
+                        continue
+                    _rows.append({
+                        "序号": _idx,
+                        "代码": _s.get("code", "-"),
+                        "名称": _s.get("name", "-"),
+                        "最终分": _s.get("final_score"),
+                        "推荐等级": _s.get("recommendation", "-"),
+                        "L1 分类": _s.get("layer1_level", "-"),
+                        "L2 分数": _s.get("layer2_score"),
+                    })
+                # 按最终分降序（None 排最后）
+                _rows.sort(key=lambda _r: (_r["最终分"] is None, -(_r["最终分"] or 0)))
+
+                _df = pd.DataFrame(_rows)
+                st.dataframe(
+                    _df,
+                    use_container_width=True,
+                    height=420,
+                    hide_index=True,
+                    column_config={
+                        "序号": st.column_config.NumberColumn(width="small"),
+                        "代码": st.column_config.TextColumn(width="small"),
+                        "名称": st.column_config.TextColumn(width="medium"),
+                        "最终分": st.column_config.NumberColumn(width="small", format="%d"),
+                        "推荐等级": st.column_config.TextColumn(width="medium"),
+                        "L1 分类": st.column_config.TextColumn(width="medium"),
+                        "L2 分数": st.column_config.NumberColumn(width="small", format="%.1f"),
+                    },
+                )
+                st.caption(
+                    "💡 提示：点击表头可排序；横向可拖动查看所有列；打分日期为池级整体更新日期（精确到日）。"
+                )
     else:
         st.warning("评测系统初始化中...")
 

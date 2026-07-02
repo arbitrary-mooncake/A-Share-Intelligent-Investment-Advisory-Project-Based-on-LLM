@@ -250,7 +250,7 @@ Implementation: `orchestrator._get_scoring_frequency_tier()` (line ~877) compute
 
 Cold start (first run, no caches exist) — V3 流水线 (2026-07 优化后):
 - Layer 0: ~2min (20 批量 `daily` API queries, trade_date-keyed)
-- Layer 1: ~20-30min (Tushare prefetch + HTTP parallel + LLM × ~900 batches of 5, 100只/批流式产出 raw_data)
+- Layer 1: ~20-30min (Tushare prefetch + HTTP parallel `semaphore=24` + LLM × ~900 batches of 5, 100只/批流式产出 raw_data)
 - Layer 2: ~3-5min (**复用 L1 raw_data, 跳过 fetch_batch**; DSV4Pro 流式双堆 top-α 后台流水线)
 - Layer 3: ~30-60min (~100 stocks × ~200s/stock, **5 并发** async queue consumer, shared ScoringEngine)
 - **Total cold start: ~1.0-1.5h** (short/medium), ~0.8-1.0h (long)

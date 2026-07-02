@@ -376,9 +376,11 @@ async def batch_score_layer1(
         return {"whitelist": [], "initial_pool": [], "blacklist": []}
 
     # Step B: 数据获取 (Tushare + HTTP)
+    # HTTP 并发从 12 提到 24: Tencent web.ifzq.gtimg.cn 能承受, 实测 ~2x 提速
+    # (4954 只 × 5s/只 / 24 并发 ≈ 17min, 比 12 并发的 34min 减半)
     batch_stocks = await fetch_batch(
         batch_input,
-        semaphore=12,
+        semaphore=24,
         on_progress=lambda c, t: on_progress(c * 3 // 4, t) if on_progress else None,
     )
 
@@ -458,8 +460,9 @@ async def batch_score_layer1_stream(
         if progress_touch:
             progress_touch()
 
+    # HTTP 并发 24: 与 batch_score_layer1 (非流式版) 保持一致
     batch_stocks = await fetch_batch(
-        batch_input, semaphore=12,
+        batch_input, semaphore=24,
         on_progress=_fetch_progress,
     )
     valid = [s for s in batch_stocks if s.get("status") == "fetched" and s.get("data")]
@@ -586,12 +589,12 @@ async def score_layer2_batch(
         if missing:
             from src.api.batch_scorer import fetch_batch
             batch_input = [{"code": s["code"], "name": s.get("name", "")} for s in missing]
-            fetched = await fetch_batch(batch_input, semaphore=12)
+            fetched = await fetch_batch(batch_input, semaphore=24)
             valid.extend(f for f in fetched if f.get("status") == "fetched" and f.get("data"))
     else:
         from src.api.batch_scorer import fetch_batch
         batch_input = [{"code": s["code"], "name": s.get("name", "")} for s in recommended_stocks]
-        fetched = await fetch_batch(batch_input, semaphore=12)
+        fetched = await fetch_batch(batch_input, semaphore=24)
         valid = [f for f in fetched if f.get("status") == "fetched" and f.get("data")]
 
     if not valid:
@@ -744,10 +747,10 @@ async def quick_screen_layer2(
     if on_progress:
         on_progress(0, len(initial_pool))
 
-    # 数据获取
+    # 数据获取 (HTTP 并发 24, 与其他 fetch_batch 调用保持一致)
     batch_input = [{"code": s["code"], "name": s.get("name", "")} for s in initial_pool]
     batch_stocks = await fetch_batch(
-        batch_input, semaphore=12,
+        batch_input, semaphore=24,
         on_progress=lambda c, t: on_progress(c // 2, t) if on_progress else None,
     )
 

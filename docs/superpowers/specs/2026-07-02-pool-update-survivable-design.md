@@ -39,6 +39,7 @@ Streamlit 页面通过 `WebAdapter.run_pool_update_streaming()` 在 `threading.T
 | 子进程自身崩溃时**过程数据不丢** | Job 文件 2Hz 原子写入，记录已完成股票 |
 | 用户可**诊断 worker 异常** | Worker stdout/stderr 重定向到 per-job log 文件，UI 提供日志查看面板 |
 | 不引入外部依赖（Celery/RQ/systemd） | 纯 stdlib：`subprocess.Popen` + `os.replace` + `json` |
+| 保留策略简单透明 | 按时间窗口（1 年）保留所有 job 文件，不按 term/状态分类，审计友好；容量 ~7.8MB/年 |
 
 ### 1.5 非目标（明确不做）
 
@@ -254,16 +255,13 @@ class AtomicJobWriter:
 
 ### 6.3 保留策略
 
-每 term 保留：
-- 最近 **5 个 completed** job
-- 最近 **5 个 failed** job
-- 所有 running / pending job（不动）
+保留**最近 1 年内**的所有 job 文件（不论 term / 状态），超过 1 年的全删。
 
-超过数量上限的最旧文件直接删除。不按时间窗口，按数量管理更可控。
+- 判定依据：文件 mtime（`os.path.getmtime()`）
+- 清理时机：每次 `start_job()` 成功后调用一次 `cleanup()`
+- 容量估算：每周 1 次 × 3 term × 50KB × 52 周 ≈ **7.8MB/年**，磁盘负担可忽略
 
-上限估算：3 term × 10 job × 50KB = 1.5MB，永远不超。
-
-清理时机：每次 `start_job()` 成功后调用一次 `cleanup()`。
+不引入更复杂的"每 term N 个 completed + N 个 failed"策略——时间窗口更直观、审计友好。
 
 ## 7. UI 改造
 
@@ -339,7 +337,7 @@ with st.expander("📋 Worker 日志", expanded=False):
   - `test_find_running_returns_existing`
   - `test_atomic_write_no_partial_reads`（并发读写压测）
   - `test_orphan_detection`
-  - `test_cleanup_keeps_5_completed_per_term`
+  - `test_cleanup_removes_jobs_older_than_one_year`
 
 ### 9.2 集成测试
 

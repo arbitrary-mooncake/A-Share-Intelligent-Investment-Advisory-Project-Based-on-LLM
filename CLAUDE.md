@@ -372,3 +372,26 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - `src/tools/mcp_config.py` uses `sys.executable` (not hardcoded `python`)
 - WSL-created venvs are incompatible; recreate with `python -m venv venv`
 - `launch.ps1` uses `taskkill /f /t` for tree-kill of uvicorn/streamlit
+
+## 精筛池更新跨重启存活
+
+Streamlit 页面触发的"🎯 更新精筛池"操作以 detached subprocess 方式运行, 与 Streamlit 进程生命周期解耦。
+
+**核心文件**:
+- `src/eval/job_manager.py`: `JobManager` (UI 侧) + `AtomicJobWriter` (worker 侧) + `is_pid_alive` + `detect_orphan`
+- `src/eval/pool_update_worker.py`: worker 入口, `python -m src.eval.pool_update_worker --job-id <id> --term <term>`
+- `data/pool_update_jobs/`: job 文件 + worker 日志 (1 年保留, 自动 cleanup)
+
+**关键行为**:
+- 同 term 同时只允许 1 个 running job, 重复触发自动 attach
+- 2Hz 原子写入 (write → .tmp → os.replace + 3-retry backoff on Windows), 防止读半写文件
+- Orphan 检测: `status=running` 但 pid 不存在 → 自动标 `orphaned`
+- Windows: `CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS` + `taskkill /F /T` 用于 stop(); POSIX: `start_new_session=True` + `SIGTERM`
+- Worker 完成后 status=completed, UI 看到后触发 `st.rerun()`; FAILED/ORPHANED 路径**不** rerun, 保留错误 UI + worker log expander
+
+**调试**:
+- UI 提供 "📋 Worker 日志" 折叠面板, 显示 `data/pool_update_jobs/{job_id}.log` 最后 200 行
+- Job JSON schema 见 `src/eval/job_manager.py` 的 `Job` dataclass
+- 保留策略: 1 年 (mtime 比较), 由 `JobManager.cleanup()` 在每次 `start_job()` 后自动触发
+
+**禁用旧接口**: `WebAdapter.run_pool_update_streaming` 已删除 (UI 全部改用 JobManager).

@@ -320,10 +320,19 @@ class JobManager:
             return False
         try:
             if sys.platform == "win32":
-                os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+                # CTRL_BREAK_EVENT cannot reach a process spawned with
+                # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP (different console
+                # and process group). Use taskkill /F /T which forcefully
+                # terminates the process tree regardless of console attachment.
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+                return result.returncode == 0
             else:
                 os.kill(pid, signal.SIGTERM)
-            return True
+                return True
         except Exception:
             return False
 

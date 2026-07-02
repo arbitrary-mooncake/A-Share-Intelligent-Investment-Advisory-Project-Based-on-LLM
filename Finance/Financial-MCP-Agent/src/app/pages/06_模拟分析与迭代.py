@@ -168,15 +168,13 @@ with tab1:
                                         f"更新完成！共 {result.get('final_pool_size', 0)} 只"
                                         f" | 耗时 {result.get('stats', {}).get('elapsed_s', 0) // 60}min"
                                     )
-                                    break
+                                    st.rerun()
                                 if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value):
                                     st.error(job.get("error") or f"任务状态: {status}")
                                     with st.expander("📋 Worker 日志", expanded=False):
                                         st.code(jm.read_log(job_id, tail=200), language="log")
                                     break
                                 time.sleep(1.0)
-
-                            st.rerun()
                         except Exception as e:
                             st.error(f"更新启动失败: {e}")
     else:

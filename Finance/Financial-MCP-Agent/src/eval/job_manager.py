@@ -6,7 +6,10 @@ Worker 侧: AtomicJobWriter.update (2Hz 节流由 worker 自己控制)
 """
 from __future__ import annotations
 
+import json
+import os
 import secrets
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -84,3 +87,63 @@ def job_path(job_id: str) -> Path:
 
 def ensure_job_dir() -> None:
     JOB_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class AtomicJobWriter:
+    """原子写入 job 文件: write -> .tmp -> os.replace。
+
+    防止 UI 读到半写 JSON。所有 update 操作都基于文件当前内容做 merge。
+    """
+
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        self.path = job_path(job_id)
+        self.tmp_path = self.path.with_suffix(".json.tmp")
+        ensure_job_dir()
+        if not self.path.exists():
+            # 首次写入: 用 Job 默认值落盘
+            base = Job(job_id=job_id, term=_extract_term(job_id))
+            self._atomic_dump(base.to_dict())
+
+    def _atomic_dump(self, data: Dict[str, Any]) -> None:
+        # Windows 下 OneDrive/杀毒 可能短暂锁定 .tmp, 重试 3 次
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        for attempt in range(3):
+            try:
+                self.tmp_path.write_text(payload, encoding="utf-8")
+                os.replace(self.tmp_path, self.path)
+                return
+            except (PermissionError, OSError):
+                if attempt == 2:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+
+    def read(self) -> Dict[str, Any]:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def update(self, **fields: Any) -> None:
+        data = self.read()
+        data.update(fields)
+        self._atomic_dump(data)
+
+    def merge_progress(self, progress: Dict[str, Any]) -> None:
+        data = self.read()
+        merged = dict(data.get("progress") or {})
+        merged.update(progress)
+        data["progress"] = merged
+        self._atomic_dump(data)
+
+    def append_completed_stock(self, stock: Dict[str, Any]) -> None:
+        data = self.read()
+        stocks = list(data.get("completed_stocks") or [])
+        stocks.append(stock)
+        data["completed_stocks"] = stocks
+        self._atomic_dump(data)
+
+
+def _extract_term(job_id: str) -> str:
+    # pool_update_{term}_{ts}_{rand}
+    parts = job_id.split("_")
+    if len(parts) >= 3 and parts[0] == "pool" and parts[1] == "update":
+        return parts[2]
+    raise PoolUpdateJobError(f"invalid job_id_format: {job_id}")

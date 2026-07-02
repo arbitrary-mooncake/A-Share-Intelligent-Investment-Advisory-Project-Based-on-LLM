@@ -170,6 +170,7 @@ class DeepSeekFreeLine:
         self.cash: float = initial_capital
         self.positions: Dict[str, Dict[str, float]] = {}
         self.trades: List[TradeRecord] = []
+        self.equity_history: List[Dict[str, Any]] = []
 
         # storage_dir 默认相对于项目根（Finance/Financial-MCP-Agent/）
         if storage_dir is None:
@@ -394,9 +395,11 @@ class DeepSeekFreeLine:
             date=trade_date,
             action="buy",
             stock_code=stock_code,
+            company_name="",
             price=price,
             shares=quantity,
             commission=commission,
+            stamp_tax=0.0,
             reason=reason or f"买入 {stock_code} {quantity}股，成交价 {price:.2f}",
         )
         self.trades.append(record)
@@ -460,9 +463,11 @@ class DeepSeekFreeLine:
             date=trade_date,
             action="sell",
             stock_code=stock_code,
+            company_name="",
             price=price,
             shares=quantity,
             commission=commission,
+            stamp_tax=stamp_tax,
             reason=reason or f"卖出 {stock_code} {quantity}股，成交价 {price:.2f}",
         )
         self.trades.append(record)
@@ -491,6 +496,45 @@ class DeepSeekFreeLine:
         self.positions[stock_code]["current_price"] = current_price
         return True
 
+    def record_daily_settlement(self, date: str) -> Dict[str, Any]:
+        """记录当日结算快照到 equity_history。
+
+        设计 §8.3：每日收盘后记录总资产，用于与用户持仓对比。
+        同一日期重复调用时覆盖旧快照，避免权益曲线出现重复点。
+
+        Args:
+            date: 结算日期 YYYY-MM-DD。
+
+        Returns:
+            当日结算快照字典。
+        """
+        ctx = self.get_context()
+        snapshot = {
+            "date": date,
+            "total_value": ctx["total_value"],
+            "cash": ctx["cash"],
+            "total_market_value": ctx["total_market_value"],
+            "return_rate": ctx["return_rate"],
+            "holdings_count": ctx["holdings_count"],
+        }
+        if self.equity_history and self.equity_history[-1].get("date") == date:
+            self.equity_history[-1] = snapshot
+        else:
+            self.equity_history.append(snapshot)
+        self.save_state()
+        return snapshot
+
+    def get_equity_curve(self) -> List[float]:
+        """返回归一化权益曲线（以 1.0 为基准）。
+
+        Returns:
+            权益净值列表，首值为 1.0。无历史时返回空列表。
+        """
+        if not self.equity_history:
+            return []
+        base = self.initial_capital if self.initial_capital > 0 else 1.0
+        return [s["total_value"] / base for s in self.equity_history]
+
     # ------------------------------------------------------------------
     # 状态持久化
     # ------------------------------------------------------------------
@@ -507,6 +551,7 @@ class DeepSeekFreeLine:
         - cash
         - positions: {stock_code: {quantity, cost_price, current_price}}
         - trades: TradeRecord 列表
+        - equity_history: 每日结算快照列表
         - updated_at: ISO 时间戳
         """
         state = {
@@ -514,6 +559,7 @@ class DeepSeekFreeLine:
             "cash": self.cash,
             "positions": self.positions,
             "trades": [asdict(t) for t in self.trades],
+            "equity_history": self.equity_history,
             "updated_at": datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             ),
@@ -547,6 +593,7 @@ class DeepSeekFreeLine:
         self.initial_capital = state.get("initial_capital", self.initial_capital)
         self.cash = state.get("cash", self.initial_capital)
         self.positions = state.get("positions", {})
+        self.equity_history = state.get("equity_history", [])
 
         raw_trades = state.get("trades", [])
         self.trades = []
@@ -561,13 +608,14 @@ class DeepSeekFreeLine:
                         price=t.get("price", 0.0),
                         shares=t.get("shares", 0),
                         commission=t.get("commission", 0.0),
+                        stamp_tax=t.get("stamp_tax", 0.0),
                         reason=t.get("reason", ""),
                     )
                 )
 
         logger.info(
-            "状态已恢复: cash=%.2f, positions=%d, trades=%d",
-            self.cash, len(self.positions), len(self.trades),
+            "状态已恢复: cash=%.2f, positions=%d, trades=%d, equity_history=%d",
+            self.cash, len(self.positions), len(self.trades), len(self.equity_history),
         )
         return True
 
@@ -639,5 +687,5 @@ except ImportError:
         price: float = 0.0
         shares: int = 0
         commission: float = 0.0
+        stamp_tax: float = 0.0
         reason: str = ""
-        st: float = 0.0  # stamp tax (保留字段，用于扩展)

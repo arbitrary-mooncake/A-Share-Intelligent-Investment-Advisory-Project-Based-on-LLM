@@ -160,6 +160,8 @@ class BacktestRunner:
         # ---- 6. 逐日回放 ----
         equity_curve: List[float] = [initial_value]
         all_trades: List[TradeRecord] = []
+        total_sells = 0
+        winning_sells = 0
 
         for i, date in enumerate(target_dates):
             # Mark-to-market：先以当日收盘价重估所有持仓
@@ -250,12 +252,16 @@ class BacktestRunner:
                 elif sig == -1 and position > 0:
                     # 卖出信号 & 有持仓 -> 清仓
                     company_name = name_map.get(code, code)
+                    cost_price_at_sell = holding.cost_price if holding else exec_price
                     try:
                         pf, trade = self.portfolio_manager.remove_holding(
                             pf, code, position, exec_price,
                             trade_date=trade_date_str,
                         )
                         all_trades.append(trade)
+                        total_sells += 1
+                        if exec_price > cost_price_at_sell:
+                            winning_sells += 1
                     except (ValueError, Exception):
                         continue
 
@@ -275,6 +281,9 @@ class BacktestRunner:
             initial_value, final_value, trading_days
         )
 
+        sharpe_ratio = self._calc_sharpe_ratio(equity_curve)
+        win_rate = (winning_sells / total_sells * 100.0) if total_sells > 0 else 0.0
+
         return BacktestResult(
             portfolio_id=pf.portfolio_id,
             strategy_name=strategy_name,
@@ -285,8 +294,8 @@ class BacktestRunner:
             total_return_pct=round(total_return_pct, 4),
             annualized_return_pct=round(annualized_return_pct, 4),
             max_drawdown_pct=round(max_dd, 4),
-            sharpe_ratio=0.0,
-            win_rate=0.0,
+            sharpe_ratio=round(sharpe_ratio, 4),
+            win_rate=round(win_rate, 4),
             trade_count=len(all_trades),
             equity_curve=equity_curve,
             trades=all_trades,
@@ -373,6 +382,42 @@ class BacktestRunner:
                     max_dd = dd
 
         return max_dd
+
+    @staticmethod
+    def _calc_sharpe_ratio(
+        equity_curve: Sequence[float],
+        trading_days_per_year: float = 244.0,
+    ) -> float:
+        """从权益曲线计算夏普比率（无风险利率设为 0）。
+
+        Args:
+            equity_curve: 每日权益值序列（首日为初始权益）。
+            trading_days_per_year: 年化交易天数基准（A 股约 244 天）。
+
+        Returns:
+            年化夏普比率。数据不足或波动为 0 时返回 0.0。
+        """
+        if not equity_curve or len(equity_curve) < 3:
+            return 0.0
+
+        daily_returns: List[float] = []
+        for i in range(1, len(equity_curve)):
+            prev = float(equity_curve[i - 1])
+            curr = float(equity_curve[i])
+            if prev > 0:
+                daily_returns.append((curr - prev) / prev)
+
+        n = len(daily_returns)
+        if n < 2:
+            return 0.0
+
+        mean_r = sum(daily_returns) / n
+        variance = sum((r - mean_r) ** 2 for r in daily_returns) / n
+        std_r = variance ** 0.5
+        if std_r == 0:
+            return 0.0
+
+        return (mean_r / std_r) * (trading_days_per_year ** 0.5)
 
 
 # ------------------------------------------------------------------

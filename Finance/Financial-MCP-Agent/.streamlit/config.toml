@@ -5,5 +5,8 @@ secondaryBackgroundColor = "#ffffff"
 textColor = "#0f172a"
 font = "sans serif"
 
+[client]
+showSidebarNavigation = false
+
 [server]
 maxUploadSize = 50

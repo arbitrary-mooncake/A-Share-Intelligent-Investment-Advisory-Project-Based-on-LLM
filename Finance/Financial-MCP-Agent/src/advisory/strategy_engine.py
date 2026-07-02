@@ -198,8 +198,8 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from ..strategy_base import TradingStrategy
-from ..strategy_registry import register_strategy
+from src.advisory.strategies.strategy_base import TradingStrategy
+from src.advisory.strategies.strategy_registry import register_strategy
 
 
 @register_strategy

@@ -17,6 +17,9 @@ import streamlit as st
 
 st.set_page_config(page_title="AI 智能问答", page_icon="💬", layout="wide")
 
+from components.shared_sidebar import render_sidebar
+render_sidebar()
+
 # ──────────────────────────────────────────────
 # 样式
 # ──────────────────────────────────────────────

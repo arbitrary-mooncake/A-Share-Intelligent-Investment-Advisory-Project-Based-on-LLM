@@ -95,6 +95,28 @@ class FundPoolAddRequest(BaseModel):
 
 # ─── 智能投顾请求模型 ───
 
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """从文本中提取最外层 JSON 对象（支持嵌套）。"""
+    if not text:
+        return None
+    text = text.strip()
+    # 找第一个 {
+    start = text.find("{")
+    if start == -1:
+        return None
+    # 括号匹配
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 class AdvisoryRecommendRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
@@ -122,6 +144,7 @@ class BacktestRequest(BaseModel):
     end_date: str
     strategy_name: Optional[str] = None
     strategy_params: Optional[Dict[str, Any]] = None
+    watchlist_codes: Optional[List[str]] = None
 
 class SimulationRequest(BaseModel):
     portfolio_id: str
@@ -130,6 +153,27 @@ class SimulationRequest(BaseModel):
 class FreeLineRequest(BaseModel):
     portfolio_id: str
     action: str  # "start" | "status" | "decide"
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+    page_context: Optional[str] = None  # JSON string, 当前页面上下文
+
+class ProfileUpdateRequest(BaseModel):
+    risk_tolerance: Optional[str] = None
+    investment_horizon: Optional[str] = None
+    favorite_sectors: Optional[List[str]] = None
+    avoid_sectors: Optional[List[str]] = None
+    investment_style: Optional[str] = None
+    custom_preferences: Optional[Dict[str, Any]] = None
+
+class PortfolioHealthRequest(BaseModel):
+    portfolio_id: str
+    session_id: str = "default"
+
+class PreferenceMatchRequest(BaseModel):
+    portfolio_id: str
+    session_id: str = "default"
 
 class ReportRequest(BaseModel):
     portfolio_id: str
@@ -182,19 +226,30 @@ def _init_advisory() -> Dict[str, Any]:
             from src.advisory.backtest_runner import BacktestRunner
             from src.advisory.simulation_runner import SimulationRunner
             from src.advisory.report_generator import AdvisoryReportGenerator
+            from src.advisory.portfolio_assessor import PortfolioAssessor
+            from src.advisory.llm_free_line import DeepSeekFreeLine
 
             # 确保数据目录存在
             root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             portfolios_dir = os.path.join(root, "data", "portfolios")
             settlements_dir = os.path.join(root, "data", "advisory_settlements")
+            llm_free_dir = os.path.join(root, "data", "advisory_llm_free")
             os.makedirs(portfolios_dir, exist_ok=True)
             os.makedirs(settlements_dir, exist_ok=True)
+            os.makedirs(llm_free_dir, exist_ok=True)
 
             pm = PortfolioManager(data_dir=portfolios_dir)
             sr = SimulationRunner(
                 portfolio_manager=pm,
                 settlement_dir=settlements_dir,
             )
+
+            # 加载用户自定义策略（设计 §6.5）
+            try:
+                from src.advisory.custom_strategy_loader import load_custom_strategies
+                load_custom_strategies()
+            except Exception as e:
+                logger.warning(f"自定义策略初始加载失败: {e}")
 
             _advisory_modules = {
                 "portfolio_manager": pm,
@@ -204,6 +259,8 @@ def _init_advisory() -> Dict[str, Any]:
                 "backtest_runner": BacktestRunner(portfolio_manager=pm),
                 "simulation_runner": sr,
                 "report_generator": AdvisoryReportGenerator(),
+                "portfolio_assessor": PortfolioAssessor(),
+                "llm_free_line": DeepSeekFreeLine(storage_dir=llm_free_dir),
             }
             logger.info(f"{SUCCESS_ICON} 智能投顾模块初始化完成")
         except ImportError as e:
@@ -1519,8 +1576,8 @@ def _ensure_name_cache():
     # 2. 加载ETF/基金名称（Tushare fund_basic）
     try:
         import requests as _req
-        resp = _req.post("https://api.tushare.pro", json={
-            "api_name": "fund_basic", "token": "fd4ff6e84626d2e63616ec08769f99110d626a91856036c30cb34818",
+        resp = _req.post(os.getenv("TUSHARE_URL", "https://api.tushare.pro"), json={
+            "api_name": "fund_basic", "token": os.getenv("TUSHARE_TOKEN", ""),
             "params": {"market": "E"},
             "fields": "ts_code,name"
         }, timeout=15)
@@ -3344,10 +3401,11 @@ async def fund_cache_status(fund_code: str):
 
 @app.post("/api/advisory/recommend")
 async def advisory_recommend(request: AdvisoryRecommendRequest):
-    """基于精筛池 + 生产缓存的 n/x/5 规则推荐股票。
+    """基于精筛池 + 生产缓存的 n/x/5 规则推荐股票。设计 §4.3。
 
-    接收用户自然语言提问，从精筛池加载所有股票，按 n/x/5 规则裁剪，
-    构建 LLM 上下文，通过 DeepSeek V4 Pro 生成最终推荐。
+    1. 如果用户提供了自然语言问题，先用 LLM 从精筛池做语义初筛
+    2. 然后应用 n/x/5 规则裁剪
+    3. 若无缓存评分可用（needs_llm_pick），由 LLM 从候选中挑选最优 5 只
     """
     try:
         modules = _init_advisory()
@@ -3356,15 +3414,143 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
         if not pool_stocks:
             raise HTTPException(status_code=404, detail="精筛池为空，请先执行 pool update")
 
-        # 收集所有候选代码
+        question = (request.question or "").strip()
         candidate_codes = [s["stock_code"] for s in pool_stocks]
-        # 应用 n/x/5 规则
-        trimmed_codes = engine.apply_nx5_rule(candidate_codes, pool_stocks)
+        pool_lookup: Dict[str, Dict[str, Any]] = {
+            s.get("stock_code", ""): s for s in pool_stocks
+        }
 
-        # 判断是否需要 LLM 介入
-        needs_llm = any("__LLM_PICK__" == c for c in trimmed_codes)
+        # ── 语义初筛：如果用户提供了需求描述，用 LLM 过滤候选 ──
+        filtered_codes = list(candidate_codes)
+        llm_filtered = False
+        if question and len(candidate_codes) > 5:
+            try:
+                # 构建简化的候选摘要
+                pool_summary_lines = []
+                for s in pool_stocks:
+                    code = s.get("stock_code", "")
+                    pool_lookup[code] = s
+                    cache_score = engine.check_score_cache(code)
+                    pool_summary_lines.append(
+                        f"  {s['company_name']}（{code}）"
+                        f" | 行业: {s.get('detected_industry', '未知')}"
+                        f" | 期限池: {s.get('term', 'N/A')}"
+                        f" | 评分: {cache_score or s.get('score', 'N/A')}"
+                    )
+                pool_summary = "\n".join(pool_summary_lines[:200])
+
+                filter_prompt = (
+                    f"## 用户需求\n{question}\n\n"
+                    f"## 候选股票（共{len(candidate_codes)}只，仅展示前200只）\n{pool_summary}\n\n"
+                    f"## 指令\n"
+                    f"请根据用户需求，从候选股票中筛选出最匹配的股票。\n"
+                    f"返回 JSON 数组格式：[\"code1\", \"code2\", ...]\n"
+                    f"- 只返回与需求相关的股票，无关的不要\n"
+                    f"- 如果需求模糊（如'推荐几只股票'），返回评分最高的 20 只\n"
+                    f"- 如果需求明确（如'科技股''银行股'），只返回对应行业的股票\n"
+                    f"- 精筛池已有质量保障，你只需要做语义匹配筛选"
+                )
+
+                base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_3", os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""))
+                client = OpenAICompatibleClient(
+                    api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_3", os.getenv("OPENAI_COMPATIBLE_API_KEY", "")),
+                    base_url=base_url,
+                    model=os.getenv("OPENAI_COMPATIBLE_MODEL_3", "qwen3.7-plus"),
+                    env_prefix="",
+                    extra_body=get_thinking_body(base_url, True),
+                    http_timeout=60,
+                )
+
+                llm_resp = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        _thread_pool,
+                        lambda: client.get_completion([
+                            {"role": "user", "content": filter_prompt},
+                        ], max_retries=1),
+                    ),
+                    timeout=60.0,
+                )
+
+                if llm_resp:
+                    # 提取 JSON 数组
+                    arr_match = re.search(r'\[[^\]]*\]', llm_resp.replace("\n", " "))
+                    if arr_match:
+                        try:
+                            filtered = json.loads(arr_match.group())
+                            if isinstance(filtered, list) and len(filtered) > 0:
+                                filtered_codes = [c for c in filtered if c in pool_lookup]
+                                if filtered_codes:
+                                    llm_filtered = True
+                                    logger.info(
+                                        f"推荐语义初筛: {len(candidate_codes)} → {len(filtered_codes)} 只"
+                                    )
+                        except json.JSONDecodeError:
+                            pass
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning(f"推荐语义初筛失败，使用全量候选: {e}")
+
+        # ── 应用 n/x/5 规则 ──
+        trimmed_codes = engine.apply_nx5_rule(filtered_codes, pool_stocks)
+
+        # 判断是否需要 LLM 介入挑选
+        needs_llm = any(c == "__LLM_PICK__" for c in trimmed_codes)
         if needs_llm:
             trimmed_codes = [c for c in trimmed_codes if c != "__LLM_PICK__"]
+            # 无缓存评分时，用 LLM 基于问题从候选中挑最优 5 只
+            if question and len(trimmed_codes) > 5:
+                try:
+                    pick_summary_lines = []
+                    for code in trimmed_codes:
+                        s = pool_lookup.get(code, {})
+                        if not s:
+                            for ps in pool_stocks:
+                                if ps.get("stock_code") == code:
+                                    s = ps
+                                    break
+                        pick_summary_lines.append(
+                            f"  {s.get('company_name', code)}（{code}）"
+                            f" | 行业: {s.get('detected_industry', '未知')}"
+                            f" | 期限池: {s.get('term', 'N/A')}"
+                            f" | 池评分: {s.get('score', 'N/A')}"
+                        )
+
+                    pick_prompt = (
+                        f"## 用户需求\n{question}\n\n"
+                        f"## 候选股票（{len(trimmed_codes)}只，均无近期缓存评分）\n"
+                        + "\n".join(pick_summary_lines[:50]) +
+                        f"\n\n## 指令\n请从以上候选中挑选最适合用户需求的 5 只股票。\n"
+                        f"返回 JSON 数组：[\"code1\", ..., \"code5\"]"
+                    )
+
+                    base_url3 = os.getenv("OPENAI_COMPATIBLE_BASE_URL_3", os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""))
+                    client3 = OpenAICompatibleClient(
+                        api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_3", os.getenv("OPENAI_COMPATIBLE_API_KEY", "")),
+                        base_url=base_url3,
+                        model=os.getenv("OPENAI_COMPATIBLE_MODEL_3", "qwen3.7-plus"),
+                        env_prefix="",
+                        extra_body=get_thinking_body(base_url3, True),
+                        http_timeout=60,
+                    )
+                    pick_resp = await asyncio.wait_for(
+                        asyncio.get_running_loop().run_in_executor(
+                            _thread_pool,
+                            lambda: client3.get_completion([
+                                {"role": "user", "content": pick_prompt},
+                            ], max_retries=1),
+                        ),
+                        timeout=60.0,
+                    )
+                    if pick_resp:
+                        arr_match = re.search(r'\[[^\]]*\]', pick_resp.replace("\n", " "))
+                        if arr_match:
+                            picked = json.loads(arr_match.group())
+                            if isinstance(picked, list) and len(picked) > 0:
+                                trimmed_codes = picked
+                except Exception as e:
+                    logger.warning(f"LLM 挑选失败，保留前5只: {e}")
+                    trimmed_codes = trimmed_codes[:5]
+            elif len(trimmed_codes) > 5:
+                trimmed_codes = trimmed_codes[:5]
 
         # 匹配完整股票信息
         result_stocks = []
@@ -3380,7 +3566,7 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
                     "industry": s.get("detected_industry", ""),
                 })
 
-        # 按池评分排序（有缓存用缓存）
+        # 按评分排序
         result_stocks.sort(
             key=lambda x: x.get("cache_score") or x.get("pool_score") or 0,
             reverse=True,
@@ -3389,8 +3575,11 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
         return {
             "status": "ok",
             "total_candidates": len(candidate_codes),
+            "semantic_filtered": llm_filtered,
+            "filtered_count": len(filtered_codes),
             "recommended_count": len(result_stocks),
             "needs_llm_pick": needs_llm,
+            "question_used": bool(question),
             "recommendations": result_stocks,
         }
     except HTTPException:
@@ -3605,6 +3794,12 @@ async def advisory_strategies():
     try:
         modules = _init_advisory()
         StrategyEngine = modules["strategy_engine"]
+        # 触发自定义策略加载
+        try:
+            from src.advisory.custom_strategy_loader import load_custom_strategies
+            load_custom_strategies()
+        except Exception as e:
+            logger.warning(f"自定义策略加载失败: {e}")
         catalog = StrategyEngine.get_strategy_catalog()
         return {
             "status": "ok",
@@ -3614,6 +3809,176 @@ async def advisory_strategies():
     except Exception as e:
         logger.error(f"{ERROR_ICON} 策略目录查询失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+class CustomStrategyRequest(BaseModel):
+    description: str
+    strategy_name: str
+    base_strategy: Optional[str] = None
+    custom_params: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/advisory/strategy/custom")
+async def advisory_strategy_custom(request: CustomStrategyRequest):
+    """通过自然语言生成自定义策略 — 设计 §6.5 路径2。
+
+    LLM 根据用户描述生成策略 Python 代码，保存到 data/strategies/custom/，
+    动态加载并 @register_strategy 注册。
+    """
+    try:
+        from src.advisory.custom_strategy_loader import (
+            load_custom_strategies,
+            save_custom_strategy,
+        )
+        from src.advisory.strategy_engine import StrategyEngine
+
+        description = request.description.strip()
+        strategy_name = request.strategy_name.strip()
+
+        if not description or not strategy_name:
+            raise HTTPException(status_code=400, detail="description 和 strategy_name 不能为空")
+
+        # 生成策略代码骨架
+        code_template = StrategyEngine.generate_strategy_code(
+            strategy_name=strategy_name,
+            user_description=description,
+            base_strategy=request.base_strategy,
+            custom_params=request.custom_params,
+        )
+
+        # 用 LLM 填充 TODO 实现
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+        model = os.getenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro")
+
+        fill_prompt = (
+            f"## 用户需求\n{description}\n\n"
+            f"## 策略骨架代码\n```python\n{code_template}\n```\n\n"
+            "## 任务\n"
+            "请填充上述代码中所有 TODO 部分，生成完整可运行的策略实现。\n"
+            "要求：\n"
+            "1. 保留 @register_strategy 装饰器和类名不变\n"
+            "2. 实现 enrich() 计算必要的技术指标\n"
+            "3. 实现 signal() 返回 1/-1/0\n"
+            "4. 适配 A 股日线数据（列: trade_date, close, open, high, low, vol）\n"
+            "5. 使用 self._na() 检查 NaN 值\n"
+            "6. 只输出完整 Python 代码，不要额外说明\n"
+        )
+
+        try:
+            client = OpenAICompatibleClient(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                env_prefix="",
+                extra_body=get_thinking_body(base_url, True),
+                http_timeout=120,
+            )
+            llm_resp = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    _thread_pool,
+                    lambda: client.get_completion([
+                        {"role": "user", "content": fill_prompt},
+                    ], max_retries=1),
+                ),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            llm_resp = ""
+        except Exception as e:
+            logger.warning(f"自定义策略 LLM 生成失败: {e}")
+            llm_resp = ""
+
+        # 从 LLM 响应中提取 Python 代码
+        final_code = code_template
+        if llm_resp:
+            import re as _re
+            code_match = _re.search(r'```python\s*(.*?)\s*```', llm_resp, _re.DOTALL)
+            if code_match:
+                final_code = code_match.group(1)
+            elif "from __future__" in llm_resp and "@register_strategy" in llm_resp:
+                final_code = llm_resp.strip()
+
+        # 确保代码包含 @register_strategy
+        if "@register_strategy" not in final_code:
+            final_code = code_template  # 回退到模板
+
+        # 保存策略文件
+        fpath = save_custom_strategy(strategy_name, final_code)
+
+        # 动态加载
+        load_custom_strategies()
+
+        # 验证策略是否已注册
+        catalog = StrategyEngine.get_strategy_catalog()
+        registered = any(s.get("name") == strategy_name for s in catalog)
+
+        return {
+            "status": "ok",
+            "strategy_name": strategy_name,
+            "file_path": fpath,
+            "code": final_code,
+            "registered": registered,
+            "available_strategies": catalog,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 自定义策略生成失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"自定义策略生成失败: {str(e)}")
+
+
+# ── 6.5 股票搜索（供持仓页手动添加） ──
+
+class StockSearchRequest(BaseModel):
+    keyword: str
+
+
+@app.post("/api/advisory/stock/search")
+async def advisory_stock_search(request: StockSearchRequest):
+    """搜索股票 — 设计 §5.1.1 手动搜索添加。
+
+    通过 Tushare stock_basic 按代码或名称模糊搜索。
+    """
+    try:
+        keyword = (request.keyword or "").strip()
+        if not keyword:
+            return {"status": "ok", "results": []}
+
+        from src.utils.tushare_client import _call, _items_to_dicts
+
+        result = _call(
+            "stock_basic",
+            {"exchange": "", "list_status": "L"},
+            fields="ts_code,symbol,name,area,industry,list_date",
+        )
+        items = _items_to_dicts(result) or []
+
+        kw_upper = keyword.upper()
+        matched = []
+        for item in items:
+            code = str(item.get("ts_code", ""))
+            name = str(item.get("name", ""))
+            symbol = str(item.get("symbol", ""))
+            if kw_upper in code.upper() or kw_upper in name.upper() or kw_upper in symbol.upper():
+                matched.append({
+                    "stock_code": code,
+                    "company_name": name,
+                    "industry": item.get("industry", ""),
+                    "list_date": item.get("list_date", ""),
+                })
+            if len(matched) >= 20:
+                break
+
+        return {
+            "status": "ok",
+            "keyword": keyword,
+            "count": len(matched),
+            "results": matched,
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 股票搜索失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"搜索失败: {str(e)}")
 
 
 # ── 7. 绑定策略 ──
@@ -3712,6 +4077,7 @@ async def advisory_backtest(request: BacktestRequest):
             end_date=end_date,
             strategy_name=strategy_name,
             strategy_params=request.strategy_params,
+            watchlist_codes=request.watchlist_codes,
         )
 
         return {
@@ -3725,6 +4091,8 @@ async def advisory_backtest(request: BacktestRequest):
             "total_return_pct": result.total_return_pct,
             "annualized_return_pct": result.annualized_return_pct,
             "max_drawdown_pct": result.max_drawdown_pct,
+            "sharpe_ratio": result.sharpe_ratio,
+            "win_rate": result.win_rate,
             "trade_count": result.trade_count,
             "equity_curve": result.equity_curve[-100:] if len(result.equity_curve) > 100 else result.equity_curve,
             "trades": [
@@ -3736,6 +4104,7 @@ async def advisory_backtest(request: BacktestRequest):
                     "price": t.price,
                     "shares": t.shares,
                     "commission": t.commission,
+                    "stamp_tax": t.stamp_tax,
                     "reason": t.reason,
                 }
                 for t in result.trades
@@ -3852,6 +4221,51 @@ async def advisory_simulation(request: SimulationRequest):
         raise HTTPException(status_code=500, detail=f"模拟盘操作失败: {str(e)}")
 
 
+# ── 9.5 自动追赶（进入板块触发） ──
+
+@app.post("/api/advisory/auto-catch-up")
+async def advisory_auto_catch_up():
+    """进入智能投顾板块时自动追赶所有组合 — 设计 §7.7.1。
+
+    遍历所有组合，对有结算记录的组合执行追赶。无结算记录的组合跳过。
+    """
+    try:
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        sr = modules["simulation_runner"]
+
+        portfolios = pm.list_all()
+        results = []
+        total_missed = 0
+
+        for pf in portfolios:
+            try:
+                result = sr.run_catch_up(pf.portfolio_id)
+                missed = result.get("missed", 0)
+                total_missed += missed
+                if missed > 0:
+                    results.append({
+                        "portfolio_id": pf.portfolio_id,
+                        "portfolio_name": pf.name,
+                        "missed": missed,
+                        "message": result.get("message", ""),
+                    })
+            except Exception as e:
+                logger.warning(f"组合 {pf.portfolio_id} 追赶失败: {e}")
+
+        return {
+            "status": "ok",
+            "total_portfolios": len(portfolios),
+            "catch_up_portfolios": len(results),
+            "total_missed_days": total_missed,
+            "results": results,
+            "message": f"已自动追赶 {len(results)} 个组合，共 {total_missed} 个交易日" if results else "所有组合均为最新状态",
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 自动追赶失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"自动追赶失败: {str(e)}")
+
+
 # ── 10. 收益报告 ──
 
 @app.post("/api/advisory/report")
@@ -3925,6 +4339,8 @@ async def advisory_report(request: ReportRequest):
                 "total_return_pct": bt_result.total_return_pct,
                 "annualized_return_pct": bt_result.annualized_return_pct,
                 "max_drawdown_pct": bt_result.max_drawdown_pct,
+                "sharpe_ratio": bt_result.sharpe_ratio,
+                "win_rate": bt_result.win_rate,
                 "trade_count": bt_result.trade_count,
                 "strategy_name": bt_result.strategy_name,
                 "start_date": request.start_date,
@@ -3936,6 +4352,8 @@ async def advisory_report(request: ReportRequest):
             settlement_dir = sr._settlement_dir
             pattern = os.path.join(settlement_dir, f"{request.portfolio_id}_*.json")
             files = sorted(glob_module.glob(pattern))
+            sim_dates = []
+            sim_trade_count = 0
             for fp in files:
                 try:
                     with open(fp, "r", encoding="utf-8") as f:
@@ -3943,26 +4361,63 @@ async def advisory_report(request: ReportRequest):
                     tv = s.get("total_value", 0)
                     if tv > 0:
                         user_equity.append(tv)
+                    sd = s.get("date", "")
+                    if sd:
+                        sim_dates.append(sd)
+                    sim_trade_count += len(s.get("trades", []))
                 except Exception:
                     pass
             if user_equity and user_equity[0] > 0:
                 base = user_equity[0]
                 user_equity = [v / base for v in user_equity]
 
+            # 从权益曲线计算最大回撤
+            sim_max_dd = 0.0
+            if user_equity and len(user_equity) >= 2:
+                peak = float(user_equity[0])
+                for val in user_equity[1:]:
+                    v = float(val)
+                    if v > peak:
+                        peak = v
+                    if peak > 0:
+                        dd = (peak - v) / peak * 100.0
+                        if dd > sim_max_dd:
+                            sim_max_dd = dd
+
+            sim_sharpe = modules["backtest_runner"]._calc_sharpe_ratio(user_equity)
+
             backtest_summary = {
                 "total_return_pct": round((user_equity[-1] - 1) * 100, 2) if user_equity else 0,
-                "max_drawdown_pct": 0,
-                "trade_count": len(files),
+                "max_drawdown_pct": round(sim_max_dd, 4),
+                "sharpe_ratio": round(sim_sharpe, 4),
+                "trade_count": sim_trade_count,
                 "strategy_name": pf.bound_strategy or "无",
-                "start_date": files[0] if files else "",
-                "end_date": files[-1] if files else "",
+                "start_date": sim_dates[0] if sim_dates else "",
+                "end_date": sim_dates[-1] if sim_dates else "",
             }
 
         # 生成图表
         chart_path = ""
+        deepseek_summary = None
+        if request.include_deepseek:
+            try:
+                line = modules["llm_free_line"]
+                line.load_state()
+                ds_curve = line.get_equity_curve()
+                if ds_curve:
+                    deepseek_equity = ds_curve
+                    ctx = line.get_context()
+                    deepseek_summary = {
+                        "total_return_pct": ctx.get("return_rate", 0.0),
+                        "trade_count": len(line.trades),
+                        "holdings_count": ctx.get("holdings_count", 0),
+                        "total_value": ctx.get("total_value", 0.0),
+                    }
+            except Exception as e:
+                logger.warning(f"DeepSeek 自由线数据加载失败: {e}")
+
         if user_equity:
             try:
-                # 仅当有真实对照数据时才传入，不合成假数据
                 has_comparison = bool(deepseek_equity or benchmark_equity)
                 chart_title = (
                     "收益对比图"
@@ -3979,14 +4434,47 @@ async def advisory_report(request: ReportRequest):
                 logger.warning(f"图表生成失败: {e}")
                 chart_path = ""
 
-        # 构建 LLM 提示词
+        # 构建 LLM 提示词（注入交易明细 — 设计 §9.2 附录）
         chart_paths = [chart_path] if chart_path else []
+
+        # 收集交易明细文本
+        trade_detail_lines: List[str] = []
+        if request.report_type == "backtest":
+            for t in bt_result.trades[:50]:
+                trade_detail_lines.append(
+                    f"  - {t.date} {t.action} {t.company_name}({t.stock_code}) "
+                    f"{t.shares}股 @ {t.price:.2f} — {t.reason}"
+                )
+        else:
+            sr = modules["simulation_runner"]
+            settlement_dir = sr._settlement_dir
+            pattern = os.path.join(settlement_dir, f"{request.portfolio_id}_*.json")
+            files = sorted(glob_module.glob(pattern))
+            for fp in files:
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        s = json.load(f)
+                    for t in s.get("trades", []):
+                        trade_detail_lines.append(
+                            f"  - {t.get('date','')} {t.get('action','')} "
+                            f"{t.get('company_name','')}({t.get('stock_code','')}) "
+                            f"{t.get('shares',0)}股 @ {t.get('price',0):.2f} — {t.get('reason','')}"
+                        )
+                    if len(trade_detail_lines) >= 50:
+                        break
+                except Exception:
+                    pass
+
+        trade_detail = "\n".join(trade_detail_lines[:50]) if trade_detail_lines else "无交易记录"
+
         prompt = gen.build_report_prompt(
             report_type=request.report_type,
             user_summary=backtest_summary,
-            deepseek_summary=None,  # 仅在有真实 DeepSeek 自由线数据时传入
+            deepseek_summary=deepseek_summary,
             chart_paths=chart_paths,
         )
+        # 追加交易明细到 prompt
+        prompt += f"\n\n## 交易明细（附录数据）\n{trade_detail}\n"
 
         # 调用 LLM 生成报告
         try:
@@ -4018,9 +4506,11 @@ async def advisory_report(request: ReportRequest):
             logger.warning(f"LLM 报告生成失败: {e}")
             report_content = f"报告生成失败: {e}"
 
-        # 保存报告
+        # 保存报告（Markdown + HTML + PDF）
         title = f"{request.report_type}_{request.portfolio_id}"
         report_path = gen.save_report(report_content, title)
+        html_path = gen.save_report_html(report_content, title, backtest_summary)
+        pdf_path = gen.save_report_pdf(report_content, title, backtest_summary)
 
         return {
             "status": "ok",
@@ -4028,6 +4518,8 @@ async def advisory_report(request: ReportRequest):
             "portfolio_id": request.portfolio_id,
             "report_content": report_content,
             "report_path": report_path,
+            "html_path": html_path,
+            "pdf_path": pdf_path,
             "chart_path": chart_path,
             "summary": backtest_summary,
         }
@@ -4038,7 +4530,555 @@ async def advisory_report(request: ReportRequest):
         raise HTTPException(status_code=500, detail=f"报告生成失败: {str(e)}")
 
 
-# ── 11. 用户画像 ──
+# ── 11. AI 顾问对话 ──
+
+def _build_advisory_system_prompt(profile_summary: str, page_name: str = "", page_data: Any = None) -> str:
+    """构建智能投顾 AI 顾问的 system prompt。"""
+    system_parts = [
+        "你是一位专业的A股智能投资顾问助手。",
+        "你的职责是为用户提供股票分析、持仓管理、策略建议、市场分析等投顾服务。",
+        "",
+        "## 用户投资画像",
+        profile_summary,
+        "",
+        "## 行为规范",
+        "- 使用 [数据] 标签标注从工具/数据中获取的确定信息",
+        "- 使用 [判断] 标签标注你的分析推理",
+        "- 不确定时坦诚说明，不要编造数据",
+        "- 推荐结果必须附免责声明：'以上仅为 AI 分析参考，不构成投资建议。市场有风险，投资需谨慎。'",
+        "- 回答简洁专业，用中文回复",
+        "",
+        "## 用户画像工具",
+        "当用户明确陈述偏好或你可以从对话中推断偏好时，调用 update_user_profile 工具更新画像。",
+        "当需要确认当前画像时，调用 get_user_profile 工具查询。",
+        "例如：用户说'我是保守型投资者' → 调用 update_user_profile(risk_tolerance='Conservative')。",
+    ]
+    if page_name:
+        system_parts.append(f"\n## 当前页面上下文\n用户正在查看「{page_name}」页面。")
+        if page_data:
+            system_parts.append(f"页面数据: {json.dumps(page_data, ensure_ascii=False)}")
+            system_parts.append("你可以就用户当前页面看到的数据进行分析和解答。")
+    return "\n".join(system_parts)
+
+
+def _execute_profile_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """执行用户画像工具调用，返回结果字符串。"""
+    from src.advisory.profile_tools import (
+        update_user_profile_tool,
+        get_user_profile_tool,
+    )
+    if tool_name == "update_user_profile":
+        return update_user_profile_tool(**arguments)
+    elif tool_name == "get_user_profile":
+        return get_user_profile_tool()
+    return f"未知工具: {tool_name}"
+
+
+@app.post("/api/advisory/chat")
+async def advisory_chat(request: ChatRequest):
+    """AI 顾问对话 — 调用 M1 MiMo-V2.5-Pro，注入用户画像与页面上下文。
+
+    设计 §2：右侧常驻 AI 面板的后端支持。
+    设计 §3.4：支持 function calling，LLM 可调用 update_user_profile / get_user_profile 工具。
+    每次对话注入当前页面上下文 + 用户画像，让 AI 感知用户在看什么。
+    """
+    try:
+        from src.advisory.profile_tools import PROFILE_TOOLS_SCHEMA
+
+        modules = _init_advisory()
+        upm = modules["user_profile_manager"]
+
+        # 加载用户画像
+        profile_summary = upm.get_profile_summary()
+
+        # 解析页面上下文
+        page_name = ""
+        page_data = None
+        if request.page_context:
+            try:
+                ctx = json.loads(request.page_context)
+                page_name = ctx.get("page", "")
+                page_data = ctx.get("data", {})
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        system_prompt = _build_advisory_system_prompt(profile_summary, page_name, page_data)
+
+        # 调用 M1 模型（支持 function calling 循环）
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+        model = os.getenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro")
+
+        try:
+            from openai import OpenAI as _OpenAISdk
+            import httpx as _httpx
+
+            raw_client = _OpenAISdk(
+                base_url=base_url,
+                api_key=api_key,
+                timeout=_httpx.Timeout(120, connect=30),
+            )
+            thinking_body = get_thinking_body(base_url, True)
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.message},
+            ]
+            tool_schemas = [t["function"] for t in PROFILE_TOOLS_SCHEMA]
+            # OpenAI tools 格式
+            tools_for_api = [
+                {"type": "function", "function": f} for f in tool_schemas
+            ]
+
+            reply = ""
+            tool_calls_log: List[Dict[str, Any]] = []
+            max_rounds = 3  # 最多 3 轮 tool 调用循环
+            tools_enabled = True  # 若首轮 tools 调用失败则降级
+
+            for round_idx in range(max_rounds):
+                api_kwargs = dict(
+                    model=model,
+                    messages=messages,
+                )
+                if tools_enabled:
+                    api_kwargs["tools"] = tools_for_api
+                if thinking_body:
+                    api_kwargs["extra_body"] = thinking_body
+
+                try:
+                    resp = await asyncio.wait_for(
+                        asyncio.get_running_loop().run_in_executor(
+                            _thread_pool,
+                            lambda: raw_client.chat.completions.create(**api_kwargs),
+                        ),
+                        timeout=120.0,
+                    )
+                except Exception as call_err:
+                    if tools_enabled and round_idx == 0:
+                        logger.warning(f"tools 参数调用失败，降级为无 tools 模式: {call_err}")
+                        tools_enabled = False
+                        continue
+                    raise
+
+                choice = resp.choices[0] if resp.choices else None
+                if choice is None:
+                    reply = "抱歉，模型返回空结果。"
+                    break
+
+                msg = choice.message
+
+                # 如果有 tool_calls，执行工具并继续对话
+                if tools_enabled and getattr(msg, "tool_calls", None) and len(msg.tool_calls) > 0:
+                    # 把 assistant 消息（含 tool_calls）加入对话
+                    messages.append({
+                        "role": "assistant",
+                        "content": msg.content or "",
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in msg.tool_calls
+                        ],
+                    })
+
+                    for tc in msg.tool_calls:
+                        tool_name = tc.function.name
+                        try:
+                            parsed = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                        except (json.JSONDecodeError, TypeError):
+                            parsed = {}
+                        if not isinstance(parsed, dict):
+                            parsed = {}
+                        arguments = parsed
+                        try:
+                            tool_result = _execute_profile_tool(tool_name, arguments)
+                        except Exception as te:
+                            logger.warning(f"工具 {tool_name} 执行失败: {te}")
+                            tool_result = f"工具执行失败: {te}"
+                        tool_calls_log.append({
+                            "tool": tool_name,
+                            "arguments": arguments,
+                            "result_preview": tool_result[:200],
+                        })
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": tool_result,
+                        })
+
+                    # 刷新 profile_summary 以反映更新后的画像
+                    if any(tc.function.name == "update_user_profile" for tc in msg.tool_calls):
+                        profile_summary = upm.get_profile_summary()
+                    # 继续下一轮，让 LLM 基于工具结果生成回复
+                    continue
+
+                # 无 tool_calls，取 content 作为最终回复
+                reply = msg.content or "抱歉，我暂时无法生成回复，请稍后重试。"
+                break
+            else:
+                reply = reply or "抱歉，工具调用轮次超限，请简化问题后重试。"
+
+        except asyncio.TimeoutError:
+            reply = "抱歉，回复生成超时（120s），请简化问题后重试。"
+        except Exception as e:
+            logger.warning(f"AI 对话模型调用失败: {e}")
+            reply = f"抱歉，模型服务暂时不可用。（{str(e)[:100]}）"
+
+        return {
+            "status": "ok",
+            "reply": reply,
+            "session_id": request.session_id,
+            "page_context": request.page_context,
+            "model": model,
+            "tool_calls": tool_calls_log,
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} AI 对话失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"AI 对话失败: {str(e)}")
+
+# ── 12. 组合健康度评估 ──
+
+@app.post("/api/advisory/portfolio/health")
+async def advisory_portfolio_health(request: PortfolioHealthRequest):
+    """组合健康度五色评估 — 设计 §5.2。
+
+    调用 PortfolioAssessor 构建评估提示词，
+    通过 M1 MiMo-V2.5-Pro 进行五色（深绿/浅绿/黄/橙/红）综合评估。
+    """
+    try:
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        assessor = modules["portfolio_assessor"]
+
+        pf = pm.load(request.portfolio_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail=f"组合 {request.portfolio_id} 不存在")
+
+        if not pf.holdings:
+            return {
+                "status": "ok",
+                "portfolio_id": request.portfolio_id,
+                "color": "yellow",
+                "color_label": "黄色",
+                "summary": "当前持仓为空，无法进行健康度评估。请先添加持仓。",
+            }
+
+        # 构建评估上下文
+        ctx = assessor.prepare_health_context(pf)
+
+        # 调用 M1 模型
+        try:
+            base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
+            api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+            model = os.getenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro")
+
+            client = OpenAICompatibleClient(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                env_prefix="",
+                extra_body=get_thinking_body(base_url, True),
+                http_timeout=120,
+            )
+
+            response = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    _thread_pool,
+                    lambda: client.get_completion([
+                        {"role": "user", "content": ctx["prompt"]},
+                    ], max_retries=1),
+                ),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            response = '{"color": "yellow", "summary": "评估超时，请稍后重试"}'
+        except Exception as e:
+            logger.warning(f"健康度评估模型调用失败: {e}")
+            response = '{"color": "yellow", "summary": "模型服务暂时不可用"}'
+
+        # 解析 LLM 返回的 JSON
+        color = "yellow"
+        color_label = "黄色"
+        summary = "评估结果解析失败，请重试"
+        term_bias = ""
+        stock_advice = []
+
+        try:
+            result = json.loads(response.strip())
+            color = result.get("color", "yellow")
+            summary = result.get("summary", summary)
+            term_bias = result.get("term_bias", "")
+            stock_advice = result.get("stock_advice", []) or []
+        except json.JSONDecodeError:
+            # 尝试从文本中提取 JSON（支持嵌套）
+            json_match = _extract_json_object(response)
+            if json_match:
+                try:
+                    result = json.loads(json_match)
+                    color = result.get("color", "yellow")
+                    summary = result.get("summary", summary)
+                    term_bias = result.get("term_bias", "")
+                    stock_advice = result.get("stock_advice", []) or []
+                except json.JSONDecodeError:
+                    pass
+
+        color_labels = {
+            "deep_green": "深绿 — 组合稳健优秀",
+            "light_green": "浅绿 — 组合良好",
+            "yellow": "黄色 — 组合一般",
+            "orange": "橙色 — 需要关注",
+            "red": "红色 — 存在显著风险",
+        }
+        color_label = color_labels.get(color, color)
+
+        return {
+            "status": "ok",
+            "portfolio_id": request.portfolio_id,
+            "holdings_count": ctx["holdings_count"],
+            "color": color,
+            "color_label": color_label,
+            "summary": summary,
+            "term_bias": term_bias,
+            "stock_advice": stock_advice,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 健康度评估失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"健康度评估失败: {str(e)}")
+
+# ── 13. 偏好匹配度评估 ──
+
+@app.post("/api/advisory/portfolio/preference-match")
+async def advisory_portfolio_preference_match(request: PreferenceMatchRequest):
+    """偏好匹配度四级评估 — 设计 §5.3。
+
+    对比持仓与用户画像，给出四级匹配（高度匹配/基本匹配/部分偏离/显著偏离）。
+    """
+    try:
+        modules = _init_advisory()
+        pm = modules["portfolio_manager"]
+        assessor = modules["portfolio_assessor"]
+        upm = modules["user_profile_manager"]
+
+        pf = pm.load(request.portfolio_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail=f"组合 {request.portfolio_id} 不存在")
+
+        profile = upm.get_profile()
+
+        if not pf.holdings:
+            return {
+                "status": "ok",
+                "portfolio_id": request.portfolio_id,
+                "level": "basic",
+                "level_label": "基本匹配",
+                "reason": "当前持仓为空，无法进行偏好匹配评估。",
+            }
+
+        # 构建评估上下文
+        ctx = assessor.prepare_preference_context(pf, profile)
+
+        # 调用 M1 模型
+        try:
+            base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
+            api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+            model = os.getenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro")
+
+            client = OpenAICompatibleClient(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                env_prefix="",
+                extra_body=get_thinking_body(base_url, True),
+                http_timeout=120,
+            )
+
+            response = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    _thread_pool,
+                    lambda: client.get_completion([
+                        {"role": "user", "content": ctx["prompt"]},
+                    ], max_retries=1),
+                ),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            response = '{"level": "basic", "reason": "评估超时，请稍后重试"}'
+        except Exception as e:
+            logger.warning(f"偏好匹配评估模型调用失败: {e}")
+            response = '{"level": "basic", "reason": "模型服务暂时不可用"}'
+
+        # 解析
+        level = "basic"
+        level_label = "基本匹配"
+        reason = "评估结果解析失败，请重试"
+
+        try:
+            result = json.loads(response.strip())
+            level = result.get("level", "basic")
+            reason = result.get("reason", reason)
+        except json.JSONDecodeError:
+            json_match = _extract_json_object(response)
+            if json_match:
+                try:
+                    result = json.loads(json_match)
+                    level = result.get("level", "basic")
+                    reason = result.get("reason", reason)
+                except json.JSONDecodeError:
+                    pass
+
+        level_labels = {
+            "high": "✅ 高度匹配",
+            "basic": "👍 基本匹配",
+            "partial": "⚠️ 部分偏离",
+            "deviated": "❌ 显著偏离",
+        }
+        level_label = level_labels.get(level, level)
+
+        return {
+            "status": "ok",
+            "portfolio_id": request.portfolio_id,
+            "level": level,
+            "level_label": level_label,
+            "reason": reason,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 偏好匹配评估失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"偏好匹配评估失败: {str(e)}")
+
+# ── 14. DeepSeek 自由投资线 ──
+
+@app.post("/api/advisory/free-line")
+async def advisory_free_line(request: FreeLineRequest):
+    """DeepSeek 自由投资线控制 — 设计 §8。
+
+    action:
+      - "start": 运行一次自主决策（调用 DeepSeek V4 Pro 分析市场并决定买卖）
+      - "status": 返回当前自由线的持仓/资金/收益状态
+      - "decide": 仅生成决策建议，不实际执行
+    """
+    try:
+        if request.action not in ("start", "status", "decide"):
+            raise HTTPException(
+                status_code=400,
+                detail="action 必须为 start / status / decide",
+            )
+
+        modules = _init_advisory()
+        line = modules["llm_free_line"]
+
+        if request.action == "status":
+            ctx = line.get_context()
+            return {
+                "status": "ok",
+                "action": "status",
+                "context": ctx,
+            }
+
+        # 构建投资上下文 + 决策提示
+        ctx = line.get_context()
+        ctx_summary = (
+            f"当前时间：{datetime.now().strftime('%Y-%m-%d')}\n"
+            f"可用现金：{ctx['cash']:.2f} 元\n"
+            f"持仓数量：{ctx['holdings_count']} 只\n"
+            f"总市值：{ctx['total_market_value']:.2f} 元\n"
+            f"总资产：{ctx['total_value']:.2f} 元\n"
+            f"累计收益率：{ctx['return_rate']:.2f}%\n"
+        )
+
+        if ctx["positions"]:
+            ctx_summary += "\n当前持仓：\n"
+            for code, pos in ctx["positions"].items():
+                ctx_summary += (
+                    f"  {code}: {pos['quantity']}股, "
+                    f"成本 {pos['cost_price']:.2f}, "
+                    f"现价 {pos['current_price']:.2f}\n"
+                )
+
+        user_prompt = (
+            f"## 当前投资状态\n\n{ctx_summary}\n\n"
+            "## 任务\n\n"
+            "请根据以上状态和当前市场数据，做出你的投资决策。\n"
+            "你可以调用可用的 MCP 数据工具来获取股票行情、财务数据等信息。\n"
+            "根据你的分析，决定是否进行买卖操作。\n\n"
+            "请以 JSON 格式输出你的决策。"
+        )
+
+        decision = line.decide(user_prompt)
+
+        if request.action == "start":
+            # 实际执行决策
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            executed = line.execute_decision(
+                decision.get("decisions", []),
+                trade_date=today_str,
+            )
+            line.record_daily_settlement(today_str)
+            return {
+                "status": "ok",
+                "action": "start",
+                "reasoning": decision.get("reasoning", ""),
+                "decisions": decision.get("decisions", []),
+                "executed": len(executed),
+                "context": line.get_context(),
+            }
+        else:
+            # decide 模式：只生成建议不执行
+            return {
+                "status": "ok",
+                "action": "decide",
+                "reasoning": decision.get("reasoning", ""),
+                "decisions": decision.get("decisions", []),
+                "context": ctx,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 自由线操作失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"自由线操作失败: {str(e)}")
+
+# ── 15. 用户画像更新 ──
+
+@app.post("/api/advisory/user-profile")
+async def advisory_user_profile_update(request: ProfileUpdateRequest):
+    """更新用户投资画像 — 设计 §3.4。
+
+    支持更新风险承受能力、投资周期、偏好/回避板块、投资风格等字段。
+    """
+    try:
+        modules = _init_advisory()
+        upm = modules["user_profile_manager"]
+
+        kwargs = request.custom_preferences or {}
+        result_msg = upm.update_profile(
+            risk_tolerance=request.risk_tolerance,
+            investment_horizon=request.investment_horizon,
+            favorite_sectors=request.favorite_sectors,
+            avoid_sectors=request.avoid_sectors,
+            investment_style=request.investment_style,
+            **kwargs,
+        )
+
+        profile = upm.get_profile()
+        return {
+            "status": "ok",
+            "message": result_msg,
+            "profile": profile,
+        }
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} 画像更新失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"画像更新失败: {str(e)}")
+
+# ── 16. 用户画像查询 ──
 
 @app.get("/api/advisory/user-profile")
 async def advisory_user_profile():

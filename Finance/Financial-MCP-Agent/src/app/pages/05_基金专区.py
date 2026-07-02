@@ -18,6 +18,7 @@ from api_client import APIError
 from config import API_BASE_URL
 from theme import page_title
 from components.common import safe_str
+from components.shared_sidebar import render_sidebar
 
 
 # ──────────────────────────────────────────────
@@ -28,6 +29,7 @@ st.set_page_config(
     page_icon="🏦",
     layout="wide",
 )
+render_sidebar()
 
 # ──────────────────────────────────────────────
 # 自定义样式

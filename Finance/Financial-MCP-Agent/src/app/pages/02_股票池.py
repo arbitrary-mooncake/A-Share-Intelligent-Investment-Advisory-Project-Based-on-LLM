@@ -41,6 +41,7 @@ from api_client import (
 )
 from config import POOL_TERMS
 from theme import inject_global_styles, page_title
+from components.shared_sidebar import render_sidebar
 
 
 # ──────────────────────────────────────────────
@@ -49,6 +50,7 @@ from theme import inject_global_styles, page_title
 st.set_page_config(page_title="股票池", page_icon="📊", layout="wide")
 
 inject_global_styles()
+render_sidebar()
 
 
 # ──────────────────────────────────────────────

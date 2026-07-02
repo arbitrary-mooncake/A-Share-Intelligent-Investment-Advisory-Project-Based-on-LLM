@@ -11,6 +11,7 @@ from .strategy_registry import (
     register_strategy,
     get_strategy_class,
 )
+from . import builtin  # noqa: F401 — 触发所有内置策略的 @register_strategy 注册
 
 __all__ = [
     "TradingStrategy",

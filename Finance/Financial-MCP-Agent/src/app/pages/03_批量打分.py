@@ -35,6 +35,7 @@ from api_client import (
     get_batch_results,
     poll_batch_results,
 )
+from components.shared_sidebar import render_sidebar
 
 # ──────────────────────────────────────────────
 # 持久化存储 — 结果存磁盘，刷新不丢失
@@ -115,6 +116,7 @@ def _stock_key(stock: dict) -> str:
 # 页面配置
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="批量打分", page_icon="📋", layout="wide")
+render_sidebar()
 
 # ──────────────────────────────────────────────
 # 自定义样式：DataFrame 多选框勾选颜色改为红色

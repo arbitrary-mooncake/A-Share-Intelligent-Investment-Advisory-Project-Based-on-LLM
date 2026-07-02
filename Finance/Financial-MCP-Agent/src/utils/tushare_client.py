@@ -2,14 +2,18 @@
 Tushare HTTP API 客户端 — 轻量封装，支持 200次/分钟 调用频率
 提供: 历史PE/PB分位、PS/PCF、财务指标、行业分类、资金流向、分红历史
 """
+import os
 import time
 import threading
 import requests
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 
-TUSHARE_TOKEN = "fd4ff6e84626d2e63616ec08769f99110d626a91856036c30cb34818"
-TUSHARE_URL = "https://api.tushare.pro"
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+TUSHARE_URL = os.getenv("TUSHARE_URL", "https://api.tushare.pro")
+if not TUSHARE_TOKEN:
+    import logging
+    logging.getLogger(__name__).warning("TUSHARE_TOKEN 未设置，Tushare API 调用将失败")
 
 # 速率控制: 200次/分钟 → 最小间隔 0.3s
 _last_call_time = 0.0
@@ -147,7 +151,7 @@ def get_fina_indicator(ts_code: str, years: int = 3) -> List[Dict]:
     return _items_to_dicts(r)
 
 
-_FINA_BATCH_SIZE = 40
+_FINA_BATCH_SIZE = 200  # Tushare fina_indicator 单次最大ts_code数
 
 
 def _chunk_ts_codes(ts_codes: List[str], size: int = _FINA_BATCH_SIZE) -> List[List[str]]:

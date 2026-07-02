@@ -126,12 +126,12 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
                     status_box.update(label=f"更新失败", state="error")
                     st.error(f"精筛池更新失败: {e}")
         st.caption(
-            "\U0001f446 四层筛选管线（总纲§4.1）:\n\n"
+            "\U0001f446 四层筛选管线（总纲§4.1, V3 流式 + L2 pre-fetch 复用）:\n\n"
             "**Layer 0 硬筛**: 去ST/新股/BJ/B股/近20日日均成交额<2000万 → ~4500只\n"
-            "**Layer 1 批量粗筛**: M1/M3生产模型5只/批打分, 分4档\n"
-            "**Layer 2 快筛**: M2(Qwen3.6-Flash)过滤初筛池\n"
-            "**Layer 3 精筛**: 白名单+初筛通过1:1.2差额 → 正式7Agent+3Scorer → LLM动态阈值\n\n"
-            "⏱ 预计耗时: ≈1小时(短线100只)"
+            "**Layer 1 批量粗筛**: M1/M3生产模型5只/批打分, 分4档 (raw_data 同步累积)\n"
+            "**Layer 2 快筛**: DSV4Pro 流式双堆 top-α, 复用 L1 raw_data (省 10-20min)\n"
+            "**Layer 3 精筛**: 白名单+推荐1:1.2差额 → 正式7Agent+3Scorer (5并发) → LLM动态阈值\n\n"
+            "⏱ 冷启动耗时: 短线/中线 ≈1-1.5h, 长线 ≈0.8-1h (热缓存 <30min)"
         )
 
     with col4:

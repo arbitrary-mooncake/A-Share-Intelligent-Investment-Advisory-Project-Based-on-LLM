@@ -147,6 +147,18 @@ When `news` conflicts with `event`, `event` wins. Reports must surface conflicts
 
 Cache hit restores both text AND structured signal_pack (via `read_signal_pack_cache` → fallback re-extraction from cached LLM text).
 
+### Two Tushare Access Paths
+
+The system accesses Tushare data through two distinct layers — important for debugging:
+
+**MCP tools (FastMCP stdio):** Used by agents during normal single-stock analysis. Each tool call goes through the MCP protocol → Tushare HTTP API. Has `tool_cache.py` in-memory cache (5-min TTL, MD5 keys).
+
+**Direct HTTP (`tushare_client.py` / `data_fetcher.py`):** Used by `batch_scorer.py` and eval system for bulk operations. `tushare_client.py` wraps Tushare HTTP API with explicit rate limiting (200 calls/min, 0.35s interval). `data_fetcher.py` is eval-specific, raises `TushareUnavailableError` on failure.
+
+`pool_screening.py` Layer 0 (`hard_screen`) uses `eval/data_fetcher._call()` directly for per-stock `daily` queries.
+
+**`_BATCH_PREFETCH_ENABLED`** (`batch_scorer.py:55`): Toggles Tushare bulk pre-fetch before HTTP data fetch in `fetch_batch()`. Disable to isolate HTTP fetch issues from Tushare issues during debugging.
+
 ## Eval/Backtest System (V2 — 2026-06 upgrade)
 
 The eval system (`src/eval/`) is an **evaluation control tower** surrounding the main advisory system. It runs simulation trading (14 lines) and historical backtesting (23 lines) to measure agent contributions via ablation experiments.
@@ -229,6 +241,31 @@ All strategies are pure code, no LLM calls (except LLM Free). Implemented in `sr
 - Mid-range (score 45-65): every 5 days
 - Stable low-score (score<45): every 7 days
 - Monday full coverage for all tiers
+
+Implementation: `orchestrator._get_scoring_frequency_tier()` (line ~877) computes tiers, `_should_analyze_today()` (line ~910) applies day_of_year modulo rules. Non-analysis-day stocks fall back to cached pool scores.
+
+**Eval orchestrator L2 cache check** (`orchestrator.py:770-822`, `_get_real_scores()`): Before running the full pipeline, reads all 7 agent signal_pack caches via `read_signal_pack_cache()`. If ALL 7 are fresh within their TTL → skips the entire LLM pipeline and calls `_assemble_from_agent_caches()` to reconstruct the result from cached data. If any one agent's cache is stale or missing → runs `run_stock_analysis()` for the full pipeline, then decomposes and writes per-agent caches individually.
+
+### Pool Screening Performance
+
+Cold start (first run, no caches exist) — V3 流水线 (2026-07 优化后):
+- Layer 0: ~2min (20 批量 `daily` API queries, trade_date-keyed)
+- Layer 1: ~20-30min (Tushare prefetch + HTTP parallel + LLM × ~900 batches of 5, 100只/批流式产出 raw_data)
+- Layer 2: ~3-5min (**复用 L1 raw_data, 跳过 fetch_batch**; DSV4Pro 流式双堆 top-α 后台流水线)
+- Layer 3: ~30-60min (~100 stocks × ~200s/stock, **5 并发** async queue consumer, shared ScoringEngine)
+- **Total cold start: ~1.0-1.5h** (short/medium), ~0.8-1.0h (long)
+
+V3 vs V2 savings:
+- 消除 Layer 2 冗余 `fetch_batch` (省 ~10-20min)
+- L2 后台流水线不阻塞 L1 循环 (省 ~2-5min)
+- L3 并发从 5 提升到 8 (省 ~15-20min)
+
+Hot cache (subsequent runs within TTL):
+- Agents with fresh caches skip LLM (fundamental=15d, value/quality_risk=7d, tech/news/event/moneyflow=1d)
+- Eval orchestrator skips entire pipeline when all 7 signal_packs hit
+- Layer 3 bottleneck shifts from agent LLM time to scorer LLM time only
+
+Key bottleneck (V3): Layer 3 的 5 并发 ScoringEngine × 7 agent × MCP stdio server。Layer 0 的 per-day 批量 `daily` 查询 (20 次 Tushare API) 已优化, 不再是 ~4500 次逐只查询。
 
 ### Eval-Specific Constraints
 

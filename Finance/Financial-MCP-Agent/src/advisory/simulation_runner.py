@@ -187,9 +187,7 @@ class SimulationRunner:
                             "模拟盘 %s: %s 下一交易日数据不可得，退回当日收盘价 %.2f 执行",
                             date, code, today_close or 0.0,
                         )
-                        exec_price = self._safe_float(
-                            today_data.get("open"), today_close
-                        )
+                        exec_price = float(today_close)
 
                     if sig == 1 and position == 0:
                         company_name = name_map.get(code, code)
@@ -448,28 +446,10 @@ class SimulationRunner:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _safe_float(value: Any, fallback: float) -> float:
-        """安全地将值转为 float，失败时返回 fallback。
-
-        Args:
-            value: 待转换的值。
-            fallback: 转换失败时的默认值。
-
-        Returns:
-            float 类型的值。
-        """
-        if value is None:
-            return fallback
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return fallback
-
-    @staticmethod
     def _next_trade_date(date: str) -> str:
         """推算下一交易日（YYYY-MM-DD）。
 
-        基于日历日递增，最多尝试 5 天以跳过周末/节假日。
+        基于日历日递增，最多尝试 5 天以跳过周末。
         不保证精确（不调用 trade_cal），仅用于实时模拟的尽力尝试。
 
         Args:
@@ -479,4 +459,8 @@ class SimulationRunner:
             推测的下一交易日 YYYY-MM-DD。
         """
         dt = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
+        for _ in range(5):
+            if dt.weekday() < 5:  # 0=Monday ... 4=Friday
+                return dt.strftime("%Y-%m-%d")
+            dt += timedelta(days=1)
         return dt.strftime("%Y-%m-%d")

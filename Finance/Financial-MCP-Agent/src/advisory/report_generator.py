@@ -36,7 +36,22 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as _fm
 from matplotlib.ticker import FuncFormatter
+
+# 注册系统中文字体，避免图表中文显示为方块
+_CN_FONT_CANDIDATES = [
+    "Microsoft YaHei", "SimHei", "SimSun",
+    "WenQuanYi Zen Hei", "WenQuanYi Micro Hei", "Noto Sans CJK SC",
+]
+for _cn_font in _CN_FONT_CANDIDATES:
+    try:
+        _fm.findfont(_cn_font, fallback_to_default=False)
+        plt.rcParams["font.sans-serif"] = [_cn_font] + plt.rcParams.get("font.sans-serif", [])
+        plt.rcParams["axes.unicode_minus"] = False
+        break
+    except Exception:
+        continue
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +379,313 @@ class AdvisoryReportGenerator:
         logger.info("报告已保存: %s (%d 字符)", filepath, len(content))
         return filepath
 
+    def save_report_html(self, content: str, title: str,
+                         summary: Optional[Dict[str, Any]] = None) -> str:
+        """保存 HTML 格式报告（可在浏览器中打开/打印为 PDF）。
+
+        将 Markdown 内容包装为带样式的 HTML 报告页面，
+        包含标题、元数据和响应式布局。适合打印导出为 PDF。
+
+        Args:
+            content: Markdown 格式的报告内容。
+            title: 报告标题。
+            summary: 可选，收益摘要字典，展示在报告头部。
+
+        Returns:
+            保存的 HTML 文件绝对路径。
+        """
+        safe_title = re.sub(r"[^\w\-_]", "_", title, flags=re.UNICODE)
+        safe_title = safe_title.strip("_")[:60] or "report"
+        content_hash = hashlib.md5(content[:200].encode("utf-8")).hexdigest()[:8]
+
+        # 将 Markdown 内容转为简单 HTML
+        html_body = self._md_to_html(content)
+
+        # 构建摘要表
+        summary_html = ""
+        if summary:
+            rows = []
+            for key, label in [
+                ("total_return_pct", "总收益率"), ("annualized_return_pct", "年化收益率"),
+                ("max_drawdown_pct", "最大回撤"), ("sharpe_ratio", "夏普比率"),
+                ("win_rate", "胜率"), ("trade_count", "交易次数"),
+            ]:
+                val = summary.get(key)
+                if val is not None:
+                    try:
+                        rows.append(f"<tr><td>{label}</td><td>{float(val):.2f}</td></tr>")
+                    except (ValueError, TypeError):
+                        rows.append(f"<tr><td>{label}</td><td>{val}</td></tr>")
+            if rows:
+                summary_html = (
+                    '<div class="summary-card"><h3>收益概览</h3>'
+                    f'<table>{"".join(rows)}</table></div>'
+                )
+
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+  @media print {{ body {{ margin: 0 15mm; }} }}
+  body {{ font-family: "Microsoft YaHei","SimSun",sans-serif; max-width:800px; margin:0 auto; padding:20px; color:#1a1a1a; line-height:1.8; }}
+  h1 {{ border-bottom: 3px solid #2563eb; padding-bottom: 12px; }}
+  h2 {{ border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; margin-top: 32px; }}
+  .summary-card {{ background: #f0f7ff; border-radius: 8px; padding: 16px 24px; margin: 16px 0; }}
+  .summary-card table {{ border-collapse:collapse; width:100%; }}
+  .summary-card td {{ padding: 4px 16px 4px 0; }}
+  .summary-card td:first-child {{ color:#64748b; }}
+  .summary-card td:last-child {{ font-weight:700; }}
+  .disclaimer {{ background:#fff3cd; padding:12px 16px; border-radius:6px; margin-top:32px; font-size:0.9em; color:#856404; }}
+  @media print {{ .no-print {{ display:none; }} }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+{summary_html}
+<div class="report-body">
+{html_body}
+</div>
+<div class="disclaimer">
+  <strong>免责声明：</strong>本报告由 AI 智能投顾系统自动生成，所有数据基于 Tushare 金融数据接口。
+  报告内容仅供参考，不构成任何投资建议。市场有风险，投资需谨慎。
+</div>
+<p class="no-print" style="text-align:center;margin-top:24px;color:#94a3b8;">
+  提示：在浏览器中按 Ctrl+P 可保存为 PDF
+</p>
+</body>
+</html>"""
+
+        filename = f"{safe_title}_{content_hash}.html"
+        filepath = os.path.join(self._output_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        logger.info("HTML 报告已保存: %s (%d 字符)", filepath, len(html))
+        return filepath
+
+    def save_report_pdf(self, content: str, title: str,
+                        summary: Optional[Dict[str, Any]] = None) -> str:
+        """保存 PDF 格式报告（使用 fpdf2）。
+
+        生成包含报告标题、摘要表格和正文内容的 PDF 文件。
+        使用系统中文 TTF 字体（SimHei / Microsoft YaHei）渲染中文。
+
+        Args:
+            content: 报告正文内容。
+            title: 报告标题。
+            summary: 可选，收益摘要字典。
+
+        Returns:
+            保存的 PDF 文件绝对路径。生成失败时返回空字符串。
+        """
+        safe_title = re.sub(r"[^\w\-_]", "_", title, flags=re.UNICODE)
+        safe_title = safe_title.strip("_")[:60] or "report"
+        content_hash = hashlib.md5(content[:200].encode("utf-8")).hexdigest()[:8]
+
+        try:
+            from fpdf import FPDF
+
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_auto_page_break(auto=True, margin=20)
+
+            # 注册中文 TTF 字体
+            cn_font_family = self._register_chinese_font(pdf)
+            title_font = cn_font_family or "Helvetica"
+            body_font = cn_font_family or "Helvetica"
+
+            # 标题
+            pdf.set_font(title_font, "B", 18)
+            pdf.cell(0, 12, title, new_x="LMARGIN", new_y="NEXT", align="C")
+            pdf.ln(6)
+
+            # 线
+            pdf.set_line_width(0.2)
+            y = pdf.get_y()
+            pdf.line(10, y, 200, y)
+            pdf.ln(6)
+
+            # 摘要表格
+            if summary:
+                pdf.set_font(title_font, "B", 13)
+                pdf.cell(0, 8, "收益概览", new_x="LMARGIN", new_y="NEXT")
+                pdf.set_font(body_font, "", 10)
+                metrics = [
+                    ("总收益率", summary.get("total_return_pct"), "%"),
+                    ("年化收益率", summary.get("annualized_return_pct"), "%"),
+                    ("最大回撤", summary.get("max_drawdown_pct"), "%"),
+                    ("夏普比率", summary.get("sharpe_ratio"), ""),
+                    ("胜率", summary.get("win_rate"), "%"),
+                    ("交易次数", summary.get("trade_count"), ""),
+                ]
+                for label, val, unit in metrics:
+                    if val is not None:
+                        try:
+                            display = f"{float(val):.2f}{unit}"
+                        except (ValueError, TypeError):
+                            display = str(val)
+                        pdf.cell(95, 6, f"  {label}: {display}")
+                        pdf.ln(6)
+                pdf.ln(4)
+
+            # 正文（去除 Markdown 标记后输出纯文本）
+            pdf.set_font(body_font, "", 10)
+            plain_text = re.sub(r"[#*`>\[\]()!_~]", "", content)
+            # 按段落分割，每段作为一个多行单元格
+            paragraphs = [p.strip() for p in plain_text.split("\n\n") if p.strip()]
+            for para in paragraphs[:100]:  # 最多100段
+                if len(para) > 500:
+                    para = para[:500] + "..."
+                # 清理连续空白
+                para = re.sub(r"\s+", " ", para)
+                try:
+                    pdf.multi_cell(0, 5.5, para, align="L")
+                    pdf.ln(2)
+                except Exception:
+                    continue
+
+            # 免责声明
+            pdf.ln(6)
+            pdf.set_font(body_font, "I", 8)
+            pdf.multi_cell(0, 4.5,
+                "免责声明：本报告由 AI 智能投顾系统自动生成，仅供参考，不构成投资建议。市场有风险，投资需谨慎。")
+
+            filename = f"{safe_title}_{content_hash}.pdf"
+            filepath = os.path.join(self._output_dir, filename)
+            pdf.output(filepath)
+            logger.info("PDF 报告已保存: %s", filepath)
+            return filepath
+
+        except ImportError:
+            logger.warning("fpdf2 未安装，无法生成 PDF，请安装: pip install fpdf2")
+            return ""
+        except Exception as e:
+            logger.error("PDF 生成失败: %s", e)
+            return ""
+
+    @staticmethod
+    def _register_chinese_font(pdf) -> Optional[str]:
+        """为 FPDF 实例注册系统中文 TTF 字体。
+
+        按优先级尝试 SimHei → Microsoft YaHei → SimSun。
+        成功时返回字体 family 名称，失败时返回 None（调用方应回退到 Helvetica）。
+        """
+        candidates = [
+            ("C:\\Windows\\Fonts\\simhei.ttf", "SimHei"),
+            ("C:\\Windows\\Fonts\\msyh.ttc", "MSYaHei"),
+            ("C:\\Windows\\Fonts\\simsun.ttc", "SimSun"),
+            ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", "WenQuanYi"),
+            ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", "WQYMicro"),
+        ]
+        for font_path, family_name in candidates:
+            if not os.path.isfile(font_path):
+                continue
+            try:
+                pdf.add_font(family_name, "", font_path, uni=True)
+                pdf.add_font(family_name, "B", font_path, uni=True)
+                pdf.add_font(family_name, "I", font_path, uni=True)
+                return family_name
+            except Exception as e:
+                logger.debug("字体注册失败 %s: %s", font_path, e)
+                continue
+        logger.warning("未找到可用的中文字体，PDF 中文内容可能无法正常显示")
+        return None
+
+    @staticmethod
+    def _md_to_html(md_text: str) -> str:
+        """将 Markdown 文本转换为基本 HTML。
+
+        处理标题、列表、粗体、段落等常见 Markdown 元素。
+        不依赖第三方库，简单但覆盖常见报告格式。
+
+        Args:
+            md_text: Markdown 格式文本。
+
+        Returns:
+            HTML 字符串。
+        """
+        lines = md_text.split("\n")
+        html_lines = []
+        in_list = False
+        in_ordered = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # 空行 → 结束列表
+            if not stripped:
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                if in_ordered:
+                    html_lines.append("</ol>")
+                    in_ordered = False
+                html_lines.append("")
+                continue
+
+            # 标题
+            if stripped.startswith("### "):
+                if in_list:
+                    html_lines.append("</ul>"); in_list = False
+                if in_ordered:
+                    html_lines.append("</ol>"); in_ordered = False
+                html_lines.append(f"<h3>{_escape_html(stripped[4:])}</h3>")
+                continue
+            if stripped.startswith("## "):
+                if in_list:
+                    html_lines.append("</ul>"); in_list = False
+                if in_ordered:
+                    html_lines.append("</ol>"); in_ordered = False
+                html_lines.append(f"<h2>{_escape_html(stripped[3:])}</h2>")
+                continue
+
+            # 无序列表
+            if re.match(r"^[-*]\s", stripped):
+                if not in_list:
+                    if in_ordered:
+                        html_lines.append("</ol>"); in_ordered = False
+                    html_lines.append("<ul>")
+                    in_list = True
+                item = re.sub(r"^[-*]\s+", "", stripped)
+                html_lines.append(f"<li>{_fmt_inline(item)}</li>")
+                continue
+
+            # 有序列表
+            if re.match(r"^\d+[.)]\s", stripped):
+                if not in_ordered:
+                    if in_list:
+                        html_lines.append("</ul>"); in_list = False
+                    html_lines.append("<ol>")
+                    in_ordered = True
+                item = re.sub(r"^\d+[.)]\s+", "", stripped)
+                html_lines.append(f"<li>{_fmt_inline(item)}</li>")
+                continue
+
+            # 分隔线
+            if stripped in ("---", "***", "___"):
+                if in_list:
+                    html_lines.append("</ul>"); in_list = False
+                if in_ordered:
+                    html_lines.append("</ol>"); in_ordered = False
+                html_lines.append("<hr>")
+                continue
+
+            # 普通段落
+            if in_list:
+                html_lines.append("</ul>"); in_list = False
+            if in_ordered:
+                html_lines.append("</ol>"); in_ordered = False
+            html_lines.append(f"<p>{_fmt_inline(stripped)}</p>")
+
+        if in_list:
+            html_lines.append("</ul>")
+        if in_ordered:
+            html_lines.append("</ol>")
+
+        return "\n".join(html_lines)
+
     # ── 内部方法 ────────────────────────────────────────────────────
 
     @staticmethod
@@ -416,3 +738,30 @@ class AdvisoryReportGenerator:
             lines.extend(extra_lines)
 
         return lines
+
+
+# ------------------------------------------------------------------
+# HTML 辅助函数
+# ------------------------------------------------------------------
+
+
+def _escape_html(text: str) -> str:
+    """转义 HTML 特殊字符。"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _fmt_inline(text: str) -> str:
+    """将 Markdown 行内格式转为 HTML。
+
+    支持：**粗体**，*斜体*，`代码`，[文字](链接)。
+    """
+    text = _escape_html(text)
+    # 粗体
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    # 斜体
+    text = re.sub(r"\*(.+?)\*", r"<em>\1</em>", text)
+    # 行内代码
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    # 链接
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    return text

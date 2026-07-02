@@ -12,6 +12,9 @@ _mcp_client_instance = None
 _mcp_tools = None
 _mcp_connection_failures = 0
 _mcp_last_failure_time = 0.0
+# 单例初始化锁: 防止并发首次调用 get_mcp_tools() 各自创建 MultiServerMCPClient 导致
+# stdio 子进程泄漏 (2026-07-02 修复: 冷启动 7 agent 同时进入 → 泄漏 6 套 stdio 子进程)。
+_mcp_init_lock: Optional[asyncio.Lock] = None
 # Circuit breaker: 连续3次失败后进入冷却期30秒
 _MCP_CIRCUIT_THRESHOLD = 3
 _MCP_COOLDOWN_SECONDS = 30
@@ -51,9 +54,13 @@ async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
     返回:
         list: 从MCP服务器加载的LangChain兼容工具列表。
     """
-    global _mcp_client_instance, _mcp_tools
+    global _mcp_client_instance, _mcp_tools, _mcp_init_lock
 
-    # 熔断器检查
+    # 延迟创建锁 (必须在 async 函数内, 因为模块导入时 event loop 未必存在)
+    if _mcp_init_lock is None:
+        _mcp_init_lock = asyncio.Lock()
+
+    # 熔断器检查 (快速路径, 无锁)
     if _mcp_tools is not None and not _check_circuit_breaker():
         # 已缓存工具且熔断器开启：返回缓存工具（仍可尝试调用）
         pass
@@ -61,32 +68,35 @@ async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
         logger.error(f"{ERROR_ICON} MCP 熔断器开启，拒绝连接请求")
         return []
 
-    # 首次加载：创建 MCP 客户端，加载全量工具，全局缓存
+    # 首次加载：在锁内 double-check, 防止 7 agent 并发进入各自创建 MCP 客户端
+    # (每个 MultiServerMCPClient 启动 4 个 stdio 子进程, 泄漏会长期占用 Tushare/MCP 通道)
     if _mcp_tools is None:
-        for attempt in range(3):
-            logger.info(
-                f"{WAIT_ICON} Initializing MultiServerMCPClient (attempt {attempt+1}/3)")
-            try:
-                _mcp_client_instance = MultiServerMCPClient(SERVER_CONFIGS)
-                loaded_tools = await _mcp_client_instance.get_tools()
-                if loaded_tools:
-                    _mcp_tools = loaded_tools
-                    _record_mcp_success()
+        async with _mcp_init_lock:
+            if _mcp_tools is None:
+                for attempt in range(3):
                     logger.info(
-                        f"{SUCCESS_ICON} Successfully loaded {len(_mcp_tools)} tools (cached).")
-                    break
-                logger.warning(
-                    f"{ERROR_ICON} MCP 返回空工具列表 (attempt {attempt+1}/3)")
-            except Exception as e:
-                logger.error(
-                    f"{ERROR_ICON} MCP 初始化失败 (attempt {attempt+1}/3): {e}")
-            if attempt < 2:
-                await asyncio.sleep(2 * (attempt + 1))
+                        f"{WAIT_ICON} Initializing MultiServerMCPClient (attempt {attempt+1}/3)")
+                    try:
+                        _mcp_client_instance = MultiServerMCPClient(SERVER_CONFIGS)
+                        loaded_tools = await _mcp_client_instance.get_tools()
+                        if loaded_tools:
+                            _mcp_tools = loaded_tools
+                            _record_mcp_success()
+                            logger.info(
+                                f"{SUCCESS_ICON} Successfully loaded {len(_mcp_tools)} tools (cached).")
+                            break
+                        logger.warning(
+                            f"{ERROR_ICON} MCP 返回空工具列表 (attempt {attempt+1}/3)")
+                    except Exception as e:
+                        logger.error(
+                            f"{ERROR_ICON} MCP 初始化失败 (attempt {attempt+1}/3): {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(2 * (attempt + 1))
 
-        if _mcp_tools is None:
-            _record_mcp_failure()
-            _mcp_tools = None  # 保持 None 以便下次调用触发重试
-            return []
+                if _mcp_tools is None:
+                    _record_mcp_failure()
+                    _mcp_tools = None  # 保持 None 以便下次调用触发重试
+                    return []
 
     # 从缓存过滤
     if tool_filter is not None:
@@ -100,20 +110,26 @@ async def get_mcp_tools(tool_filter: Optional[List[str]] = None):
 
 
 async def reconnect_mcp() -> bool:
-    """重置并重新建立 MCP 连接。返回是否成功。"""
-    global _mcp_client_instance, _mcp_tools, _mcp_connection_failures, _mcp_last_failure_time
-    logger.info(f"{WAIT_ICON} 正在重置 MCP 连接...")
-    # 关闭旧连接
-    if _mcp_client_instance:
-        try:
-            await _mcp_client_instance.__aexit__(None, None, None)
-        except Exception:
-            pass
-    _mcp_client_instance = None
-    _mcp_tools = None
-    _mcp_connection_failures = 0
-    _mcp_last_failure_time = 0.0
-    # 重新加载
+    """重置并重新建立 MCP 连接。返回是否成功。
+
+    必须在 _mcp_init_lock 内执行, 防止与 get_mcp_tools() 首次初始化竞态。
+    """
+    global _mcp_client_instance, _mcp_tools, _mcp_connection_failures, _mcp_last_failure_time, _mcp_init_lock
+    if _mcp_init_lock is None:
+        _mcp_init_lock = asyncio.Lock()
+    async with _mcp_init_lock:
+        logger.info(f"{WAIT_ICON} 正在重置 MCP 连接...")
+        # 关闭旧连接
+        if _mcp_client_instance:
+            try:
+                await _mcp_client_instance.__aexit__(None, None, None)
+            except Exception:
+                pass
+        _mcp_client_instance = None
+        _mcp_tools = None
+        _mcp_connection_failures = 0
+        _mcp_last_failure_time = 0.0
+    # 重新加载 (get_mcp_tools 会自己获取锁)
     tools = await get_mcp_tools()
     return len(tools) > 0 if tools else False
 

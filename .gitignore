@@ -5,6 +5,7 @@
 
 # Python virtual environment
 venv/
+.venv/
 
 # Python bytecode cache
 __pycache__/
@@ -18,8 +19,9 @@ __pycache__/
 .vscode/
 .idea/
 
-# Logs
+# Logs (含运行时生成的 execution_info / agent_execution 等 JSON)
 *.log
+logs/
 
 # Git worktrees
 .worktrees/
@@ -28,3 +30,30 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# ─── 运行时数据 / 缓存 / 报告 ─────────────────────────────
+# 这些目录由程序运行时生成，不应提交到 git
+data/
+reports/
+stock_pool.json
+fund_pool.json
+*.cache
+
+# ─── 运行时状态目录 ───────────────────────────────────────
+.run/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ─── Streamlit 本地密钥 ───────────────────────────────────
+.streamlit/secrets.toml
+
+# ─── Claude Code / Superpowers 本地状态 ───────────────────
+.claude/
+.superpowers/
+
+# ─── 临时文件 ─────────────────────────────────────────────
+Thumbs.db
+*.swp
+*.swo
+*~
+

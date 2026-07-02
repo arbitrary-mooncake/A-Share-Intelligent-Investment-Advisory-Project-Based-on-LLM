@@ -3,13 +3,15 @@
 
 四层管线:
   Layer 0: 纯代码硬筛 (去ST/*ST/新股/低流动/北交所/B股)
-  Layer 1: M1/M3 批量粗筛分档 (强烈推荐→白名单, 买入/谨慎买入/观望→初筛池, 卖出→黑名单)
+  Layer 1: M1/M3 批量粗筛分档 (强烈推荐→白名单, 推荐→初筛池, 中性/回避→丢弃, 卖出→黑名单)
   Layer 2: M2 快筛过滤初筛池 (便宜模型, 淘汰明显不行的)
   Layer 3: 1:1.2差额精筛 (白名单+初筛通过→正式7Agent+3Scorer→LLM动态阈值→最终精筛池)
 """
 import asyncio
+import heapq
 import json
 import logging
+import math
 import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Callable, Optional
@@ -17,6 +19,124 @@ from typing import Dict, Any, List, Callable, Optional
 from src.eval.pool_manager import PoolManager
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════
+# Streaming Dual-Heap Top-α Selector (流式双堆 top-α 选择器)
+# ═══════════════════════════════════════════════════════════
+
+def calc_alpha(whitelist_count: int, recommended_total: int,
+               target_size: int, ratio: float = 1.2) -> float:
+    """动态计算 Layer 2 的 α 比例。
+
+    α = (target_size × ratio - whitelist_count) / recommended_total
+
+    白名单越多, α 越小; 推荐越多, α 越小。
+    返回值限制在 [0, 1]。
+    """
+    layer3_capacity = int(target_size * ratio)
+    layer2_slots = max(0, layer3_capacity - whitelist_count)
+    if recommended_total == 0:
+        return 0.0
+    return min(1.0, layer2_slots / recommended_total)
+
+
+class StreamingTopAlphaHeap:
+    """流式双堆 top-α 选择器。
+
+    维护两个堆:
+      - High: 小顶堆, 存当前 top-α 候选 (分数最高的 α 比例)
+      - Low:  大顶堆, 存其余股票
+
+    τ = High.min() = top-α 下界阈值。
+
+    Dispatch 策略:
+      连续 stable_batches 批 τ 波动 < epsilon → 视为 τ 收敛
+      → 将 High 中尚未 dispatch 的股票 dispatch 到 Layer 3。
+    """
+
+    def __init__(self, alpha_fn: Callable[[], float],
+                 epsilon: float = 3.0, stable_batches: int = 3):
+        self.alpha_fn = alpha_fn
+        self.epsilon = epsilon
+        self.stable_batches = stable_batches
+        self.high: List[tuple] = []   # min-heap: (score, stock_code)
+        self.low: List[tuple] = []    # max-heap: (-score, stock_code)
+        self._dispatched: set = set()
+        self._tau_history: List[float] = []
+        self._total = 0
+        self._stock_map: Dict[str, Any] = {}  # code → stock dict
+
+    @property
+    def tau(self) -> float:
+        """当前 top-α 阈值."""
+        return self.high[0][0] if self.high else 0.0
+
+    @property
+    def total(self) -> int:
+        return self._total
+
+    def feed(self, score: float, stock: Dict[str, Any]):
+        """喂入一个新分数和对应的股票."""
+        code = stock.get("code", str(id(stock)))
+        self._stock_map[code] = stock
+        self._total += 1
+
+        # Step 1: 粗分
+        if not self.high or score >= self.high[0][0]:
+            heapq.heappush(self.high, (score, code))
+        else:
+            heapq.heappush(self.low, (-score, code))
+
+        # Step 2: 按比例重平衡
+        k = max(1, math.ceil(self.alpha_fn() * self._total))
+        while len(self.high) > k:
+            s, c = heapq.heappop(self.high)
+            heapq.heappush(self.low, (-s, c))
+        while len(self.high) < k and self.low:
+            s, c = heapq.heappop(self.low)
+            heapq.heappush(self.high, (-s, c))
+
+        # Step 3: 修正跨堆次序
+        while self.low and self.high and -self.low[0][0] > self.high[0][0]:
+            a_s, a_c = heapq.heappop(self.low)
+            b_s, b_c = heapq.heappop(self.high)
+            heapq.heappush(self.high, (-a_s, a_c))
+            heapq.heappush(self.low, (-b_s, b_c))
+
+    def batch_done(self):
+        """一批数据喂完后调用, 记录 τ 历史."""
+        self._tau_history.append(self.tau)
+        if len(self._tau_history) > self.stable_batches * 3:
+            self._tau_history = self._tau_history[-self.stable_batches * 2:]
+
+    def is_tau_stable(self) -> bool:
+        """τ 是否连续 stable_batches 批稳定 (波动 < epsilon)."""
+        if len(self._tau_history) < self.stable_batches:
+            return False
+        recent = self._tau_history[-self.stable_batches:]
+        return max(recent) - min(recent) < self.epsilon
+
+    def get_undispatched(self) -> List[Dict[str, Any]]:
+        """获取 High 中尚未 dispatch 的股票列表."""
+        result = []
+        for _, code in self.high:
+            if code not in self._dispatched and code in self._stock_map:
+                result.append(self._stock_map[code])
+                self._dispatched.add(code)
+        return result
+
+    def finalize(self) -> List[Dict[str, Any]]:
+        """Layer 1 完成后调用, dispatch High 中所有剩余的."""
+        return self.get_undispatched()
+
+    @property
+    def high_size(self) -> int:
+        return len(self.high)
+
+    @property
+    def low_size(self) -> int:
+        return len(self.low)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -77,16 +197,20 @@ async def hard_screen() -> List[Dict[str, Any]]:
     from src.eval.data_fetcher import _call as tushare_call
     from src.eval.config import get as eval_get
 
-    min_daily_amount = eval_get("hard_screen_min_daily_amount", 20000000)
-    logger.info("[Layer 0] 硬筛开始: 最低日均成交额=%d万", min_daily_amount // 10000)
+    # Tushare daily.amount 单位是千元, 20000千元 = 2000万元
+    min_daily_amount = eval_get("hard_screen_min_daily_amount", 20000)  # 千元
+    logger.info("[Layer 0] 硬筛开始: 最低日均成交额=%d万元 (%.0f千元)",
+                min_daily_amount * 1000 // 10000, min_daily_amount)
 
-    # 获取全A股列表
+    # 获取全A股列表 (不传exchange参数=全市场)
     stock_list = tushare_call("stock_basic", {
         "list_status": "L",
-        "exchange": "",
     }, fields="ts_code,name,list_date,industry")
     if not stock_list or "items" not in stock_list:
         raise RuntimeError("Tushare stock_basic查询失败")
+    if len(stock_list["items"]) < 100:
+        logger.error("stock_basic返回异常: 仅%d只 (预期>5000), 可能Tushare限流或参数错误",
+                     len(stock_list["items"]))
 
     fields = stock_list["fields"]
     stocks = []
@@ -179,50 +303,27 @@ async def hard_screen() -> List[Dict[str, Any]]:
 # Layer 1: M1/M3 Batch Scoring (生产模型批量粗筛)
 # ═══════════════════════════════════════════════════════════
 
-# 总纲 §4.1 第1层分类标准
-LAYER1_LEVELS = ["强烈推荐", "买入", "谨慎买入", "观望", "卖出"]
+# 总纲 §4.1 第1层分类标准 — 与 batch_scorer.LEVELS 对齐
+# 注意: 此列表必须与 _BATCH_SYSTEM_PROMPT 中的分类一致，
+# 否则 parse_batch_response 的 normalization 会静默改写 LLM 输出。
+LAYER1_LEVELS = ["强烈推荐", "推荐", "中性", "回避", "卖出"]
 
-# 总纲5级 → 3档 映射 (只有"卖出"进黑名单)
+# 总纲5级 → 3档 映射 (只有"卖出"进黑名单, "中性"/"回避"丢弃)
 LEVEL_TO_TIER = {
     "强烈推荐": "whitelist",
-    "买入": "initial_pool",
-    "谨慎买入": "initial_pool",
-    "观望": "initial_pool",
+    "推荐": "initial_pool",
+    "中性": "initial_pool",
+    "回避": "initial_pool",
     "卖出": "blacklist",
 }
 
-# Layer 1 专用 System Prompt (使用总纲分类标准)
-_LAYER1_SYSTEM_PROMPT = """你是 A 股批量筛选器。你的任务是对每只股票基于其数据给出 5 级分类和一句话理由。
-
-## 分类标准（总纲 §4.1 精筛池筛选第1层）
-
-| 级别 | 含义 | 判定标准 |
-|------|------|---------|
-| 强烈推荐 | 白名单 | 基本面优秀 + 估值合理或低估 + 无明显风险信号 |
-| 买入 | 初筛池 | 基本面良好 + 估值合理 + 有一定投资价值 |
-| 谨慎买入 | 初筛池 | 基本面尚可但有瑕疵 / 估值略偏高 / 存在一定不确定性 |
-| 观望 | 初筛池 | 多空因素交织 / 数据不足无法判断 / 需观察后续变化 |
-| 卖出 | 黑名单 | 基本面恶化 / 严重高估 / 重大风险 / ST类 |
-
-## 核心原则
-1. **宁可保守不可激进**：数据不明确时选"观望"，绝不猜测
-2. **数据引用规则**：只能引用下方股票数据中实际出现的数字，严禁编造
-3. **跨行业可比**：参考行业估值基准，银行 PE 6 倍可能合理，科技 PE 60 倍可能低估
-4. **ST/*ST 股票一律标"卖出"**
-5. **"强烈推荐"宁缺毋滥**：只有基本面+估值+成长性+风险四方面都优秀的股票才能给此评级
-
-## 输出格式
-严格输出 JSON 数组（不要 markdown 代码块标记）：
-
-[{"code": "sh.603871", "level": "买入", "confidence": "高",
-  "reason": "低估值+高ROE+行业景气(30字内)", "risk": "原材料涨价(30字内)"},
- ...]
-"""
+# Layer 1 使用 batch_scorer 内置的 _BATCH_SYSTEM_PROMPT
+# 自定义 prompt 已废弃——与 batch_scorer 共用同一套 prompt 保证分类一致
 
 
 def classify_batch_result(score: Dict[str, str]) -> str:
     """将批量打分结果按总纲标准分类为 whitelist / initial_pool / blacklist"""
-    level = score.get("level", "观望")
+    level = score.get("level", "中性")
     return LEVEL_TO_TIER.get(level, "initial_pool")
 
 
@@ -277,7 +378,7 @@ async def batch_score_layer1(
     # Step B: 数据获取 (Tushare + HTTP)
     batch_stocks = await fetch_batch(
         batch_input,
-        semaphore=6,
+        semaphore=12,
         on_progress=lambda c, t: on_progress(c * 3 // 4, t) if on_progress else None,
     )
 
@@ -323,8 +424,290 @@ async def batch_score_layer1(
     return {"whitelist": whitelist, "initial_pool": initial_pool, "blacklist": blacklist}
 
 
+async def batch_score_layer1_stream(
+    ts_stocks: List[Dict[str, Any]],
+    term: str,
+    on_progress: Optional[Callable] = None,
+    progress_touch: Optional[Callable] = None,
+):
+    """Layer 1 流式版: 数据一次性获取, LLM 打分分批产出。
+
+    每批 CHUNK_SIZE 只(默认100) 打分完成后 yield 该批的分类结果列表。
+    用于 run_pool_update_v3 的流水线调度——Layer 1 边跑边分叉到 Layer 2/3。
+
+    progress_touch: 可选, 数据获取阶段定期调用以刷新心跳/防卡顿。
+    """
+    from src.api.batch_scorer import fetch_batch, score_batch
+
+    CHUNK_SIZE = 100  # 每次 score_batch 处理的股票数 (20批×5只)
+    model_suffix = "_3" if term == "short" else ""
+
+    logger.info("[Layer 1-Stream] 流式批量粗筛: %d只, term=%s, chunk=%d",
+                len(ts_stocks), term, CHUNK_SIZE)
+
+    if on_progress:
+        on_progress(0, len(ts_stocks))
+
+    # Step A+B: 格式转换 + 数据获取 (一次性)
+    batch_input = _prepare_stocks_for_batch(ts_stocks)
+    if not batch_input:
+        return
+
+    # 数据获取阶段: 定期回调以刷新心跳/防卡顿, 并推进进度估算
+    def _fetch_progress(completed, total):
+        if progress_touch:
+            progress_touch()
+
+    batch_stocks = await fetch_batch(
+        batch_input, semaphore=12,
+        on_progress=_fetch_progress,
+    )
+    valid = [s for s in batch_stocks if s.get("status") == "fetched" and s.get("data")]
+    logger.info("[Layer 1-Stream] 数据获取完成: %d/%d 有效", len(valid), len(batch_stocks))
+
+    # Step C: 分批 LLM 打分, 逐批 yield
+    # yield 同时携带原始 data 字典, 供 Layer 2 复用 (避免冗余 fetch_batch)。
+    total_valid = len(valid)
+    scored_total = 0
+    for chunk_start in range(0, total_valid, CHUNK_SIZE):
+        chunk = valid[chunk_start:chunk_start + CHUNK_SIZE]
+        scored = await score_batch(
+            chunk, horizon=term, semaphore=8,
+            model_suffix=model_suffix,
+            custom_levels=LAYER1_LEVELS,
+        )
+        # 产出本批分类结果 (含 raw data, 供 Layer 2 直接复用, 避免二次 fetch)
+        batch_results = []
+        for s in scored:
+            sd = s.get("score", {})
+            if isinstance(sd, dict):
+                entry = {
+                    "code": s.get("code", ""),
+                    "name": s.get("name", ""),
+                    "layer1_level": sd.get("level", ""),
+                    "layer1_confidence": sd.get("confidence", ""),
+                    "layer1_reason": sd.get("reason", ""),
+                    "layer1_risk": sd.get("risk", ""),
+                    "_raw_data": s.get("data"),
+                }
+                batch_results.append(entry)
+
+        scored_total += len(chunk)
+        if on_progress:
+            progress = min(scored_total, total_valid)
+            on_progress(progress, len(ts_stocks))
+        logger.info("[Layer 1-Stream] chunk %d/%d: %d results",
+                    chunk_start // CHUNK_SIZE + 1,
+                    (total_valid + CHUNK_SIZE - 1) // CHUNK_SIZE,
+                    len(batch_results))
+        yield batch_results
+
+    if on_progress:
+        on_progress(len(ts_stocks), len(ts_stocks))
+
+
 # ═══════════════════════════════════════════════════════════
-# Layer 2: M2 Quick Screen (快筛模型过滤初筛池)
+# Layer 2: DSV4Pro 流式排序打分 (输出 0-100 连续分数)
+# ═══════════════════════════════════════════════════════════
+
+# Layer 2 专用 System Prompt: 输出 0-100 连续数值分数, 用于精确排序
+_LAYER2_SYSTEM_PROMPT = """你是 A 股精筛排序器。你的任务不是判断"能不能投"，而是对已确认"有投资价值"的股票给出 0-100 的连续分数，用于精确排序。
+
+## 评分标准 (0-100 连续值)
+- 90-100: 极优质——基本面/估值/成长/风险全方位领先同类
+- 75-89:  优秀——多项指标突出，建议优先考虑
+- 60-74:  良好——整体不错，部分指标一般
+- 40-59:  一般——中规中矩，无明显亮点也无严重缺陷
+- 20-39:  偏弱——存在明显瑕疵但不至于淘汰
+- 0-19:   弱——勉强合格，不推荐
+
+## 核心原则
+1. **精确区分**: 这批股票 Layer 1 都已判为"推荐"，彼此差别可能很细微。请精确使用 0-100 连续值，65 和 68 的差异要有依据，不要所有人都在 70-80。
+2. **数据引用规则**: 只能引用股票数据中实际出现的数字，严禁编造。
+3. **跨行业可比**: 参考行业估值基准，银行 PE 6 倍合理 ≠ 科技 PE 60 倍高估。
+4. **宁可保守**: 数据不足时给 40-50 的中性分，不要猜测。
+
+## 输出格式
+严格输出 JSON 数组（不要 markdown 代码块标记）：
+
+[{"code": "sh.603871", "score": 78, "reason": "低估值+高ROE+行业景气(30字内)", "risk": "原材料涨价(30字内)"},
+ ...]
+"""
+
+_HORIZON_CONTEXT_L2 = {
+    "short": """## 当前评分维度: 短线 (1-5 交易日)
+重点关注: 量价关系、技术信号、短期资金情绪、近期涨跌幅。基本面权重降低。""",
+
+    "medium": """## 当前评分维度: 中线 (1-3 个月)
+重点关注: 基本面质量(ROE/毛利率/增速)、估值水平(vs行业)、技术趋势、风险评估。""",
+
+    "long": """## 当前评分维度: 长线 (1-3 年)
+重点关注: 商业护城河、行业景气度、ROE 持续性、估值安全边际。短线波动可忽略。""",
+}
+
+
+async def score_layer2_batch(
+    recommended_stocks: List[Dict[str, Any]],
+    term: str,
+    pre_fetched_data: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """对一批推荐股票用 DeepSeek V4 Pro 打连续 0-100 分 (5只/批, 8并发)。
+
+    使用自定义 prompt (_LAYER2_SYSTEM_PROMPT) 让 LLM 输出 0-100 连续数值,
+    而非 5 级分类。分数用于 StreamingTopAlphaHeap 的精确排序。
+
+    Args:
+        recommended_stocks: [{code, name, ...}, ...]
+        term: short/medium/long
+        pre_fetched_data: 可选 {code: raw_data_dict}. 若提供且命中率高, 跳过 fetch_batch
+            (Layer 1 已预先抓取过数据, 复用可省 10-20min/cold-start)。
+
+    Returns:
+        [{code, score: float, reason, risk}, ...]
+    """
+    from src.utils.llm_clients import OpenAICompatibleClient
+    import os
+
+    if not recommended_stocks:
+        return []
+
+    # 数据获取: 优先复用 Layer 1 已抓取的 raw_data, 仅对缺失部分走 fetch_batch
+    pre_hit = 0
+    valid = []
+    if pre_fetched_data:
+        for s in recommended_stocks:
+            code = s.get("code", "")
+            raw = pre_fetched_data.get(code)
+            if raw and isinstance(raw, dict):
+                valid.append({"code": code, "name": s.get("name", ""), "data": raw, "status": "fetched"})
+                pre_hit += 1
+        missing = [s for s in recommended_stocks
+                   if not (pre_fetched_data.get(s.get("code", "")))]
+        if missing:
+            from src.api.batch_scorer import fetch_batch
+            batch_input = [{"code": s["code"], "name": s.get("name", "")} for s in missing]
+            fetched = await fetch_batch(batch_input, semaphore=12)
+            valid.extend(f for f in fetched if f.get("status") == "fetched" and f.get("data"))
+    else:
+        from src.api.batch_scorer import fetch_batch
+        batch_input = [{"code": s["code"], "name": s.get("name", "")} for s in recommended_stocks]
+        fetched = await fetch_batch(batch_input, semaphore=12)
+        valid = [f for f in fetched if f.get("status") == "fetched" and f.get("data")]
+
+    if not valid:
+        logger.warning("[Layer 2] 无有效股票数据")
+        return []
+
+    logger.info("[Layer 2] 数据复用: %d/%d 来自 L1 pre-fetched, %d 需重新获取",
+                pre_hit, len(recommended_stocks), len(valid) - pre_hit)
+
+    # 分块 + LLM 评分
+    from src.api.batch_scorer import chunk_stocks
+    chunks = chunk_stocks(valid, chunk_size=5)
+    total_chunks = len(chunks)
+    logger.info("[Layer 2] DSV4Pro 打分: %d只, %d 批次, 8并发", len(valid), total_chunks)
+
+    # 模型配置
+    api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY_6", "")
+    base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_6", "")
+    model = os.getenv("OPENAI_COMPATIBLE_MODEL_6", "deepseek-v4-pro")
+    if not all([api_key, base_url, model]):
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
+        model = os.getenv("OPENAI_COMPATIBLE_MODEL", "deepseek-v4-pro")
+
+    from src.utils.model_config import get_thinking_body
+    llm = OpenAICompatibleClient(
+        api_key=api_key, base_url=base_url, model=model, env_prefix="",
+        extra_body=get_thinking_body(base_url, enabled=True),
+        http_timeout=180, http_connect_timeout=10,
+    )
+
+    horizon_context = _HORIZON_CONTEXT_L2.get(term, _HORIZON_CONTEXT_L2["medium"])
+
+    def _build_l2_prompt(stocks_data: list) -> str:
+        from src.utils.industry_knowledge import identify_industry, get_industry_info
+        stock_blocks = []
+        for s in stocks_data:
+            fields = []
+            for lbl, key in [("PE", "pe"), ("PB", "pb"), ("ROE(%)", "roe"),
+                            ("毛利率(%)", "gross_margin"), ("营收增速(%)", "revenue_growth"),
+                            ("利润增速(%)", "profit_growth"), ("负债率(%)", "debt_ratio"),
+                            ("市值", "market_cap"), ("行业", "industry")]:
+                v = s.get(key, "")
+                if v and str(v).strip() not in ("", "None", "N/A"):
+                    fields.append(f"  {lbl}: {v}")
+            pc = s.get("price_changes", {}) or {}
+            for period, label in [("1m", "近1月"), ("3m", "近3月"), ("1y", "近1年")]:
+                v = pc.get(period, "")
+                if v and v != "N/A":
+                    fields.append(f"  涨跌({label}): {v}")
+            blocks = "\n".join(fields) if fields else "  (无数据)"
+            stock_blocks.append(f"### {s.get('name','')} ({s.get('code','')})\n{blocks}")
+        return f"""{horizon_context}
+
+## 股票数据
+
+{chr(10).join(stock_blocks)}
+
+## 输出要求
+对上述 {len(stocks_data)} 只股票，返回 JSON 数组（不要 markdown 代码块）。
+每只股票输出: code, score(0-100连续值), reason(30字内), risk(30字内)
+
+只返回 JSON 数组:"""
+
+    sem = asyncio.Semaphore(8)
+    score_lock = asyncio.Lock()
+    results = []
+
+    async def _score_chunk(chunk):
+        stocks_data = [s["data"] for s in chunk]
+        prompt = _build_l2_prompt(stocks_data)
+        try:
+            response = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    None, lambda: llm.get_completion(
+                        [{"role": "system", "content": _LAYER2_SYSTEM_PROMPT},
+                         {"role": "user", "content": prompt}], max_retries=1
+                    )
+                ), timeout=300.0
+            )
+            if response:
+                import re
+                text = str(response).strip()
+                start = text.find('[')
+                if start >= 0:
+                    for end in range(len(text), start, -1):
+                        try:
+                            parsed = json.loads(text[start:end])
+                            if isinstance(parsed, list):
+                                async with score_lock:
+                                    for item in parsed:
+                                        if isinstance(item, dict):
+                                            code = item.get("code", "")
+                                            if re.match(r'^(sh|sz)\.\d{5,6}$', code):
+                                                results.append({
+                                                    "code": code,
+                                                    "score": float(item.get("score", 50)),
+                                                    "reason": item.get("reason", ""),
+                                                    "risk": item.get("risk", ""),
+                                                })
+                                break
+                        except json.JSONDecodeError:
+                            continue
+        except asyncio.TimeoutError:
+            logger.warning("[Layer 2] 批次超时")
+        except Exception as e:
+            logger.error("[Layer 2] 批次失败: %s", e)
+
+    await asyncio.gather(*[_score_chunk(c) for c in chunks])
+
+    logger.info("[Layer 2] DSV4Pro 打分完成: %d 只有效分数", len(results))
+    return results
+
+
+# ═══════════════════════════════════════════════════════════
+# Layer 2: M2 Quick Screen (快筛模型过滤初筛池) [保留旧版兼容]
 # ═══════════════════════════════════════════════════════════
 
 async def quick_screen_layer2(
@@ -364,7 +747,7 @@ async def quick_screen_layer2(
     # 数据获取
     batch_input = [{"code": s["code"], "name": s.get("name", "")} for s in initial_pool]
     batch_stocks = await fetch_batch(
-        batch_input, semaphore=6,
+        batch_input, semaphore=12,
         on_progress=lambda c, t: on_progress(c // 2, t) if on_progress else None,
     )
 
@@ -677,7 +1060,608 @@ async def formal_score_layer3(
 
 
 # ═══════════════════════════════════════════════════════════
-# Main Orchestrator
+# Pipeline Progress Monitor (心跳 + 进度 + 卡死检测 + ETA)
+# ═══════════════════════════════════════════════════════════
+
+class PipelineProgress:
+    """流水线进度追踪器: 多阶段进度、ETA、心跳、卡死检测。"""
+
+    def __init__(self, on_progress: Optional[Callable] = None):
+        self.on_progress = on_progress
+        self.start_time = datetime.now()
+        self.stages: Dict[str, Dict[str, Any]] = {
+            "0_hard_screen":    {"label": "硬筛", "total": 1, "done": 0, "start": None, "end": None},
+            "1_batch_score":    {"label": "批量粗筛", "total": 1, "done": 0, "start": None, "end": None},
+            "2_stream_heap":    {"label": "流式排序", "total": 1, "done": 0, "start": None, "end": None},
+            "3_formal_score":   {"label": "精筛打分", "total": 1, "done": 0, "start": None, "end": None},
+        }
+        self.queue_depth = 0       # Layer 3 队列当前深度
+        self.last_progress_time = datetime.now()
+        self.heartbeat_count = 0
+
+    def stage_start(self, stage: str, total: int = 1):
+        s = self.stages.get(stage)
+        if s:
+            s["start"] = datetime.now()
+            s["total"] = total
+            s["done"] = 0
+
+    def stage_progress(self, stage: str, done: int):
+        """更新阶段进度, done 只允许单调递增 (防止 UI 进度条倒退/清零)。
+
+        调用方 (如 _layer3_consumer 的 completed 计数) 本身是累计值, 但若有
+        其他路径传入更小值时, 此处兜底忽略。last_progress_time 始终更新以
+        保证卡顿检测不误报。
+        """
+        s = self.stages.get(stage)
+        if s:
+            if done >= s.get("done", 0):
+                s["done"] = done
+        self.last_progress_time = datetime.now()
+
+    def stage_end(self, stage: str):
+        s = self.stages.get(stage)
+        if s:
+            s["end"] = datetime.now()
+            s["done"] = s["total"]
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return (datetime.now() - self.start_time).total_seconds()
+
+    @property
+    def overall_progress_pct(self) -> float:
+        """整体进度百分比 (加权: L0=2%, L1=40%, L2=5%, L3=53%)."""
+        weights = {"0_hard_screen": 0.02, "1_batch_score": 0.40,
+                   "2_stream_heap": 0.05, "3_formal_score": 0.53}
+        pct = 0.0
+        for stage, w in weights.items():
+            s = self.stages[stage]
+            if s["total"] > 0:
+                pct += w * min(s["done"] / s["total"], 1.0)
+        return pct
+
+    @property
+    def eta_seconds(self) -> float:
+        """预估剩余时间 (秒)."""
+        pct = self.overall_progress_pct
+        if pct < 0.01:
+            return 999999  # 还没开始
+        elapsed = self.elapsed_seconds
+        if elapsed < 1:
+            return 999999
+        total_est = elapsed / pct
+        return max(0, total_est - elapsed)
+
+    @property
+    def eta_str(self) -> str:
+        s = self.eta_seconds
+        if s > 86400:
+            return "计算中..."
+        if s > 3600:
+            return f"{s/3600:.1f}h"
+        if s > 60:
+            return f"{s/60:.0f}min"
+        return f"{s:.0f}s"
+
+    @property
+    def stall_seconds(self) -> float:
+        """上次进度更新以来经过的秒数."""
+        return (datetime.now() - self.last_progress_time).total_seconds()
+
+    def heartbeat(self):
+        """生成心跳日志."""
+        self.heartbeat_count += 1
+        parts = []
+        for stage, s in self.stages.items():
+            if s["start"] and not s["end"]:
+                pct = min(s["done"] / s["total"] * 100, 100) if s["total"] > 0 else 0
+                parts.append(f"{s['label']}={pct:.0f}%")
+        return (f"[心跳 #{self.heartbeat_count}] 运行{self.elapsed_seconds/60:.0f}min, "
+                f"ETA={self.eta_str}, Q={self.queue_depth}, "
+                f"进度: {', '.join(parts)}")
+
+    def emit_progress(self):
+        """发射结构化进度到回调."""
+        if self.on_progress:
+            try:
+                self.on_progress({
+                    "overall_pct": round(self.overall_progress_pct * 100, 1),
+                    "elapsed_s": round(self.elapsed_seconds),
+                    "eta_s": round(self.eta_seconds),
+                    "eta_str": self.eta_str,
+                    "queue_depth": self.queue_depth,
+                    "stages": {
+                        k: {"label": v["label"], "pct": round(
+                             min(v["done"] / v["total"] * 100, 100) if v["total"] > 0 else 0, 1),
+                            "done": v["done"], "total": v["total"]}
+                        for k, v in self.stages.items()
+                    },
+                    "stall_s": round(self.stall_seconds),
+                })
+            except Exception:
+                pass
+
+    def check_stall(self) -> Optional[str]:
+        """检查是否卡死。返回警告消息或 None."""
+        stall = self.stall_seconds
+        if stall > 900:   # 15分钟
+            return f"⚠️ 流水线可能卡死: {stall/60:.0f}分钟无进度更新, 最后活跃层={self._active_stage()}"
+        if stall > 300:   # 5分钟
+            logger.warning("流水线 %d 分钟无进度, 最后活跃: %s",
+                          stall // 60, self._active_stage())
+        return None
+
+    def _active_stage(self) -> str:
+        for k, v in self.stages.items():
+            if v["start"] and not v["end"]:
+                return v["label"]
+        return "无"
+
+
+async def _heartbeat_loop(progress: PipelineProgress, interval: float = 30.0):
+    """心跳协程: 定期打印进度和ETA."""
+    while True:
+        await asyncio.sleep(interval)
+        stall_msg = progress.check_stall()
+        if stall_msg:
+            logger.warning(stall_msg)
+        logger.info(progress.heartbeat())
+        progress.emit_progress()
+
+
+# ═══════════════════════════════════════════════════════════
+# Layer 3: Async Consumer (流式队列消费者)
+# ═══════════════════════════════════════════════════════════
+
+async def _layer3_consumer(
+    queue: asyncio.Queue,
+    results: List[Dict[str, Any]],
+    whitelist_final: List[Dict[str, Any]],
+    blacklist_final: List[Dict[str, Any]],
+    lock: asyncio.Lock,
+    term: str,
+    progress: Optional[PipelineProgress] = None,
+    heartbeat_interval: float = 30.0,
+    per_task_timeout: float = 900.0,
+):
+    """Layer 3 异步消费者: 从队列取股票 → ScoringEngine 打分 → 分类。
+
+    一直运行到收到毒丸信号(None), 由 run_pool_update_v3 控制生命周期。
+    内置心跳、超时保护、进度上报。
+    """
+    from src.stock_pool.scoring_engine import ScoringEngine
+
+    # 共用单个 ScoringEngine: 避免 N 并发各自初始化 MCP client 导致 TaskGroup 崩溃
+    # 并发数 5 (2026-07-02 从 8 回退): 冷启动时 8 并发 × 7 agent ≈ 56 路 MCP stdio
+    # 调用会严重阻塞 Tushare/MCP 通道, 实测单只股票 Phase 1 从 13s 涨到 739s,
+    # 5 并发 × 7 agent ≈ 35 路更稳健, 与 CLAUDE.md 架构文档对齐。
+    shared_engine = ScoringEngine()
+    sem = asyncio.Semaphore(5)
+    completed = 0
+    total_dispatched = 0
+    last_heartbeat = datetime.now()
+    term_key = {"short": "short_term_score", "medium": "medium_term_score",
+                 "long": "long_term_score"}
+    cache_date = datetime.now().strftime("%Y-%m-%d")
+
+    async def _score_one(stock: Dict[str, Any]):
+        nonlocal completed, last_heartbeat
+        from src.utils.cache_utils import read_cache, write_cache
+        code = stock.get("code", "")
+        name = stock.get("name", code)
+        safe_code = code.replace(".", "_").replace("/", "_")
+        entry = {**stock, "final_score": 50, "recommendation": ""}
+
+        # full_analysis 缓存检查
+        cached_full = None
+        try:
+            cached_full = read_cache("full_pool_analysis", safe_code, cache_date)
+        except Exception:
+            pass
+        if cached_full:
+            try:
+                cache_data = json.loads(cached_full)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                cache_data = None
+            sd = cache_data.get("score_data", {}) if cache_data else {}
+            if sd:
+                ts = sd.get(term_key.get(term, "medium_term_score"), {})
+                actual_score = ts.get("score") if isinstance(ts, dict) else sd.get("score", 50)
+                if actual_score is None:
+                    actual_score = sd.get("score", 50)
+                rec = sd.get("recommendation", "")
+                entry = {**stock, "final_score": actual_score or 50, "recommendation": rec}
+                logger.debug("  %s 命中full_analysis缓存, score=%s", code, actual_score)
+                async with lock:
+                    if "强烈推荐" in str(rec) or (actual_score or 0) >= 85:
+                        whitelist_final.append(entry)
+                    elif "卖出" in str(rec) or (actual_score or 50) < 30:
+                        blacklist_final.append(entry)
+                    results.append(entry)
+                    completed += 1
+                    last_heartbeat = datetime.now()
+                    if progress:
+                        progress.stage_progress("3_formal_score", completed)
+                        progress.queue_depth = queue.qsize()
+                queue.task_done()
+                return
+
+        try:
+            # 共用 engine 实例, 只靠 semaphore 控制并发
+            async with sem:
+                result = await asyncio.wait_for(
+                    shared_engine.score_stock(code, name),
+                    timeout=per_task_timeout,
+                )
+            if result and result.get("score_data"):
+                try:
+                    write_cache("full_pool_analysis", safe_code, cache_date,
+                                json.dumps({"score_data": result["score_data"]},
+                                           ensure_ascii=False, default=str))
+                except Exception:
+                    pass
+                sd = result["score_data"]
+                score = sd.get("score") or 50
+                ts = sd.get(term_key.get(term, "medium_term_score"), {})
+                actual_score = ts.get("score") if isinstance(ts, dict) else score
+                if actual_score is None:
+                    actual_score = score
+                rec = sd.get("recommendation", "")
+                entry = {**stock, "final_score": actual_score, "recommendation": rec}
+            else:
+                entry = {**stock, "final_score": 50, "recommendation": ""}
+        except asyncio.TimeoutError:
+            logger.warning("  Layer3 超时 %s (%.0fs), 使用默认分数", code, per_task_timeout)
+            entry = {**stock, "final_score": 40, "recommendation": "超时"}
+        except Exception as e:
+            logger.warning("  Layer3 评分失败 %s: %s", code, e)
+            entry = {**stock, "final_score": 40, "recommendation": ""}
+
+        async with lock:
+            if "强烈推荐" in str(entry.get("recommendation", "")) or entry.get("final_score", 0) >= 85:
+                whitelist_final.append(entry)
+            elif "卖出" in str(entry.get("recommendation", "")) or entry.get("final_score", 50) < 30:
+                blacklist_final.append(entry)
+            results.append(entry)
+            completed += 1
+            last_heartbeat = datetime.now()
+            if progress:
+                progress.stage_progress("3_formal_score", completed)
+                progress.queue_depth = queue.qsize()
+        queue.task_done()
+
+    # 主循环: 从队列拉取任务, 分派到 _score_one
+    while True:
+        try:
+            stock = await asyncio.wait_for(queue.get(), timeout=2.0)
+        except asyncio.TimeoutError:
+            # 心跳检查
+            hb_age = (datetime.now() - last_heartbeat).total_seconds()
+            if progress:
+                progress.queue_depth = queue.qsize()
+                progress.last_progress_time = datetime.now()  # 防卡顿误报
+            if hb_age > heartbeat_interval:
+                logger.info("[L3心跳] 运行中: 已完成%d/%d, Q=%d, 距上次完成%.0fs",
+                           completed, completed + queue.qsize(),
+                           queue.qsize(), hb_age)
+            continue
+        if stock is None:  # 毒丸信号
+            queue.task_done()
+            if progress:
+                progress.queue_depth = queue.qsize()
+            break
+        total_dispatched += 1
+        asyncio.create_task(_score_one(stock))
+
+    # 等待所有 in-flight 任务完成 (queue.join 在 task_done 计数归零后返回)
+    logger.info("[L3消费者] 收到毒丸, 等待剩余%d个任务完成...", queue.qsize())
+    await queue.join()
+    logger.info("[L3消费者] 所有任务完成: 已处理%d只", completed)
+
+
+# ═══════════════════════════════════════════════════════════
+# Safe Queue Put (队列背压保护)
+# ═══════════════════════════════════════════════════════════
+
+async def _safe_queue_put(queue: asyncio.Queue, item: Any, label: str = "",
+                          timeout: float = 10.0):
+    """安全入队: 超时保护, 队列满时等待而非死锁.
+
+    如果队列满, 等待 timeout 秒后仍无法入队, 记录警告并丢弃 (非毒丸).
+    毒丸 (item is None) 不会丢弃——必须入队以确保消费者退出.
+    """
+    try:
+        await asyncio.wait_for(queue.put(item), timeout=timeout)
+    except asyncio.TimeoutError:
+        if item is None:
+            logger.warning("[%s] 毒丸入队超时, 重试...", label)
+            await queue.put(item)  # 毒丸必须入队, 无限等待
+        else:
+            logger.warning("[%s] 队列满 %.0fs, 丢弃 %s",
+                          label, timeout,
+                          item.get("code", str(item)) if isinstance(item, dict) else str(item))
+
+
+# ═══════════════════════════════════════════════════════════
+# Main Orchestrator V3: 流式流水线
+# ═══════════════════════════════════════════════════════════
+
+async def run_pool_update_v3(
+    term: str = "short",
+    on_stage: Optional[Callable] = None,
+    on_progress: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """精筛池流水线 V3: Layer 0→1→(2+3) 流式并发 + L2 pre-fetch 复用 (2026-07 优化)。
+
+    架构:
+      Layer 0: 硬筛 (~30s)
+      Layer 1: M1/M3 流式批量粗筛 (100只/批), 逐批分叉:
+        → 强烈推荐 → whitelist → Layer 3 立即 dispatch
+        → 推荐     → raw_data 累积 → Layer 2 后台流水线 (不阻塞 L1)
+        → 中性/回避 → 放弃
+        → 卖出     → blacklist
+      Layer 2: DSV4Pro 流式双堆 top-α, **复用 Layer 1 raw_data 跳过 fetch_batch**
+              (省 10-20min/cold-start). τ 收敛后 dispatch top-α 到 Layer 3.
+      Layer 3: 5 并发异步队列消费者, 7Agent+3Scorer 正式评分
+      截断: target_size × 1.2 进, target_size 出
+
+    预估冷启动耗时: short ~1.0-1.5h, medium ~1.0-1.5h, long ~0.8-1.0h.
+    """
+    from src.eval.config import get as eval_get
+
+    pm = PoolManager()
+    target_size = {"short": 100, "medium": 80, "long": 60}[term]
+    ratio = eval_get("whitelist_pass_ratio", 1.2)
+
+    def _stage(name, msg):
+        logger.info("[PoolUpdateV3:%s] %s: %s", term, name, msg)
+        if on_stage:
+            on_stage(name, msg)
+
+    result = {"term": term, "stages": {}}
+
+    # ── 进度/心跳/ETA监控 ──
+    progress = PipelineProgress(on_progress=on_progress)
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_loop(progress, interval=30.0)
+    )
+
+    # ── Layer 0: Hard Screen ──
+    _stage("0_hard_screen", "从Tushare获取全A股, 硬筛...")
+    progress.stage_start("0_hard_screen")
+    ts_stocks = await hard_screen()
+    progress.stage_end("0_hard_screen")
+    result["stages"]["0_hard_screen"] = f"硬筛后{len(ts_stocks)}只"
+    if len(ts_stocks) < target_size:
+        heartbeat_task.cancel()
+        return {"error": f"硬筛后仅{len(ts_stocks)}只"}
+
+    # ── 初始化共享状态 ──
+    whitelist: List[Dict] = []
+    blacklist: List[Dict] = []
+    layer3_results: List[Dict] = []
+    whitelist_final: List[Dict] = []
+    blacklist_final: List[Dict] = []
+    layer3_lock = asyncio.Lock()
+    layer3_queue_maxsize = max(200, target_size * 2)
+    layer3_queue = asyncio.Queue(maxsize=layer3_queue_maxsize)
+    code_to_stock: Dict[str, Dict] = {}
+    recommended_score_map: Dict[str, float] = {}  # code → layer2_score (fallback用)
+    # Layer 1 预抓取的 raw data (供 Layer 2 复用, 避免二次 fetch)
+    layer1_raw_data_map: Dict[str, Dict[str, Any]] = {}
+    # Layer 2 后台任务队列 (流水线: L2 与 L1 并行, 避免阻塞)
+    layer2_pending_tasks: List[asyncio.Task] = []
+    layer2_task_lock = asyncio.Lock()
+
+    # Layer 2 流式堆 + fallback flag
+    def alpha_fn():
+        return calc_alpha(len(whitelist), stream_heap.total, target_size, ratio)
+    stream_heap = StreamingTopAlphaHeap(alpha_fn=alpha_fn, epsilon=3.0, stable_batches=3)
+    layer2_fallback = False  # 如果 DSV4Pro 失败, 用 Layer 1 兜底
+
+    # Layer 3 消费者
+    _stage("3_start", "启动 Layer 3 消费者 (5并发, 15min超时)...")
+    progress.stage_start("3_formal_score", total=target_size * 2)
+    l3_task = asyncio.create_task(
+        _layer3_consumer(
+            layer3_queue, layer3_results, whitelist_final, blacklist_final,
+            layer3_lock, term, progress=progress,
+            heartbeat_interval=30.0, per_task_timeout=900.0,
+        )
+    )
+
+    # ── Layer 1: 流式批量粗筛 + 分叉路由 ──
+    _stage("1_batch_score", f"流式批量粗筛{len(ts_stocks)}只 (M1/M3)...")
+    progress.stage_start("1_batch_score", total=len(ts_stocks))
+    layer1_stats = {"whitelist": 0, "recommended": 0, "neutral_avoid": 0, "sell": 0}
+    layer1_scored = 0
+
+    # 数据获取阶段进度: 每回调一次推进 total 的 0.15% (约 7 只股票等效)
+    _fetch_step = len(ts_stocks) * 0.0015
+    _fetch_acc = [0.0]
+    def _progress_touch():
+        progress.last_progress_time = datetime.now()
+        _fetch_acc[0] += _fetch_step
+        progress.stage_progress("1_batch_score", int(min(_fetch_acc[0], len(ts_stocks) * 0.35)))
+
+    async for batch in batch_score_layer1_stream(
+        ts_stocks, term, on_progress=None,
+        progress_touch=_progress_touch
+    ):
+        layer1_scored += len(batch)
+        progress.stage_progress("1_batch_score", layer1_scored)
+        progress.emit_progress()
+
+        new_recommended = []
+        for stock in batch:
+            code = stock.get("code", "")
+            # 累积 L1 raw data (供 Layer 2 复用, 避免冗余 fetch)
+            raw_data = stock.pop("_raw_data", None)
+            if raw_data and code:
+                layer1_raw_data_map[code] = raw_data
+            code_to_stock[code] = stock
+            level = stock.get("layer1_level", "")
+
+            if level == "强烈推荐":
+                whitelist.append(stock)
+                layer1_stats["whitelist"] += 1
+                await _safe_queue_put(layer3_queue, stock, "L3-whitelist")
+            elif level == "推荐":
+                new_recommended.append(stock)
+                layer1_stats["recommended"] += 1
+            elif level == "卖出":
+                blacklist.append(stock)
+                layer1_stats["sell"] += 1
+            else:  # 中性/回避
+                layer1_stats["neutral_avoid"] += 1
+
+        # 新推荐 → Layer 2 打分 → 喂流式堆
+        # 流水线: Layer 2 后台执行, 不阻塞 Layer 1 处理下一批
+        if new_recommended:
+            chunk_snapshot = list(new_recommended)
+
+            async def _process_l2_chunk(chunk, raw_map_snapshot):
+                nonlocal layer2_fallback
+                try:
+                    layer2_scored = await score_layer2_batch(
+                        chunk, term, pre_fetched_data=raw_map_snapshot,
+                    )
+                    for s in layer2_scored:
+                        numeric = s.get("score", 50)
+                        if isinstance(numeric, (int, float)):
+                            code = s.get("code", "")
+                            recommended_score_map[code] = float(numeric)
+                            stock = code_to_stock.get(code)
+                            if stock:
+                                stock["layer2_score"] = float(numeric)
+                                stream_heap.feed(float(numeric), stock)
+                    stream_heap.batch_done()
+                except Exception as e:
+                    logger.warning("Layer 2 DSV4Pro 失败, 启用 Layer 1 兜底排序: %s", e)
+                    layer2_fallback = True
+                    # Layer 1 兜底: 用 confidence 近似分数
+                    conf_map = {"高": 80, "中": 50, "低": 30}
+                    for stock in chunk:
+                        code = stock.get("code", "")
+                        conf = stock.get("layer1_confidence", "中")
+                        fallback_score = conf_map.get(conf, 50)
+                        recommended_score_map[code] = fallback_score
+                        stock["layer2_score"] = fallback_score
+                        stream_heap.feed(fallback_score, stock)
+                    stream_heap.batch_done()
+
+                # τ 稳定 → dispatch
+                if stream_heap.is_tau_stable():
+                    for stock in stream_heap.get_undispatched():
+                        await _safe_queue_put(layer3_queue, stock, "L3-heap")
+
+            # 仅把本批 chunk 对应的 raw_data 快照传给后台任务, 避免 dict 共享竞态
+            raw_snapshot = {code: layer1_raw_data_map[code]
+                            for code in (s.get("code", "") for s in chunk_snapshot)
+                            if code in layer1_raw_data_map}
+            task = asyncio.create_task(
+                _process_l2_chunk(chunk_snapshot, raw_snapshot)
+            )
+            async with layer2_task_lock:
+                layer2_pending_tasks.append(task)
+
+        progress.queue_depth = layer3_queue.qsize()
+
+    # Layer 1 完成: 等待所有后台 L2 任务结束
+    if layer2_pending_tasks:
+        _stage("1_wait_l2", f"等待 {len(layer2_pending_tasks)} 个 L2 后台任务完成...")
+        await asyncio.gather(*layer2_pending_tasks, return_exceptions=True)
+        async with layer2_task_lock:
+            layer2_pending_tasks.clear()
+
+    # Layer 1 完成
+    progress.stage_end("1_batch_score")
+    result["stages"]["1_batch_score"] = (
+        f"白名单{layer1_stats['whitelist']}只, 推荐{layer1_stats['recommended']}只, "
+        f"放弃{layer1_stats['neutral_avoid']}只, 卖出{layer1_stats['sell']}只"
+    )
+    logger.info("[Layer 1-Stream] 完成: %s (fallback=%s, L1 pre-fetch 复用 %d 只)",
+                result["stages"]["1_batch_score"], layer2_fallback,
+                len(layer1_raw_data_map))
+
+    # ── Layer 2 finalize ──
+    progress.stage_start("2_stream_heap", total=stream_heap.total)
+    _stage("2_finalize", f"Layer 2 流式堆 finalize: {stream_heap.total}只推荐, "
+           f"high={stream_heap.high_size}, τ={stream_heap.tau:.1f}, fallback={layer2_fallback}")
+    for stock in stream_heap.finalize():
+        await _safe_queue_put(layer3_queue, stock, "L3-finalize")
+    progress.stage_end("2_stream_heap")
+    progress.queue_depth = layer3_queue.qsize()
+
+    # ── Layer 3 收尾 ──
+    _stage("3_wait", f"等待 Layer 3 完成 (队列剩余{layer3_queue.qsize()}只)...")
+    await asyncio.sleep(2.0)  # 让最后几个入队任务被消费
+    await _safe_queue_put(layer3_queue, None, "poison")  # 毒丸
+    try:
+        await asyncio.wait_for(l3_task, timeout=3600.0)  # 最多再等 1h
+    except asyncio.TimeoutError:
+        logger.error("Layer 3 消费者超时 (1h), 强制结束")
+        l3_task.cancel()
+    progress.stage_end("3_formal_score")
+
+    # 停止心跳
+    heartbeat_task.cancel()
+    try:
+        await heartbeat_task
+    except asyncio.CancelledError:
+        pass
+
+    # ── 截断到 target_size ──
+    async with layer3_lock:
+        scored = sorted(layer3_results, key=lambda x: x.get("final_score", 0), reverse=True)
+        pool_final = scored[:target_size]
+
+    stats = {
+        "candidates": len(layer3_results),
+        "scored": len(layer3_results),
+        "whitelist_final": len(whitelist_final),
+        "blacklist_final": len(blacklist_final),
+        "pool_size": len(pool_final),
+        "layer2_fallback": layer2_fallback,
+        "elapsed_s": round(progress.elapsed_seconds),
+        "score_range": {
+            "min": min((s.get("final_score", 0) for s in layer3_results), default=0),
+            "max": max((s.get("final_score", 0) for s in layer3_results), default=0),
+        },
+    }
+
+    # ── 持久化 ──
+    pm.clean_expired_blacklist()
+    pm.update_pool(term, pool_final)
+
+    blacklist_expiry = eval_get("blacklist_expiry_days", 120)
+    all_blacklist = blacklist + blacklist_final
+    for b in all_blacklist:
+        code = b.get("code", "")
+        if code and not pm.is_blacklisted(code):
+            pm.add_to_blacklist(
+                code,
+                b.get("layer1_reason", b.get("recommendation", "批量粗筛判定")),
+                expiry_days=blacklist_expiry,
+            )
+
+    result["pool"] = pool_final
+    result["whitelist"] = whitelist_final
+    result["blacklist"] = blacklist_final
+    result["stats"] = stats
+    result["final_pool_size"] = len(pool_final)
+
+    _stage("done", f"精筛池[{term}] V3完成: {len(pool_final)}只, "
+           f"耗时{progress.elapsed_seconds/60:.0f}min, "
+           f"(白{layer1_stats['whitelist']}, 推{layer1_stats['recommended']}, "
+           f"弃{layer1_stats['neutral_avoid']}, 卖{layer1_stats['sell']})")
+    progress.emit_progress()
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# Main Orchestrator (V2 兼容, 保持不变)
 # ═══════════════════════════════════════════════════════════
 
 async def run_pool_update(
@@ -690,7 +1674,7 @@ async def run_pool_update(
 
     管线:
       Layer 0: 硬筛(ST/BJ/B/新股/低成交额)
-      Layer 1: M1/M3批量粗筛分档(强烈推荐→白名单, 买入/谨慎买入/观望→初筛池, 卖出→黑名单)
+      Layer 1: M1/M3批量粗筛分档(强烈推荐→白名单, 推荐→初筛池, 中性/回避→丢弃, 卖出→黑名单)
       Layer 2: M2快筛过滤初筛池(便宜模型, 淘汰明显不行的)
       Layer 3: 1:1.2差额 → 正式7Agent+3Scorer → LLM动态阈值 → 最终精筛池
 

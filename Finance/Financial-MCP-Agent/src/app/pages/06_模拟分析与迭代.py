@@ -6,10 +6,9 @@ Tab 3: 趋势与优化（长期追踪）
 """
 import streamlit as st
 from datetime import datetime
+import sys, os, threading, time
 
 st.set_page_config(page_title="模拟分析与迭代", page_icon="📈", layout="wide")
-
-import sys, os
 _app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _app_dir not in sys.path:
     sys.path.insert(0, _app_dir)
@@ -21,8 +20,10 @@ from components.eval.holdings_table import render_holdings_table
 from components.eval.backtest_panel import render_backtest_panel
 from components.eval.contribution import render_contribution_leaderboard, render_optimization_tickets
 from components.eval.trends_charts import render_trends_tabs
+from components.shared_sidebar import render_sidebar
 
 inject_global_styles()
+render_sidebar()
 page_title("📈 模拟分析与迭代")
 st.caption("评分智能体 — 模拟盘评估、消融实验、回测、自动优化。所有结果仅供参考，使用评测模型(MiMo-V2.5)，目的是优化Agent系统。")
 
@@ -114,16 +115,71 @@ with tab1:
                         f"🔄 全量更新{label}池", key=f"health_full_{term}",
                         use_container_width=True,
                     ):
-                        with st.spinner(f"全量更新{label}池中..."):
-                            update_result = _run_async(orch.run_pool_update(term))
-                            if "error" in update_result:
-                                st.error(update_result["error"])
-                            else:
-                                st.success(
-                                    f"更新完成！共"
-                                    f"{update_result.get('final_pool_size', 0)}只"
-                                )
-                                st.rerun()
+                        # ── V3 流式进度 + ETA ──
+                        progress_bar = st.progress(0, "Layer 0: 硬筛中...")
+                        status_col1, status_col2, status_col3 = st.columns(3)
+                        eta_display = st.empty()
+                        stage_lines = st.empty()
+
+                        latest_progress = {"overall_pct": 0, "eta_str": "计算中...",
+                                          "stages": {}, "stall_s": 0}
+                        progress_lock = threading.Lock()
+
+                        def on_progress(data):
+                            with progress_lock:
+                                latest_progress.update(data)
+
+                        def on_stage(stage_name, message):
+                            pass  # stage transitions shown via progress data
+
+                        from src.eval.web_adapter import WebAdapter
+                        adapter = WebAdapter(orch)
+                        holder = adapter.run_pool_update_streaming(
+                            term, on_progress=on_progress, on_stage=on_stage
+                        )
+
+                        # 轮询进度, 更新 UI
+                        while not holder.get("done", False):
+                            with progress_lock:
+                                pct = latest_progress.get("overall_pct", 0) / 100.0
+                                eta = latest_progress.get("eta_str", "计算中...")
+                                stages = latest_progress.get("stages", {})
+                                stall = latest_progress.get("stall_s", 0)
+                            progress_bar.progress(
+                                min(pct, 1.0),
+                                f"总进度 {pct*100:.0f}% | ETA: {eta}"
+                                + (f" | ⚠️ 卡顿{stall:.0f}s" if stall > 60 else "")
+                            )
+                            # 阶段详情
+                            stage_text = ""
+                            for k, v in stages.items():
+                                if v.get("done", 0) > 0:
+                                    stage_text += (
+                                        f"**{v['label']}**: {v['pct']:.0f}% "
+                                        f"({v.get('done', 0)}/{v.get('total', 0)})  "
+                                    )
+                            stage_lines.markdown(stage_text or "准备中...")
+                            eta_display.caption(
+                                f"已运行 {(latest_progress.get('elapsed_s', 0) // 60)}min"
+                                f" | ETA: {eta}"
+                                f" | 队列: {latest_progress.get('queue_depth', 0)}只"
+                            )
+                            time.sleep(1.0)
+
+                        # 完成
+                        update_result = holder.get("result", {})
+                        if holder.get("error"):
+                            st.error(holder["error"])
+                        elif "error" in update_result:
+                            st.error(update_result["error"])
+                        else:
+                            progress_bar.progress(1.0, "完成!")
+                            st.success(
+                                f"更新完成！共 "
+                                f"{update_result.get('final_pool_size', 0)} 只"
+                                f" | 耗时 {update_result.get('stats', {}).get('elapsed_s', 0) // 60}min"
+                            )
+                            st.rerun()
     else:
         st.info("精筛池未初始化，请先运行评测系统。")
 

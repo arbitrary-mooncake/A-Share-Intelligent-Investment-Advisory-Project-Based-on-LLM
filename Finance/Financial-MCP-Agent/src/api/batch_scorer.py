@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Dict, List, Optional, Any
 
@@ -61,7 +61,7 @@ def _prefetch_tushare_batch(
 ) -> Dict[str, Dict]:
     """批量预取 Tushare 数据 (主线程顺序执行)。
 
-    三步: stock_basic 全量 → daily_basic 逐只 → fina_indicator 批量(40只/批)
+    三步: stock_basic 全量 → daily_basic 逐只 → fina_indicator 批量(200只/批)
     返回: {ts_code: {industry, pe, pb, ps, roe, gross_margin, ...}}
     缺失字段留空字符串。
 
@@ -136,10 +136,10 @@ def _prefetch_tushare_batch(
     pe_hit = sum(1 for tc in ts_codes if cache[tc].get("pe"))
     logger.info(f"  预取 Step B 完成: PE 命中 {pe_hit}/{total} (批量查询模式)")
 
-    # ── Step C: fina_indicator 批量 (每批40只) ──
-    batch_count = (total + 39) // 40
+    # ── Step C: fina_indicator 批量 (每批200只) ──
+    batch_count = (total + 199) // 200
     logger.info(
-        f"  预取 Step C: fina_indicator 批量 ({batch_count} 批, 每批40只)"
+        f"  预取 Step C: fina_indicator 批量 ({batch_count} 批, 每批200只)"
     )
     try:
         fina_map = get_fina_indicator_batch(ts_codes, years=2)
@@ -447,7 +447,6 @@ def _fetch_light_stock_data_sync(
     # ── 2. K线数据: Tencent 优先 ──
     kline_data = []
     try:
-        from datetime import timedelta
         start = (datetime.now() - timedelta(days=1130)).strftime("%Y-%m-%d")
         k_url = (
             f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"

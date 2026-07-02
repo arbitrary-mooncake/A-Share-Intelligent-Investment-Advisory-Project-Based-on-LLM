@@ -31,7 +31,7 @@ DEFAULTS: Dict[str, Any] = {
     "stock_pool_long_size": 60,
 
     # 初筛
-    "hard_screen_min_daily_amount": 20000000,  # 2000万
+    "hard_screen_min_daily_amount": 20000,  # 2000万元 (Tushare daily.amount单位=千元)
     "hard_screen_min_list_days": 60,
     "quick_screen_threshold_short": 50,
     "quick_screen_threshold_medium": 50,

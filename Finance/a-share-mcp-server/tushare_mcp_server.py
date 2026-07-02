@@ -17,8 +17,18 @@ import json, time as _time, threading as _threading, requests as _requests
 from datetime import datetime as _datetime, timedelta as _timedelta
 from typing import Dict, List, Optional, Any
 
-_TUSHARE_TOKEN = "fd4ff6e84626d2e63616ec08769f99110d626a91856036c30cb34818"
-_TUSHARE_URL = "https://api.tushare.pro"
+# 从 .env 加载环境变量（兼容直接运行与作为 MCP subprocess 运行两种场景）
+try:
+    from dotenv import load_dotenv
+    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Financial-MCP-Agent", ".env")
+    load_dotenv(_ENV_PATH, override=False)
+except ImportError:
+    pass
+
+_TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+_TUSHARE_URL = os.getenv("TUSHARE_URL", "https://api.tushare.pro")
+if not _TUSHARE_TOKEN:
+    logging.getLogger("tushare_mcp").warning("TUSHARE_TOKEN 未设置，Tushare API 调用将失败")
 _last_call = 0.0
 _rate_lock = _threading.Lock()
 

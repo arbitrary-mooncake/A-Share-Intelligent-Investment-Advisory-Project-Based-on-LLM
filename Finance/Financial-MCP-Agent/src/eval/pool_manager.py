@@ -295,8 +295,19 @@ class PoolManager:
                 )
                 status = "red"
 
+            # ── 欠填充检测（当前池容量显著低于目标） ──
+            min_size = DEFAULT_POOL_CONFIG[term]["min_size"]
+            severe_underfill = pool_size < min_size * 0.5
+
             # YELLOW（仅当非RED时）
             if status != "red":
+                if severe_underfill:
+                    triggers.append(
+                        f"精筛池严重欠填充: 当前{pool_size}只 < 下限{min_size}只"
+                        f"（目标{summary['target_size']}只），建议立即全量更新"
+                    )
+                    status = "yellow"
+
                 if not_held_pct > 20:
                     triggers.append(
                         f"池内{not_held_pct:.0f}%的股票未被任何线路持有（连续10日）"
@@ -313,7 +324,7 @@ class PoolManager:
             if status == "red":
                 suggested_action = "建议立即全量更新精筛池"
             elif status == "yellow":
-                if days_since_update >= max_days:
+                if severe_underfill or days_since_update >= max_days:
                     suggested_action = "建议全量更新精筛池"
                 else:
                     suggested_action = "建议部分更新（替换评分垫底的20%股票）"

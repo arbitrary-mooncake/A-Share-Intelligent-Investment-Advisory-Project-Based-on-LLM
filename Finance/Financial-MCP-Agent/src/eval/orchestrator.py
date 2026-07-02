@@ -1008,25 +1008,31 @@ class EvalOrchestrator:
             return {}
 
     async def run_pool_update(self, term: str = "short",
-                               on_stage: callable = None) -> Dict[str, Any]:
+                               on_stage: callable = None,
+                               on_progress: callable = None) -> Dict[str, Any]:
         """
-        精筛池更新 — 完整四层管线（总纲 §4.1）。
+        精筛池更新 — 流式流水线 V3 (2026-06-28)。
 
         管线:
           Layer 0: 硬筛 (去ST/BJ/B/新股/低成交额)
-          Layer 1: M1/M3批量粗筛分档 (强烈推荐→白名单, 买入/谨慎买入/观望→初筛池, 卖出→黑名单)
-          Layer 2: M2快筛过滤初筛池
-          Layer 3: 1:1.2差额组建候选 → 正式7Agent+3Scorer → LLM动态阈值 → 最终精筛池
+          Layer 1: M1/M3流式批量粗筛 → 实时分叉:
+            → 强烈推荐 → whitelist → Layer 3 立即 dispatch
+            → 推荐 → Layer 2 DSV4Pro 流式双堆 top-α
+            → 中性/回避 → 放弃
+            → 卖出 → blacklist
+          Layer 2: DSV4Pro 流式排序, τ 收敛后 dispatch top-α 到 Layer 3
+          Layer 3: 5并发异步队列, 7Agent+3Scorer → 分数截断 → 精筛池
 
         Args:
             term: short/medium/long
-            on_stage: 阶段回调(stage_name, message) — 供Streamlit实时显示进度
+            on_stage: 阶段回调(stage_name, message)
+            on_progress: 进度回调(dict) — V3 PipelineProgress.emit_progress 格式
 
         Returns:
             完整结果字典
         """
-        from src.eval.pool_screening import run_pool_update as _run
-        return await _run(term=term, on_stage=on_stage)
+        from src.eval.pool_screening import run_pool_update_v3 as _run
+        return await _run(term=term, on_stage=on_stage, on_progress=on_progress)
 
     async def run_pool_update_light(self, term: str = "short") -> Dict[str, Any]:
         """[已废弃] 保留兼容旧接口，内部转调 run_pool_update（四层管线）"""

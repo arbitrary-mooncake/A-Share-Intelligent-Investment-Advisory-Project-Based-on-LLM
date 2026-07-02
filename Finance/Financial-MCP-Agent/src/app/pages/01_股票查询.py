@@ -15,6 +15,7 @@ import streamlit as st
 
 from components.query_form import render_query_form
 from components.result_card import render_result_card
+from components.shared_sidebar import render_sidebar
 from api_client import (
     APIError,
     quick_query,
@@ -33,6 +34,7 @@ st.set_page_config(
 )
 
 inject_global_styles()
+render_sidebar()
 
 
 def handle_quick_query(stock_input: str):

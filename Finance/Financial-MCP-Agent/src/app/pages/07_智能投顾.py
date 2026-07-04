@@ -863,7 +863,7 @@ def _render_chat_panel():
     st.divider()
 
     # 消息展示
-    chat_container = st.container(height=500)
+    chat_container = st.container(height=350)
     with chat_container:
         for msg in st.session_state["advisory_chat"]:
             with st.chat_message(msg["role"]):
@@ -921,7 +921,7 @@ def _render_history_sidebar():
     # 展开状态
     col_toggle, col_title = st.columns([1, 4])
     with col_toggle:
-        if st.button("◀", key="btn_collapse_history"):
+        if st.button("▶", key="btn_collapse_history"):
             st.session_state["advisory_history_expanded"] = False
             st.rerun()
     with col_title:

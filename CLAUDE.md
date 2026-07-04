@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -11,14 +11,16 @@ A stock investment advisor agent system for A-share (Chinese stock market) and f
 ### Two-Layer Architecture
 
 **Layer 1: MCP Servers** (`Finance/a-share-mcp-server/`)
-- `tushare_mcp_server.py` — Tushare MCP server (primary data source, all agents use Tushare tools)
-- `mcp_server.py` — Legacy AKshare MCP server (minimal use, being phased out)
-- Both run over stdio via FastMCP; in-memory tool-level cache (5-min TTL)
+- `tushare_mcp_server.py` — Tushare MCP server (primary data source for A-share data)
+- `mcp_server.py` — Legacy AKShare MCP server (minimal use, being phased out)
+- `web_search_mcp_server.py` — Web search MCP server (news/sentiment, supplementary data)
+- `yfinance_mcp_server.py` — Yahoo Finance MCP server (international/macro/commodity data)
+- All run over stdio via FastMCP; in-memory tool-level cache (5-min TTL)
 
 **Layer 2: Financial MCP Agent** (`Finance/Financial-MCP-Agent/`)
 - Consumes MCP servers via `langchain-mcp-adapters` (`MultiServerMCPClient`)
 - LangGraph workflows orchestrate analysis → scoring/report pipelines
-- LLM calls via OpenAI-compatible API (5-model architecture in `.env`)
+- LLM calls via OpenAI-compatible API (6-model architecture in `.env`, M4 currently unused)
 
 ### A-Stock Pipeline (v2 — 2026-06 upgrade)
 
@@ -191,15 +193,36 @@ run_full_check() → detect_missed_days() → catch_up (≤7 days) →
 |--------|------|
 | `orchestrator.py` | Central scheduler: full check, rebalance, settlement, catch-up, pool update |
 | `market_simulator.py` | Shared trade execution: commission, stamp tax, slippage, volume constraints, limit up/down, suspension, T+1 |
+| `settlement_engine.py` | Daily P&L settlement: realized/unrealized gains, position tracking, NAV calculation |
 | `loss_engine.py` | Multi-dim Loss: L_total = w_effect×L_effect + w_stability×L_stability + w_efficiency×L_efficiency |
 | `contribution_engine.py` | Agent ablation ΔLoss with Bootstrap CI, Cluster Bootstrap (short-term), Permutation Test |
+| `experiment_engine.py` | Manages ablation experiment configuration and execution across line combinations |
 | `replay_backtest_engine.py` | PIT backtest: per-anchor agent analysis via cache, regime slicing (bull/bear/ranging) |
 | `pool_manager.py` | 3 refined pools (short/medium/long) with health monitoring (5 trigger conditions from 总纲 §4.2) |
 | `pool_screening.py` | 4-layer screening pipeline: hard screen → batch score (M1/M3) → quick screen (M2) → formal scoring |
 | `fidelity_engine.py` | Detects score drift between eval model (M5) and production models (M1/M3) |
+| `report_builder.py` | Aggregates settlement/loss/contribution data into structured report payloads |
 | `report_writer_agent.py` | LLM report writing via DeepSeek V4 Pro with anti-hallucination verification |
 | `memory_manager.py` | Long-term trend storage: score/loss/contribution/fidelity/runtime histories |
 | `chart_service.py` | Trend data generation for Streamlit charts (5 tabs) |
+| `check_runner.py` | Executes daily full-check cycle: orchestrates rebalance + settlement + report generation |
+| `config.py` | Priority-based config: env vars > `config/eval/*.json` > hardcoded defaults |
+| `database.py` | SQLite connection manager for `eval.db` (eval results, settlements, positions) |
+| `repositories.py` | Data access layer: CRUD for settlements, positions, scores, losses, contributions |
+
+### Eval Config System
+
+Eval system uses a three-tier priority config (`src/eval/config.py`):
+1. **Environment variables** (highest priority)
+2. **JSON config files** in `config/eval/*.json` (pool sizes, thresholds, model profiles)
+3. **Hardcoded defaults** in `config.py`
+
+Key configurable parameters (via JSON or env):
+- `stock_pool_short_size` (100), `stock_pool_medium_size` (80), `stock_pool_long_size` (60)
+- `hard_screen_min_daily_amount` (20000 = 2000万元), `hard_screen_min_list_days` (60)
+- `quick_screen_threshold_{short,medium,long}` (50)
+- `grading_enabled` (True), `monday_full_run` (True)
+- `score_change_upgrade_threshold` (10.0), `score_stable_downgrade_threshold` (3.0)
 
 ### Strategies (总纲 §5)
 
@@ -276,6 +299,46 @@ Key bottleneck (V3): Layer 3 的 5 并发 ScoringEngine × 7 agent × MCP stdio 
 - **10-batch minimum for trend charts**: Trend curves only render after ≥10 batches accumulated, otherwise show progress bar.
 - **Progress bars**: All operations >1 second MUST show `st.progress()` + `st.status()` in Streamlit (总纲 §16.1.9).
 
+## Streamlit Web UI
+
+The web UI is in `src/app/` with `Home.py` as the entry point and 7 pages in `src/app/pages/`:
+
+| Page | File | Purpose |
+|------|------|---------|
+| 股票查询 | `01_股票查询.py` | Single-stock search and quick analysis |
+| 股票池 | `02_股票池.py` | Pool management: add/remove stocks, view scores |
+| 批量打分 | `03_批量打分.py` | Batch scoring for multiple stocks |
+| 智能问答 | `04_智能问答.py` | Natural language Q&A about stocks/markets |
+| 基金专区 | `05_基金专区.py` | Fund/ETF analysis and pool management |
+| 模拟分析与迭代 | `06_模拟分析与迭代.py` | Eval system UI: line status, trends, pool updates, reports |
+| 智能投顾 | `07_智能投顾.py` | Investment advisor dashboard with multi-turn chat, persistent session history, collapsible history sidebar |
+
+**UI components** in `src/app/components/`: reusable Streamlit components (charts, tables, status indicators).
+**API client** (`src/app/api_client.py`): HTTP client for communicating with the FastAPI backend when running in API mode.
+**Theme** (`src/app/theme.py`): centralized color scheme and styling.
+
+**精筛池更新跨重启存活**: The "🎯 更新精筛池" operation runs as a detached subprocess (see `src/eval/job_manager.py` and `src/eval/pool_update_worker.py`), decoupled from Streamlit lifecycle.
+
+## Data Directory Structure
+
+`data/` under `Finance/Financial-MCP-Agent/`:
+
+| Directory | Purpose |
+|-----------|---------|
+| `intermediate_cache/` | Production LLM cache (M1/M3), no `_eval` suffix |
+| `eval/cache/` | Eval system LLM cache (M5), `_eval` suffix — **physically isolated from production** |
+| `eval/` | Eval DB (`eval.db`), settlement records, position snapshots, refined pool JSON |
+| `pool_update_jobs/` | Job state files + worker logs for detached pool updates (1-year retention) |
+| `batch_jobs/` | Batch scoring job state |
+| `advisory_sessions/` | Multi-turn advisory chat sessions (JSON persistence) |
+| `advisory_settlements/` | Advisory system settlement records |
+| `advisory_llm_free/` | LLM Free strategy decision logs |
+| `portfolios/` | User portfolio data |
+| `qa_sessions/` | Q&A engine session state |
+| `reports/` | Generated Markdown/PDF reports |
+| `strategies/` | Strategy configuration files |
+| `user_profiles/` | User preference profiles |
+
 ## Commands
 
 All commands run from `Finance/Financial-MCP-Agent/`.
@@ -316,11 +379,21 @@ python -m src.eval optimize --analyze  # Generate optimization suggestions
 python -m pytest tests/ -v                          # All tests
 python -m pytest tests/test_analysis_package.py -v  # Schema + builder
 python -m pytest tests/test_risk_gate.py -v         # Risk gate rules
+python -m pytest tests/test_market_simulator.py -v  # Trade execution logic
+python -m pytest tests/test_loss_engine.py -v       # Multi-dim loss calculation
+python -m pytest tests/test_contribution.py -v      # Agent ablation + Bootstrap CI
+python -m pytest tests/test_orchestrator.py -v      # Eval scheduler
+python -m pytest tests/test_pool_screening.py -v    # 4-layer screening pipeline
+python -m pytest tests/test_eval_cache.py -v        # Eval cache isolation
+python -m pytest tests/test_job_manager.py -v       # Pool update job lifecycle
+python -m pytest tests/test_backtest.py -v          # Replay backtest engine
+python -m pytest tests/test_settlement.py -v        # Daily settlement logic
+python -m pytest tests/test_qa.py -v                # Q&A engine
 ```
 
 ## Environment Variables
 
-`.env` file. Five-model architecture via `src/utils/model_config.py`:
+`.env` file. Six-model architecture via `src/utils/model_config.py`:
 
 | Model | Suffix | Default Model | Used By |
 |-------|--------|---------------|---------|
@@ -347,6 +420,7 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - `src/utils/industry_knowledge.py` — 25 Shenwan industry PE/PB/ROE benchmarks
 - `src/utils/fund_type_knowledge.py` — Fund-type-specific scoring guidance
 - `src/utils/tushare_client.py` — Tushare API wrappers (stock_info, daily_basic, fina_indicator, PE percentile, etc.)
+- `src/utils/stock_data_cache.py` — Stock data caching layer for frequently accessed market data
 - `src/stock_pool/stock_pool_manager.py` — 5 per-term pools (short/medium/long/quick_screen/fine) in `stock_pool.json`
 
 ## Anti-Patterns to Avoid
@@ -372,26 +446,3 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - `src/tools/mcp_config.py` uses `sys.executable` (not hardcoded `python`)
 - WSL-created venvs are incompatible; recreate with `python -m venv venv`
 - `launch.ps1` uses `taskkill /f /t` for tree-kill of uvicorn/streamlit
-
-## 精筛池更新跨重启存活
-
-Streamlit 页面触发的"🎯 更新精筛池"操作以 detached subprocess 方式运行, 与 Streamlit 进程生命周期解耦。
-
-**核心文件**:
-- `src/eval/job_manager.py`: `JobManager` (UI 侧) + `AtomicJobWriter` (worker 侧) + `is_pid_alive` + `detect_orphan`
-- `src/eval/pool_update_worker.py`: worker 入口, `python -m src.eval.pool_update_worker --job-id <id> --term <term>`
-- `data/pool_update_jobs/`: job 文件 + worker 日志 (1 年保留, 自动 cleanup)
-
-**关键行为**:
-- 同 term 同时只允许 1 个 running job, 重复触发自动 attach
-- 2Hz 原子写入 (write → .tmp → os.replace + 3-retry backoff on Windows), 防止读半写文件
-- Orphan 检测: `status=running` 但 pid 不存在 → 自动标 `orphaned`
-- Windows: `CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS` + `taskkill /F /T` 用于 stop(); POSIX: `start_new_session=True` + `SIGTERM`
-- Worker 完成后 status=completed, UI 看到后触发 `st.rerun()`; FAILED/ORPHANED 路径**不** rerun, 保留错误 UI + worker log expander
-
-**调试**:
-- UI 提供 "📋 Worker 日志" 折叠面板, 显示 `data/pool_update_jobs/{job_id}.log` 最后 200 行
-- Job JSON schema 见 `src/eval/job_manager.py` 的 `Job` dataclass
-- 保留策略: 1 年 (mtime 比较), 由 `JobManager.cleanup()` 在每次 `start_job()` 后自动触发
-
-**禁用旧接口**: `WebAdapter.run_pool_update_streaming` 已删除 (UI 全部改用 JobManager).

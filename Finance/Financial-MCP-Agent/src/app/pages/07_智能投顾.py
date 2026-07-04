@@ -978,22 +978,20 @@ def _render_history_sidebar():
 
 @st.dialog("确认删除", width="small")
 def _delete_confirm_dialog(session_id: str):
-    """删除确认对话框"""
+    """删除确认对话框 — 进入时清除标记，防止 X 关闭后重复弹出"""
+    st.session_state["advisory_delete_confirm"] = None
     st.warning("确定要删除这个历史会话吗？此操作不可撤销。")
 
     col_cancel, col_confirm = st.columns(2)
     with col_cancel:
         if st.button("取消", use_container_width=True):
-            st.session_state["advisory_delete_confirm"] = None
             st.rerun()
     with col_confirm:
         if st.button("确认删除", type="primary", use_container_width=True):
             result = _api(f"/api/advisory/sessions/{session_id}", "DELETE")
             if "error" not in result:
-                # 如果删的是当前会话，清空聊天
                 if st.session_state.get("advisory_current_session_id") == session_id:
                     _clear_chat_for_new_session()
-                st.session_state["advisory_delete_confirm"] = None
                 _refresh_session_list()
                 st.rerun()
             else:
@@ -1040,13 +1038,12 @@ _handle_tab_switch()
 if st.session_state.get("advisory_delete_confirm"):
     _delete_confirm_dialog(st.session_state["advisory_delete_confirm"])
 
-# 三栏布局：左(5) + 中(3) + 右(2 或 0)
+# 三栏布局：左(5) + 中(3) + 右(2) 或 左(5) + 中(3) + 右(1) 折叠
 history_expanded = st.session_state.get("advisory_history_expanded", False)
 if history_expanded:
     left_col, chat_col, history_col = st.columns([5, 3, 2])
 else:
-    left_col, chat_col = st.columns([5, 3])
-    history_col = None
+    left_col, chat_col, history_col = st.columns([5, 3, 1])
 
 with left_col:
     {
@@ -1061,9 +1058,5 @@ with left_col:
 with chat_col:
     _render_chat_panel()
 
-if history_col is not None:
-    with history_col:
-        _render_history_sidebar()
-else:
-    # 折叠状态下在聊天面板下方显示一个小按钮
-    pass
+with history_col:
+    _render_history_sidebar()

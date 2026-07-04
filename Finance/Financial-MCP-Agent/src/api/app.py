@@ -57,6 +57,7 @@ from src.stock_pool.stock_pool_manager import StockPoolManager
 from src.stock_pool.scoring_engine import ScoringEngine
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.industry_knowledge import identify_industry, get_industry_info, get_industry_scoring_guidance
+from src.advisory.advisory_session_manager import get_advisory_session_manager
 
 # QA 引擎
 from src.qa.qa_engine import process_question
@@ -1538,9 +1539,6 @@ app.add_middleware(
 # API 端点
 # ──────────────────────────────────────────────
 
-_name_code_cache: Optional[dict] = None  # name → code 映射
-
-
 _name_code_cache: Optional[dict] = None  # name → normalized_code 映射 (sh.xxxxxx / sz.xxxxxx)
 _etf_name_cache: Optional[dict] = None   # ETF name → sh.xxxxxx 映射
 _name_cache_loaded: bool = False          # 仅在缓存完全加载后置 True（用 flag 而非 dict is not None，避免空 dict 误判）
@@ -1884,6 +1882,20 @@ async def get_score_status(task_id: str):
 # 精筛股票池三期限并行打分
 # ──────────────────────────────────────────────
 
+
+def _resolve_stock_name(stock_code: str) -> str:
+    """尝试通过名称缓存反查股票代码对应的公司名称"""
+    _ensure_name_cache()
+    bare = stock_code.replace("sh.", "").replace("sz.", "")
+    for name, code in (_name_code_cache or {}).items():
+        if code == stock_code or code.replace("sh.", "").replace("sz.", "") == bare:
+            return name
+    for name, code in (_etf_name_cache or {}).items():
+        if code == stock_code or code.replace("sh.", "").replace("sz.", "") == bare:
+            return name
+    return ""
+
+
 async def _run_score_all_task(task_id: str, stock_code: str, company_name: str):
     """后台执行精筛打分（三期限并行）"""
     try:
@@ -1903,7 +1915,7 @@ async def _run_score_all_task(task_id: str, stock_code: str, company_name: str):
             "short_term_score": short_ts,
             "medium_term_score": medium_ts,
             "long_term_score": long_ts,
-        })
+        }, company_name=company_name)
 
         _score_all_tasks[task_id] = {
             "status": "completed",
@@ -1934,6 +1946,15 @@ async def trigger_score_all(stock_code: str):
 
     task_id = str(uuid.uuid4())[:8]
     company_name = stock["company_name"]
+    if _pool_manager._is_bad_name(company_name, stock_code):
+        resolved = _resolve_stock_name(stock_code)
+        if resolved:
+            company_name = resolved
+            stock["company_name"] = resolved
+            _pool_manager._save()
+            logger.info(f"{SUCCESS_ICON} 精筛打分: 修复 {stock_code} 名称为 {resolved}")
+        else:
+            logger.warning(f"精筛打分: {stock_code} 名称缺失，将使用代码作为名称")
     _score_all_tasks[task_id] = {
         "status": "pending", "stock_code": stock_code, "company_name": company_name,
     }
@@ -4532,8 +4553,8 @@ async def advisory_report(request: ReportRequest):
 
 # ── 11. AI 顾问对话 ──
 
-def _build_advisory_system_prompt(profile_summary: str, page_name: str = "", page_data: Any = None) -> str:
-    """构建智能投顾 AI 顾问的 system prompt。"""
+def _build_advisory_system_prompt(profile_summary: str, page_name: str = "", page_data: Any = None, history_text: str = "") -> str:
+    """构建智能投顾 AI 顾问的 System prompt。"""
     system_parts = [
         "你是一位专业的A股智能投资顾问助手。",
         "你的职责是为用户提供股票分析、持仓管理、策略建议、市场分析等投顾服务。",
@@ -4553,6 +4574,9 @@ def _build_advisory_system_prompt(profile_summary: str, page_name: str = "", pag
         "当需要确认当前画像时，调用 get_user_profile 工具查询。",
         "例如：用户说'我是保守型投资者' → 调用 update_user_profile(risk_tolerance='Conservative')。",
     ]
+    if history_text:
+        system_parts.append("")
+        system_parts.append(history_text)
     if page_name:
         system_parts.append(f"\n## 当前页面上下文\n用户正在查看「{page_name}」页面。")
         if page_data:
@@ -4576,20 +4600,14 @@ def _execute_profile_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
 
 @app.post("/api/advisory/chat")
 async def advisory_chat(request: ChatRequest):
-    """AI 顾问对话 — 调用 M1 MiMo-V2.5-Pro，注入用户画像与页面上下文。
-
-    设计 §2：右侧常驻 AI 面板的后端支持。
-    设计 §3.4：支持 function calling，LLM 可调用 update_user_profile / get_user_profile 工具。
-    每次对话注入当前页面上下文 + 用户画像，让 AI 感知用户在看什么。
-    """
+    """AI 顾问对话 — 多轮上下文 + 自动保存 + 用户画像工具。"""
     try:
         from src.advisory.profile_tools import PROFILE_TOOLS_SCHEMA
 
         modules = _init_advisory()
         upm = modules["user_profile_manager"]
-
-        # 加载用户画像
         profile_summary = upm.get_profile_summary()
+        session_mgr = get_advisory_session_manager()
 
         # 解析页面上下文
         page_name = ""
@@ -4602,9 +4620,25 @@ async def advisory_chat(request: ChatRequest):
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        system_prompt = _build_advisory_system_prompt(profile_summary, page_name, page_data)
+        # 会话管理：确保 session 存在
+        session_id = request.session_id
+        if not session_id or session_id == "default":
+            session_id = session_mgr.create_session()
+        sess = session_mgr.get_session(session_id)
+        if sess is None:
+            session_id = session_mgr.create_session()
 
-        # 调用 M1 模型（支持 function calling 循环）
+        # 获取历史上下文
+        history_text = session_mgr.get_history_for_llm(session_id, max_turns=6)
+
+        system_prompt = _build_advisory_system_prompt(
+            profile_summary, page_name, page_data, history_text
+        )
+
+        # 保存用户消息
+        session_mgr.add_message(session_id, "user", request.message, page_context=page_name)
+
+        # 调用 M1 模型
         base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "")
         api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
         model = os.getenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro")
@@ -4625,21 +4659,17 @@ async def advisory_chat(request: ChatRequest):
                 {"role": "user", "content": request.message},
             ]
             tool_schemas = [t["function"] for t in PROFILE_TOOLS_SCHEMA]
-            # OpenAI tools 格式
             tools_for_api = [
                 {"type": "function", "function": f} for f in tool_schemas
             ]
 
             reply = ""
             tool_calls_log: List[Dict[str, Any]] = []
-            max_rounds = 3  # 最多 3 轮 tool 调用循环
-            tools_enabled = True  # 若首轮 tools 调用失败则降级
+            max_rounds = 3
+            tools_enabled = True
 
             for round_idx in range(max_rounds):
-                api_kwargs = dict(
-                    model=model,
-                    messages=messages,
-                )
+                api_kwargs = dict(model=model, messages=messages)
                 if tools_enabled:
                     api_kwargs["tools"] = tools_for_api
                 if thinking_body:
@@ -4667,25 +4697,16 @@ async def advisory_chat(request: ChatRequest):
 
                 msg = choice.message
 
-                # 如果有 tool_calls，执行工具并继续对话
                 if tools_enabled and getattr(msg, "tool_calls", None) and len(msg.tool_calls) > 0:
-                    # 把 assistant 消息（含 tool_calls）加入对话
                     messages.append({
                         "role": "assistant",
                         "content": msg.content or "",
                         "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
-                            }
+                            {"id": tc.id, "type": "function",
+                             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                             for tc in msg.tool_calls
                         ],
                     })
-
                     for tc in msg.tool_calls:
                         tool_name = tc.function.name
                         try:
@@ -4694,30 +4715,21 @@ async def advisory_chat(request: ChatRequest):
                             parsed = {}
                         if not isinstance(parsed, dict):
                             parsed = {}
-                        arguments = parsed
                         try:
-                            tool_result = _execute_profile_tool(tool_name, arguments)
+                            tool_result = _execute_profile_tool(tool_name, parsed)
                         except Exception as te:
-                            logger.warning(f"工具 {tool_name} 执行失败: {te}")
                             tool_result = f"工具执行失败: {te}"
                         tool_calls_log.append({
-                            "tool": tool_name,
-                            "arguments": arguments,
+                            "tool": tool_name, "arguments": parsed,
                             "result_preview": tool_result[:200],
                         })
                         messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": tool_result,
+                            "role": "tool", "tool_call_id": tc.id, "content": tool_result,
                         })
-
-                    # 刷新 profile_summary 以反映更新后的画像
                     if any(tc.function.name == "update_user_profile" for tc in msg.tool_calls):
                         profile_summary = upm.get_profile_summary()
-                    # 继续下一轮，让 LLM 基于工具结果生成回复
                     continue
 
-                # 无 tool_calls，取 content 作为最终回复
                 reply = msg.content or "抱歉，我暂时无法生成回复，请稍后重试。"
                 break
             else:
@@ -4729,10 +4741,13 @@ async def advisory_chat(request: ChatRequest):
             logger.warning(f"AI 对话模型调用失败: {e}")
             reply = f"抱歉，模型服务暂时不可用。（{str(e)[:100]}）"
 
+        # 保存 AI 回复
+        session_mgr.add_message(session_id, "assistant", reply, page_context=page_name)
+
         return {
             "status": "ok",
             "reply": reply,
-            "session_id": request.session_id,
+            "session_id": session_id,
             "page_context": request.page_context,
             "model": model,
             "tool_calls": tool_calls_log,
@@ -4740,6 +4755,57 @@ async def advisory_chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"{ERROR_ICON} AI 对话失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"AI 对话失败: {str(e)}")
+
+
+@app.get("/api/advisory/sessions")
+async def list_advisory_sessions():
+    """列出所有投顾会话（摘要，按更新时间倒序）"""
+    try:
+        session_mgr = get_advisory_session_manager()
+        sessions = session_mgr.list_sessions()
+        return {"status": "ok", "sessions": sessions}
+    except Exception as e:
+        logger.error(f"列出投顾会话失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"列出会话失败: {str(e)}")
+
+
+@app.get("/api/advisory/sessions/{session_id}")
+async def get_advisory_session(session_id: str):
+    """获取指定会话的完整历史"""
+    try:
+        session_mgr = get_advisory_session_manager()
+        sess = session_mgr.get_session(session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "name": sess.name,
+            "history": [m.to_dict() for m in sess.history],
+            "created_at": sess.created_at,
+            "updated_at": sess.updated_at,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取投顾会话失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取会话失败: {str(e)}")
+
+
+@app.delete("/api/advisory/sessions/{session_id}")
+async def delete_advisory_session(session_id: str):
+    """删除指定会话"""
+    try:
+        session_mgr = get_advisory_session_manager()
+        success = session_mgr.delete_session(session_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {"status": "ok", "deleted": session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"删除投顾会话失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"删除会话失败: {str(e)}")
 
 # ── 12. 组合健康度评估 ──
 

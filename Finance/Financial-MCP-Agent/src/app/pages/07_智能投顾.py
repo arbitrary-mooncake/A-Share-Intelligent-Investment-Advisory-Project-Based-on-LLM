@@ -31,6 +31,8 @@ def _api(path: str, method: str = "GET", body: dict = None) -> dict:
     try:
         if method == "GET":
             resp = requests.get(url, timeout=30)
+        elif method == "DELETE":
+            resp = requests.delete(url, timeout=30)
         else:
             resp = requests.post(url, json=body, timeout=120)
         resp.raise_for_status()
@@ -75,6 +77,56 @@ if "advisory_match_result" not in st.session_state:
     st.session_state["advisory_match_result"] = None
 if "advisory_auto_catchup_done" not in st.session_state:
     st.session_state["advisory_auto_catchup_done"] = False
+if "advisory_current_session_id" not in st.session_state:
+    st.session_state["advisory_current_session_id"] = None
+if "advisory_history_expanded" not in st.session_state:
+    st.session_state["advisory_history_expanded"] = False
+if "advisory_delete_confirm" not in st.session_state:
+    st.session_state["advisory_delete_confirm"] = None
+if "advisory_session_list" not in st.session_state:
+    st.session_state["advisory_session_list"] = []
+if "advisory_prev_page" not in st.session_state:
+    st.session_state["advisory_prev_page"] = None
+
+# ── 辅助函数 ──────────────────────────────────
+
+def _clear_chat_for_new_session():
+    """清空当前聊天，准备新会话。旧会话已在后端保存。"""
+    st.session_state["advisory_chat"] = []
+    st.session_state["advisory_chat_loading"] = False
+    st.session_state["advisory_current_session_id"] = None
+
+
+def _load_session_into_chat(session_id: str):
+    """从后端加载历史会话到聊天面板"""
+    result = _api(f"/api/advisory/sessions/{session_id}")
+    if "error" not in result and result.get("status") == "ok":
+        history = result.get("history", [])
+        st.session_state["advisory_chat"] = [
+            {"role": m["role"], "content": m["content"]} for m in history
+        ]
+        st.session_state["advisory_current_session_id"] = session_id
+
+
+def _refresh_session_list():
+    """刷新历史会话列表"""
+    result = _api("/api/advisory/sessions")
+    if "error" not in result:
+        st.session_state["advisory_session_list"] = result.get("sessions", [])
+
+
+def _handle_tab_switch():
+    """检测 Tab 切换，自动清空聊天并归档旧会话"""
+    current_page = st.session_state["advisory_page"]
+    prev_page = st.session_state.get("advisory_prev_page")
+    if prev_page is not None and prev_page != current_page:
+        # Tab 发生了变化 — 清空聊天
+        if st.session_state["advisory_chat"]:
+            # 有消息的会话已在后端保存，只需前端清空
+            pass
+        _clear_chat_for_new_session()
+    st.session_state["advisory_prev_page"] = current_page
+
 
 # ── 子页面定义 ────────────────────────────────
 PAGE_CONFIG = {
@@ -92,50 +144,17 @@ PAGE_CONFIG = {
 # ──────────────────────────────────────────────
 
 def _render_ai_chat():
-    """💬 AI顾问对话 — 真实 AI 聊天界面"""
+    """AI顾问对话 — Tab 内容区（聊天已移到中间面板）"""
     st.markdown("### 💬 AI顾问对话")
     st.caption("与智能投顾直接对话，获取投资建议与市场分析")
 
-    # 聊天消息展示
-    chat_container = st.container()
-    with chat_container:
-        for msg in st.session_state["advisory_chat"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-    # 底部输入
-    prompt = st.chat_input("输入您的问题，例如：当前市场热点是什么？", key="advisory_chat_input")
-    if prompt and prompt.strip():
-        st.session_state["advisory_chat"].append({"role": "user", "content": prompt.strip()})
-        st.session_state["advisory_chat_loading"] = True
-        st.rerun()
-
-    # 处理待发送的消息
-    if st.session_state.get("advisory_chat_loading"):
-        with st.spinner("AI 顾问思考中..."):
-            user_msg = st.session_state["advisory_chat"][-1]["content"]
-            page_ctx = json.dumps({
-                "page": "AI顾问对话",
-                "data": {},
-            }, ensure_ascii=False)
-            result = _api("/api/advisory/chat", "POST", {
-                "message": user_msg,
-                "session_id": "default",
-                "page_context": page_ctx,
-            })
-            reply = result.get("reply", result.get("error", "抱歉，服务暂时不可用"))
-            st.session_state["advisory_chat"].append({"role": "assistant", "content": reply})
-        st.session_state["advisory_chat_loading"] = False
-        st.rerun()
-
-    # 空状态提示
     if not st.session_state["advisory_chat"]:
         st.info("👋 您好！我是您的智能投顾助手，由 M1 MiMo-V2.5-Pro 模型驱动，可以为您提供:\n\n"
                 "- 📊 **个股分析** — 输入股票代码或名称\n"
                 "- 📈 **市场热点** — 当前板块轮动与资金流向\n"
                 "- 💰 **持仓诊断** — 组合风险与收益评估\n"
                 "- 🎯 **策略建议** — 根据您的风险偏好推荐策略\n\n"
-                "请在下方输入框开始对话。")
+                "请在右侧聊天面板开始对话。")
 
 
 def _render_recommend():
@@ -798,42 +817,32 @@ def _render_report():
 
 
 # ──────────────────────────────────────────────
-# 右侧 AI 顾问面板
+# 中间 AI 聊天面板
 # ──────────────────────────────────────────────
 
-def _render_ai_panel(current_page_key: str):
-    """右侧常驻 AI 顾问面板 — 上下文感知 + 真实对话"""
+def _render_chat_panel():
+    """中间常驻 AI 聊天面板 — 多轮对话 + 上下文感知快捷提问"""
+    current_page_key = st.session_state["advisory_page"]
     page = PAGE_CONFIG.get(current_page_key, PAGE_CONFIG["ai_chat"])
 
-    st.markdown(
-        f'<div class="theme-card-l3" style="text-align:center;">'
-        f'<div style="font-size:1.5em;font-weight:800;color:#1e40af;">🤖 AI 顾问</div>'
-        f'<div style="font-size:0.85em;color:#64748b;margin-top:4px;">'
-        f'M1 MiMo-V2.5-Pro · 当前页面：{page["icon"]} {page["label"]}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    # 标题栏
+    col_title, col_new = st.columns([4, 1])
+    with col_title:
+        st.markdown(
+            f'<div style="text-align:center;padding:6px 0;">'
+            f'<span style="font-size:1.1em;font-weight:800;color:#1e40af;">🤖 AI 顾问</span>'
+            f'<span style="font-size:0.8em;color:#64748b;margin-left:8px;">'
+            f'{page["icon"]} {page["label"]}</span></div>',
+            unsafe_allow_html=True,
+        )
+    with col_new:
+        if st.button("🔄", key="btn_new_chat", help="开始新对话（当前对话自动保存到历史）"):
+            if st.session_state["advisory_chat"]:
+                pass  # 后端已自动保存
+            _clear_chat_for_new_session()
+            st.rerun()
 
-    # 上下文感知提示
-    context_hints = {
-        "ai_chat":    "我在关注您的对话，随时为您解答投资问题。",
-        "recommend":  "我看到您在查看股票推荐。我可以解释推荐逻辑或分析某只个股。",
-        "portfolio":  "您正在管理持仓组合。需要我分析持仓风险或建议调仓吗？",
-        "strategies": "您正在浏览策略市场。我可以比较不同策略或推荐适合您的策略。",
-        "backtest":   "您在使用回测功能。我可以帮您解读回测结果或优化参数。",
-        "report":     "您在准备收益报告。需要我建议报告内容或生成草稿吗？",
-    }
-    hint = context_hints.get(current_page_key, "随时为您提供投资建议。")
-
-    st.markdown(
-        f'<div class="theme-card" style="font-size:0.9em;color:#0f172a;">'
-        f'<div style="font-weight:600;margin-bottom:6px;">💡 当前建议</div>'
-        f'{hint}'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    # 快捷问询 — 调用真实 API
+    # 上下文感知快捷提问
     quick_questions = {
         "ai_chat":    ["今天市场热点板块有哪些？", "帮我分析一下大盘走势"],
         "recommend":  ["推荐逻辑是什么？", "这些股票适合什么风险偏好？"],
@@ -843,51 +852,152 @@ def _render_ai_panel(current_page_key: str):
         "report":     ["报告包含哪些内容？", "如何解读收益报告？"],
     }
     qqs = quick_questions.get(current_page_key, ["今天市场怎么样？", "有什么投资建议？"])
-
-    st.markdown(
-        f'<div style="font-size:0.85em;color:#64748b;margin-bottom:6px;">快捷提问</div>',
-        unsafe_allow_html=True,
-    )
-    for q in qqs:
-        if st.button(f"💬 {q}", key=f"qq_{q}", use_container_width=True):
-            st.session_state["advisory_chat"].append({"role": "user", "content": q})
-            page_ctx = json.dumps({
-                "page": PAGE_CONFIG[current_page_key]["label"],
-                "data": {},
-            }, ensure_ascii=False)
-            result = _api("/api/advisory/chat", "POST", {
-                "message": q,
-                "session_id": "default",
-                "page_context": page_ctx,
-            })
-            reply = result.get("reply", result.get("error", "抱歉，服务暂时不可用"))
-            st.session_state["advisory_chat"].append({"role": "assistant", "content": reply})
-            st.rerun()
+    qq_cols = st.columns(len(qqs))
+    for i, q in enumerate(qqs):
+        with qq_cols[i]:
+            if st.button(f"💬 {q}", key=f"qq_{current_page_key}_{i}", use_container_width=True):
+                st.session_state["advisory_chat"].append({"role": "user", "content": q})
+                st.session_state["_pending_quick_msg"] = q
+                st.rerun()
 
     st.divider()
 
-    # 右侧面板快捷输入 — 仅在非 ai_chat 页面显示
-    if current_page_key != "ai_chat":
-        quick_input = st.chat_input("向 AI 顾问提问...", key="advisory_right_input")
-        if quick_input and quick_input.strip():
-            st.session_state["advisory_chat"].append({"role": "user", "content": quick_input.strip()})
+    # 消息展示
+    chat_container = st.container(height=500)
+    with chat_container:
+        for msg in st.session_state["advisory_chat"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+    # 底部输入
+    prompt = st.chat_input("输入您的问题...", key="advisory_chat_main_input")
+    if prompt and prompt.strip():
+        st.session_state["advisory_chat"].append({"role": "user", "content": prompt.strip()})
+        st.session_state["_pending_quick_msg"] = prompt.strip()
+        st.rerun()
+
+    # 处理待发送的消息（来自输入框或快捷按钮）
+    pending = st.session_state.pop("_pending_quick_msg", None)
+    if pending:
+        with st.spinner("AI 顾问思考中..."):
             page_ctx = json.dumps({
                 "page": PAGE_CONFIG[current_page_key]["label"],
                 "data": {},
             }, ensure_ascii=False)
+            session_id = st.session_state.get("advisory_current_session_id") or "default"
             result = _api("/api/advisory/chat", "POST", {
-                "message": quick_input.strip(),
-                "session_id": "default",
+                "message": pending,
+                "session_id": session_id,
                 "page_context": page_ctx,
             })
             reply = result.get("reply", result.get("error", "抱歉，服务暂时不可用"))
+            # 更新 session_id（后端可能在 session_id="default" 时创建了新 session）
+            new_sid = result.get("session_id")
+            if new_sid and new_sid != "default":
+                st.session_state["advisory_current_session_id"] = new_sid
             st.session_state["advisory_chat"].append({"role": "assistant", "content": reply})
-            st.rerun()
+        st.rerun()
 
-        st.divider()
-        if st.button("💬 前往完整对话页", use_container_width=True):
-            st.session_state["advisory_page"] = "ai_chat"
+    # 空状态提示
+    if not st.session_state["advisory_chat"]:
+        st.caption("💡 点击上方快捷按钮或在输入框提问，开始与 AI 顾问对话")
+
+
+# ──────────────────────────────────────────────
+# 右侧历史会话侧栏
+# ──────────────────────────────────────────────
+
+def _render_history_sidebar():
+    """右侧可折叠历史会话侧栏"""
+    expanded = st.session_state.get("advisory_history_expanded", False)
+
+    if not expanded:
+        if st.button("📋 历史", key="btn_expand_history", use_container_width=True):
+            st.session_state["advisory_history_expanded"] = True
+            _refresh_session_list()
             st.rerun()
+        return
+
+    # 展开状态
+    col_toggle, col_title = st.columns([1, 4])
+    with col_toggle:
+        if st.button("◀", key="btn_collapse_history"):
+            st.session_state["advisory_history_expanded"] = False
+            st.rerun()
+    with col_title:
+        st.markdown("**📋 历史会话**")
+
+    if st.button("＋ 新对话", key="btn_sidebar_new", use_container_width=True):
+        if st.session_state["advisory_chat"]:
+            pass  # 后端已自动保存
+        _clear_chat_for_new_session()
+        st.rerun()
+
+    st.divider()
+
+    # 加载/刷新列表
+    _refresh_session_list()
+    sessions = st.session_state.get("advisory_session_list", [])
+
+    if not sessions:
+        st.caption("暂无历史会话")
+        return
+
+    current_sid = st.session_state.get("advisory_current_session_id")
+
+    for sess in sessions:
+        sid = sess["session_id"]
+        name = sess.get("name", "未命名")
+        msg_count = sess.get("message_count", 0)
+        is_current = (sid == current_sid)
+
+        border = "2px solid #2563eb" if is_current else "1px solid #e2e8f0"
+        bg = "#eff6ff" if is_current else "#ffffff"
+
+        st.markdown(
+            f'<div style="padding:6px 8px;border:{border};border-radius:6px;'
+            f'background:{bg};margin-bottom:4px;">'
+            f'<div style="font-weight:600;font-size:0.85em;overflow:hidden;'
+            f'text-overflow:ellipsis;white-space:nowrap;">{name}</div>'
+            f'<div style="font-size:0.75em;color:#64748b;">{msg_count}条消息</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        col_load, col_del = st.columns([3, 1])
+        with col_load:
+            btn_label = "📌 当前" if is_current else "💬 加载"
+            if st.button(btn_label, key=f"load_{sid}", use_container_width=True, disabled=is_current):
+                _load_session_into_chat(sid)
+                st.rerun()
+        with col_del:
+            if st.button("🗑", key=f"del_{sid}"):
+                st.session_state["advisory_delete_confirm"] = sid
+                st.rerun()
+
+
+@st.dialog("确认删除", width="small")
+def _delete_confirm_dialog(session_id: str):
+    """删除确认对话框"""
+    st.warning("确定要删除这个历史会话吗？此操作不可撤销。")
+
+    col_cancel, col_confirm = st.columns(2)
+    with col_cancel:
+        if st.button("取消", use_container_width=True):
+            st.session_state["advisory_delete_confirm"] = None
+            st.rerun()
+    with col_confirm:
+        if st.button("确认删除", type="primary", use_container_width=True):
+            result = _api(f"/api/advisory/sessions/{session_id}", "DELETE")
+            if "error" not in result:
+                # 如果删的是当前会话，清空聊天
+                if st.session_state.get("advisory_current_session_id") == session_id:
+                    _clear_chat_for_new_session()
+                st.session_state["advisory_delete_confirm"] = None
+                _refresh_session_list()
+                st.rerun()
+            else:
+                st.error(f"删除失败: {result['error']}")
 
 
 # ──────────────────────────────────────────────
@@ -923,8 +1033,20 @@ if not st.session_state["advisory_auto_catchup_done"]:
     if cu and "error" not in cu and cu.get("total_missed_days", 0) > 0:
         st.toast(cu.get('message', '已自动追赶'), icon="✅")
 
-# 两栏布局：左(3) + 右(2)
-left_col, right_col = st.columns([3, 2])
+# 检测 Tab 切换
+_handle_tab_switch()
+
+# 处理删除确认弹窗
+if st.session_state.get("advisory_delete_confirm"):
+    _delete_confirm_dialog(st.session_state["advisory_delete_confirm"])
+
+# 三栏布局：左(5) + 中(3) + 右(2 或 0)
+history_expanded = st.session_state.get("advisory_history_expanded", False)
+if history_expanded:
+    left_col, chat_col, history_col = st.columns([5, 3, 2])
+else:
+    left_col, chat_col = st.columns([5, 3])
+    history_col = None
 
 with left_col:
     {
@@ -936,5 +1058,12 @@ with left_col:
         "report": _render_report,
     }[st.session_state["advisory_page"]]()
 
-with right_col:
-    _render_ai_panel(st.session_state["advisory_page"])
+with chat_col:
+    _render_chat_panel()
+
+if history_col is not None:
+    with history_col:
+        _render_history_sidebar()
+else:
+    # 折叠状态下在聊天面板下方显示一个小按钮
+    pass

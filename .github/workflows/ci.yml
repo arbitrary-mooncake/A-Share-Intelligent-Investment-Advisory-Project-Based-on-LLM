@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        cd Finance
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio
+
+    - name: Create .env file
+      run: |
+        cd Finance/Financial-MCP-Agent
+        cp .env.example .env
+        # Tests will use mock data or skip API-dependent tests
+
+    - name: Run tests
+      run: |
+        cd Finance/Financial-MCP-Agent
+        python -m pytest tests/ -v --tb=short -x
+      env:
+        # Mock environment variables for CI
+        OPENAI_COMPATIBLE_API_KEY: test_key
+        OPENAI_COMPATIBLE_BASE_URL: http://localhost:8000
+        OPENAI_COMPATIBLE_MODEL: test-model
+        TUSHARE_TOKEN: test_token
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: 'pip'
+
+    - name: Install linting tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install ruff black
+
+    - name: Run Ruff linter
+      run: |
+        cd Finance/Financial-MCP-Agent/src
+        ruff check . --exit-zero --statistics
+      continue-on-error: true
+
+    - name: Check code formatting with Black
+      run: |
+        cd Finance/Financial-MCP-Agent/src
+        black --check . --line-length 100
+      continue-on-error: true
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install security scanning tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety
+
+    - name: Run Bandit security scan
+      run: |
+        cd Finance/Financial-MCP-Agent/src
+        bandit -r . -f json -o bandit-report.json || true
+      continue-on-error: true
+
+    - name: Check for hardcoded secrets
+      run: |
+        # Simple check for potential secrets
+        ! grep -r "sk-" Finance/Financial-MCP-Agent/src --include="*.py" || exit 1
+        ! grep -r "api_key\s*=\s*['\"][a-zA-Z0-9]" Finance/Financial-MCP-Agent/src --include="*.py" || exit 1
+      continue-on-error: true

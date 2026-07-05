@@ -33,8 +33,8 @@ class LLMFreeStrategy(BaseStrategy):
       4. 按期限（短/中/长）有不同仓位上限和风控参数
     """
 
-    def __init__(self, config=None):
-        super().__init__(config)
+    def __init__(self, config=None, term="short"):
+        super().__init__(config, term=term)
         # 获取 DeepSeek V4 Pro 模型配置（suffix=_6）
         self.model_config = get_eval_model_config("eval_llm_free")
 
@@ -49,8 +49,8 @@ class LLMFreeStrategy(BaseStrategy):
         # 每期限卖出评分阈值
         self.sell_hard_thresholds = {"short": 35, "medium": 45, "long": 35}
 
-        # 当前期限（由 select_stocks/generate_sell_orders 调用时推断）
-        self._active_term = "short"
+        # 当前期限（由line definition注入，不从持仓推断）
+        self._active_term = self._term
 
         # 构建 thinking 参数
         base_url = self.model_config["base_url"]
@@ -112,7 +112,7 @@ class LLMFreeStrategy(BaseStrategy):
         Returns:
             List[BuyOrder]: LLM 决策的买入订单
         """
-        self._active_term = self._infer_term(holdings)
+        self._active_term = self._term
 
         if not self.llm_client:
             logger.warning("LLMFreeStrategy: LLM client unavailable, returning empty orders")
@@ -163,7 +163,7 @@ class LLMFreeStrategy(BaseStrategy):
         Returns:
             List[SellOrder]: LLM 决策的卖出订单
         """
-        self._active_term = self._infer_term(holdings)
+        self._active_term = self._term
 
         if not self.llm_client:
             logger.warning("LLMFreeStrategy: LLM client unavailable, returning empty orders")

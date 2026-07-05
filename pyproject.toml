@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a-stock-advisor"
+version = "0.1.0"
+description = "A股智能投顾Agent助手 - 多智能体投研分析平台"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "See LICENSE file"}
+authors = [
+    {name = "arbitrary124"}
+]
+keywords = ["stock", "investment", "agent", "llm", "finance", "a-share"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "langgraph==1.1.10",
+    "python-dotenv==1.1.0",
+    "langchain-openai==1.2.1",
+    "langchain-core==1.3.2",
+    "baostock==0.9.1",
+    "akshare==1.18.60",
+    "langchain-mcp-adapters==0.2.2",
+    "streamlit==1.45.1",
+    "fastapi==0.136.1",
+    "uvicorn==0.46.0",
+    "httpx==0.28.1",
+    "backoff==2.2.1",
+    "openpyxl==3.1.5",
+    "fpdf2==2.8.7",
+    "duckduckgo-search==8.1.1",
+    "yfinance==1.4.1",
+    "matplotlib==3.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/arbitrary124/A-Stock-Advisor"
+Repository = "https://github.com/arbitrary124/A-Stock-Advisor"
+Issues = "https://github.com/arbitrary124/A-Stock-Advisor/issues"
+
+[tool.setuptools.packages.find]
+where = ["Finance/Financial-MCP-Agent"]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["Finance/Financial-MCP-Agent/tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

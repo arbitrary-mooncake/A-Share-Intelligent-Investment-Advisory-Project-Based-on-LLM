@@ -145,16 +145,51 @@ def _load_json_config(filename: str) -> Dict[str, Any]:
     return {}
 
 
+def _flatten_strategy_config(nested: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    将 strategy_defaults.json 的嵌套分组结构扁平化为 config.py 的 flat key 字典。
+
+    规则:
+      - 一级分组 (如 market_simulator, strategy_short_ablation) 内部的 leaf key
+        直接提升为顶级 key（与 DEFAULTS 命名一致）。
+      - 二级嵌套 (如 scorer_weights.short_term) 保留嵌套结构，
+        包装在顶级 key 下（如 scorer_weights -> {short_term: {...}, ...}）。
+    """
+    flat: Dict[str, Any] = {}
+    nested_top_keys = {"scorer_weights", "loss_weights", "risk_gate"}
+
+    for group_name, group_val in nested.items():
+        if not isinstance(group_val, dict):
+            continue
+        if group_name.startswith("_"):
+            continue
+        if group_name in nested_top_keys:
+            # 保留嵌套结构
+            flat[group_name] = group_val
+        else:
+            # 扁平化: 内部 key 直接提升为顶级
+            for key, val in group_val.items():
+                if not key.startswith("_"):
+                    flat[key] = val
+    return flat
+
+
 def get_config() -> Dict[str, Any]:
     """
     获取完整配置。
-    优先级: 环境变量 > config/eval/defaults.json > 代码默认值
+    优先级: 环境变量 > config/eval/strategy_defaults.json > config/eval/defaults.json > 代码默认值
     """
     config = dict(DEFAULTS)
 
-    # 加载JSON配置覆盖
+    # 加载JSON配置覆盖 (第一层: defaults.json)
     json_config = _load_json_config("defaults.json")
     config.update(json_config)
+
+    # 加载策略参数配置 (第二层: strategy_defaults.json, 扁平化)
+    strategy_config = _load_json_config("strategy_defaults.json")
+    if strategy_config:
+        flat_strategy = _flatten_strategy_config(strategy_config)
+        config.update(flat_strategy)
 
     # 环境变量覆盖（EVAL_前缀）
     for key in config:

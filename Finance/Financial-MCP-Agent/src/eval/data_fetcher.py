@@ -171,14 +171,39 @@ def build_market_data_map(stock_codes: List[str], trade_date: str = "") -> Dict[
     """
     构建评测系统所需的 MarketData 映射（用于日常调仓）。
 
+    增强版：除基础行情外，还填充 ROE、revenue_growth、profit_growth_3y、
+    price_to_ma_ratio 等字段，使中线/长线策略的买入/卖出条件检查能真正生效。
+
     Returns:
         {stock_code: MarketData}
     """
     from src.eval.market_simulator import MarketData
+    from src.utils.tushare_client import get_fina_indicator_batch
 
     if not trade_date:
         trade_date = datetime.now().strftime("%Y-%m-%d")
     ts_date = convert_date_to_ts(trade_date)
+
+    # ── 批量获取财务指标（ROE/增速等）──
+    ts_codes = [convert_code_to_ts(c) for c in stock_codes]
+    try:
+        fina_batch = get_fina_indicator_batch(ts_codes, years=3)
+    except Exception as e:
+        logger.warning("fina_indicator_batch failed: %s, using defaults", e)
+        fina_batch = {}
+
+    # ── 计算 MA60 所需的60日价格（批量获取） ──
+    ma60_start = (datetime.strptime(ts_date, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
+    ma60_prices: Dict[str, List[float]] = {}
+    for code in stock_codes:
+        ts_code = convert_code_to_ts(code)
+        try:
+            daily_60d = fetch_daily_prices(ts_code, ma60_start, ts_date)
+            if daily_60d:
+                closes = [d["close"] for d in daily_60d if d.get("close", 0) > 0]
+                ma60_prices[code] = closes
+        except Exception:
+            pass
 
     market_map = {}
     for code in stock_codes:
@@ -210,18 +235,31 @@ def build_market_data_map(stock_codes: List[str], trade_date: str = "") -> Dict[
         # 获取额外指标
         basic = fetch_daily_basic(ts_code, trade_date)
 
-        # 停牌判断：Tushare daily接口对停牌股通常不返回数据；
-        # 若返回但 volume=0 且 open=close=0 则视为停牌（Tushare停牌日占位行特征）
+        # 停牌判断
         is_suspended = (d.get("volume", 0) == 0 and close == 0 and d.get("open", 0) == 0)
 
-        # 沪深300成分股近似判断：无法在此处获取真实成分列表，
-        # 按"主板大盘股"启发式覆盖沪深两市典型大盘股代码段
-        # 注意：这是近似，真正判定应查 index_member (000300.SH)
+        # 沪深300成分股近似判断
         code_clean = code.replace("sh.", "").replace("sz.", "")
         is_hs300 = (
-            code_clean.startswith(("601318", "600519", "600036", "601398", "600028"))  # 沪市大盘
-            or code_clean.startswith(("000001", "000333", "000651", "000858", "002594"))  # 深市大盘
+            code_clean.startswith(("601318", "600519", "600036", "601398", "600028"))
+            or code_clean.startswith(("000001", "000333", "000651", "000858", "002594"))
         )
+
+        # ── 从批量财务数据提取 ROE / 增速 ──
+        fina = fina_batch.get(ts_code, {})
+        roe = _safe_float(fina.get("roe", 0))
+        revenue_growth = _safe_float(fina.get("or_yoy", 0))
+        profit_yoy = _safe_float(fina.get("profit_yoy", 0))
+        # profit_growth_3y: 用最近一期 profit_yoy 近似（批量接口只返回最新一期）
+        profit_growth_3y = profit_yoy
+
+        # ── 计算 price_to_ma_ratio (close / MA60) ──
+        price_to_ma = 1.0
+        closes_60d = ma60_prices.get(code, [])
+        if len(closes_60d) >= 20 and close > 0:
+            ma60 = sum(closes_60d[-min(60, len(closes_60d)):]) / len(closes_60d[-min(60, len(closes_60d)):])
+            if ma60 > 0:
+                price_to_ma = round(close / ma60, 4)
 
         market_map[code] = MarketData(
             stock_code=code,
@@ -240,8 +278,11 @@ def build_market_data_map(stock_codes: List[str], trade_date: str = "") -> Dict[
             market_cap=basic.get("total_mv", 0),
             pe_ratio=basic.get("pe", 0),
             pb_ratio=basic.get("pb", 0),
-            price_to_ma_ratio=1.0,  # Will be populated by technical analysis when available
-            risk_flags=None,  # Will be populated by risk analysis when available
+            price_to_ma_ratio=price_to_ma,
+            roe=roe,
+            revenue_growth=revenue_growth,
+            profit_growth_3y=profit_growth_3y,
+            risk_flags=None,
         )
 
     return market_map

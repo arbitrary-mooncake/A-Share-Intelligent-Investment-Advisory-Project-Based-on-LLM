@@ -2,9 +2,12 @@
 精筛池管理器 — 管理短/中/长线三个精筛股票池的创建、更新、查询。
 """
 import json
+import logging
 import os
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 POOL_DIR = os.path.join(
@@ -19,6 +22,12 @@ DEFAULT_POOL_CONFIG = {
     "long": {"target_size": 60, "max_size": 66, "min_size": 54},
 }
 
+DEFAULT_BLACKLIST_TTL = {
+    "short": 14,
+    "medium": 60,
+    "long": 365,
+}
+
 
 class PoolManager:
     """精筛池管理器"""
@@ -30,16 +39,51 @@ class PoolManager:
     def _load(self) -> Dict[str, Any]:
         if os.path.exists(POOL_FILE):
             try:
-                with open(POOL_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                with open(POOL_FILE, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                self._migrate_blacklist(data)
+                return data
+            except Exception as e:
+                logger.error("[PoolManager] Failed to load %s: %s", POOL_FILE, e)
         return {
             "short": {"stocks": [], "updated_at": "", "version": 0},
             "medium": {"stocks": [], "updated_at": "", "version": 0},
             "long": {"stocks": [], "updated_at": "", "version": 0},
-            "blacklist": [],
+            "blacklist": {"short": [], "medium": [], "long": []},
+            "pool_health_history": {"short": [], "medium": [], "long": []},
         }
+
+    def _migrate_blacklist(self, data: Dict[str, Any]):
+        """Migrate blacklist from old flat-list format to per-term dict.
+
+        Old: "blacklist": [{code, reason, ...}, ...]
+        New: "blacklist": {"short": [...], "medium": [...], "long": [...]}
+        """
+        bl = data.get("blacklist")
+        if isinstance(bl, list):
+            import shutil
+            backup_path = POOL_FILE + f".bl_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            try:
+                shutil.copy2(POOL_FILE, backup_path)
+            except Exception:
+                pass
+            new_bl = {"short": [], "medium": [], "long": []}
+            for entry in bl:
+                term = entry.get("term", "long")
+                if term not in new_bl:
+                    term = "long"
+                entry.setdefault("term", term)
+                new_bl[term].append(entry)
+            data["blacklist"] = new_bl
+            logger.info("[PoolManager] Blacklist migrated from flat list to per-term "
+                       "(short=%d, medium=%d, long=%d), backup: %s",
+                       len(new_bl["short"]), len(new_bl["medium"]),
+                       len(new_bl["long"]), backup_path)
+        elif isinstance(bl, dict):
+            for term in ("short", "medium", "long"):
+                bl.setdefault(term, [])
+        else:
+            data["blacklist"] = {"short": [], "medium": [], "long": []}
 
     def _save(self):
         self.pools["updated_at"] = datetime.now().isoformat()
@@ -66,10 +110,67 @@ class PoolManager:
         }
         self._save()
 
+    def save_reserve(self, term: str, candidates: List[Dict[str, Any]]):
+        """保存候补名单到 refined_pools.json
+
+        Args:
+            term: short/medium/long
+            candidates: [{code, name, final_score, recommendation}, ...]
+        """
+        pool_data = self.pools.get(term, {})
+        pool_data["reserve"] = candidates
+        pool_data["reserve_updated_at"] = datetime.now().isoformat()
+        self._save()
+        logger.info("[PoolManager] %s 候补名单已保存: %d只", term, len(candidates))
+
+    def get_reserve(self, term: str) -> List[Dict[str, Any]]:
+        """获取候补名单"""
+        pool_data = self.pools.get(term, {})
+        return pool_data.get("reserve", [])
+
+    def update_pool_partial(self, term: str, new_stocks: List[Dict[str, Any]],
+                            removed_codes: List[str]) -> Dict[str, Any]:
+        """部分更新: 替换底部股票为新股票
+
+        Args:
+            term: short/medium/long
+            new_stocks: 新入池的股票列表 (已按 final_score 排序)
+            removed_codes: 被替换掉的股票代码列表
+
+        Returns:
+            {kept: int, added: int, removed: int, new_pool_size: int}
+        """
+        pool_data = self.pools.get(term, {})
+        stocks = pool_data.get("stocks", [])
+
+        # 保留非移除股票
+        kept_stocks = [s for s in stocks if s.get("code", "") not in set(removed_codes)]
+
+        # 合并保留 + 新增
+        merged = kept_stocks + new_stocks
+
+        # 按 final_score 降序排序
+        merged.sort(key=lambda s: s.get("final_score", 0), reverse=True)
+
+        # 更新池
+        self.pools[term] = {
+            "stocks": merged,
+            "updated_at": datetime.now().isoformat(),
+            "version": pool_data.get("version", 0) + 1,
+        }
+        self._save()
+
+        return {
+            "kept": len(kept_stocks),
+            "added": len(new_stocks),
+            "removed": len(removed_codes),
+            "new_pool_size": len(merged),
+        }
+
     def get_pool_summary(self, term: str) -> Dict[str, Any]:
         pool = self.pools.get(term, {})
         stocks = pool.get("stocks", [])
-        scores = [s.get("score", 0) if isinstance(s, dict) else 50 for s in stocks]
+        scores = [s.get("final_score", s.get("score", 0)) if isinstance(s, dict) else 50 for s in stocks]
         return {
             "term": term,
             "size": len(stocks),
@@ -82,53 +183,101 @@ class PoolManager:
     def get_all_summaries(self) -> Dict[str, Any]:
         return {term: self.get_pool_summary(term) for term in ["short", "medium", "long"]}
 
-    def add_to_blacklist(self, stock_code: str, reason: str = "", expiry_days: int = 120):
-        """添加到黑名单"""
-        self.pools.setdefault("blacklist", [])
-        self.pools["blacklist"].append({
+    def add_to_blacklist(self, stock_code: str, term: str = "long",
+                         reason: str = "", expiry_days: int = None):
+        """添加到黑名单 (按期限隔离)
+
+        Args:
+            stock_code: 股票代码
+            term: short/medium/long
+            reason: 加入原因
+            expiry_days: 过期天数, None 时使用 DEFAULT_BLACKLIST_TTL[term]
+        """
+        if expiry_days is None:
+            expiry_days = DEFAULT_BLACKLIST_TTL.get(term, 365)
+        bl = self.pools.get("blacklist", {})
+        if isinstance(bl, list):
+            bl = {"short": [], "medium": [], "long": []}
+            self.pools["blacklist"] = bl
+        bl.setdefault(term, [])
+        bl[term].append({
             "code": stock_code,
+            "term": term,
             "reason": reason,
             "added_at": datetime.now().isoformat(),
             "expires_at": (datetime.now() + timedelta(days=expiry_days)).isoformat(),
         })
         self._save()
 
-    def is_blacklisted(self, stock_code: str) -> bool:
-        """检查股票是否在黑名单中（自动过滤过期条目）"""
+    def is_blacklisted(self, stock_code: str, term: str = None) -> bool:
+        """检查股票是否在黑名单中（自动过滤过期条目）
+
+        Args:
+            stock_code: 股票代码
+            term: 仅查对应 term 的黑名单; None 时查所有 term
+        """
         now = datetime.now()
-        active = []
-        for entry in self.pools.get("blacklist", []):
+        bl = self.pools.get("blacklist", {})
+        if isinstance(bl, list):
+            terms_to_check = [None]
+            entries_iter = bl
+        else:
+            terms_to_check = [term] if term else ["short", "medium", "long"]
+            entries_iter = []
+            for t in terms_to_check:
+                entries_iter.extend(bl.get(t, []))
+        for entry in entries_iter:
             if entry.get("code") == stock_code:
                 expires_str = entry.get("expires_at", "")
                 if expires_str:
                     try:
                         expires_at = datetime.fromisoformat(expires_str)
                         if now > expires_at:
-                            continue  # 已过期，视为不在黑名单
+                            continue
                     except (ValueError, TypeError):
                         pass
                 return True
         return False
 
     def clean_expired_blacklist(self):
-        """清理过期的黑名单条目"""
+        """清理过期的黑名单条目 (按 term 分别清理)"""
         now = datetime.now()
-        blacklist = self.pools.get("blacklist", [])
-        cleaned = []
+        bl = self.pools.get("blacklist", {})
         removed = 0
-        for entry in blacklist:
-            expires_str = entry.get("expires_at", "")
-            if expires_str:
-                try:
-                    if now > datetime.fromisoformat(expires_str):
-                        removed += 1
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            cleaned.append(entry)
-        if removed > 0:
-            self.pools["blacklist"] = cleaned
-            self._save()
+
+        if isinstance(bl, list):
+            cleaned = []
+            for entry in bl:
+                expires_str = entry.get("expires_at", "")
+                if expires_str:
+                    try:
+                        if now > datetime.fromisoformat(expires_str):
+                            removed += 1
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                cleaned.append(entry)
+            if removed > 0:
+                self.pools["blacklist"] = cleaned
+                self._save()
+        else:
+            for term in ("short", "medium", "long"):
+                entries = bl.get(term, [])
+                cleaned = []
+                for entry in entries:
+                    expires_str = entry.get("expires_at", "")
+                    if expires_str:
+                        try:
+                            if now > datetime.fromisoformat(expires_str):
+                                removed += 1
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    cleaned.append(entry)
+                bl[term] = cleaned
+            if removed > 0:
+                self.pools["blacklist"] = bl
+                self._save()
 
     def needs_update(self, term: str) -> Dict[str, Any]:
         """检查精筛池是否需要更新"""
@@ -158,6 +307,244 @@ class PoolManager:
             "current_size": summary["size"],
             "target_size": config["target_size"],
         }
+
+    def record_pool_health_snapshot(self, date: str, term: str,
+                                     low_score_pct: float,
+                                     not_held_pct: float):
+        """
+        记录池健康快照，用于连续交易日检查（总纲 §4.2）。
+
+        每个期限保留最近30个交易日的快照历史。
+
+        Args:
+            date: 交易日 YYYY-MM-DD
+            term: short/medium/long
+            low_score_pct: 评分<50的股票占比（%）
+            not_held_pct: 未被任何线路持有的股票占比（%）
+        """
+        history = self.pools.setdefault("pool_health_history", {})
+        term_history = history.setdefault(term, [])
+        # 避免同日重复记录（覆盖更新）
+        if term_history and term_history[-1].get("date") == date:
+            term_history[-1] = {
+                "date": date, "low_score_pct": round(low_score_pct, 1),
+                "not_held_pct": round(not_held_pct, 1),
+            }
+        else:
+            term_history.append({
+                "date": date, "low_score_pct": round(low_score_pct, 1),
+                "not_held_pct": round(not_held_pct, 1),
+            })
+        # 保留最近30天
+        if len(term_history) > 30:
+            history[term] = term_history[-30:]
+        self._save()
+
+    @staticmethod
+    def _count_consecutive_days_above(history: List[Dict], field: str,
+                                       threshold: float) -> int:
+        """
+        从最新日期往回数，统计连续满足 field > threshold 的天数。
+
+        历史按日期降序扫描，直到遇到不满足条件的那天为止。
+
+        Args:
+            history: 按日期降序排列的健康快照列表
+            field: 检查的字段名（low_score_pct / not_held_pct）
+            threshold: 阈值
+
+        Returns:
+            连续满足条件的天数（>=0）
+        """
+        if not history:
+            return 0
+        # 按日期降序排列
+        sorted_hist = sorted(history, key=lambda x: x.get("date", ""), reverse=True)
+        count = 0
+        for entry in sorted_hist:
+            if entry.get(field, 0) > threshold:
+                count += 1
+            else:
+                break
+        return count
+
+    def check_blacklist_fundamental_improvements(self) -> List[Dict[str, Any]]:
+        """
+        检查黑名单中的股票是否有基本面显著改善，值得提前解除黑名单。
+
+        对每个未过期的黑名单股票，查询最新财务数据，检查3项指标：
+          1. PE回到行业正常范围（pe_cheap_threshold <= PE <= pe_expensive_threshold）
+          2. ROE转正（>0）
+          3. 营收增速转正（or_yoy > 0）
+
+        3项全部满足 → 标记为"建议提前解除黑名单"。
+
+        Returns:
+            [{code, term, reason（入黑原因）, improvements: [描述, ...]}, ...]
+            按改善项数量降序排列
+        """
+        now = datetime.now()
+        bl = self.pools.get("blacklist", {})
+
+        # 收集所有未过期的黑名单条目
+        active_entries = []
+        if isinstance(bl, dict):
+            for t, entries in bl.items():
+                for entry in entries:
+                    expires_str = entry.get("expires_at", "")
+                    if expires_str:
+                        try:
+                            if now > datetime.fromisoformat(expires_str):
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    active_entries.append(entry)
+        elif isinstance(bl, list):
+            for entry in bl:
+                expires_str = entry.get("expires_at", "")
+                if expires_str:
+                    try:
+                        if now > datetime.fromisoformat(expires_str):
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                active_entries.append(entry)
+
+        if not active_entries:
+            return []
+
+        # 去重
+        seen_codes = set()
+        unique_entries = []
+        for entry in active_entries:
+            code = entry.get("code", "")
+            if code not in seen_codes:
+                seen_codes.add(code)
+                unique_entries.append(entry)
+
+        candidates = []
+
+        for entry in unique_entries:
+            code = entry.get("code", "")
+            if not code:
+                continue
+
+            # 代码转换为Tushare格式
+            if code.startswith("sh."):
+                ts_code = code[3:] + ".SH"
+            elif code.startswith("sz."):
+                ts_code = code[3:] + ".SZ"
+            else:
+                ts_code = code
+
+            try:
+                from src.utils.tushare_client import _call as tushare_call
+                from src.utils.industry_knowledge import get_industry_info
+                from src.utils.tushare_client import get_stock_info
+
+                improvements = []
+
+                # ── 指标1: PE检查（daily_basic） ──
+                from src.eval.data_fetcher import fetch_latest_trading_day
+                trade_date = fetch_latest_trading_day().replace("-", "")
+                pe_basic = tushare_call("daily_basic", {
+                    "ts_code": ts_code,
+                    "trade_date": trade_date,
+                }, fields="pe_ttm")
+                pe = None
+                if pe_basic and pe_basic.get("items"):
+                    field_names = pe_basic["fields"]
+                    row = dict(zip(field_names, pe_basic["items"][0]))
+                    pe_val = row.get("pe_ttm")
+                    if pe_val is not None:
+                        pe = float(pe_val)
+
+                # ── 指标2 & 3: ROE和营收增速（fina_indicator） ──
+                fina = tushare_call("fina_indicator", {
+                    "ts_code": ts_code,
+                    "start_date": f"{now.year - 1}0101",
+                    "end_date": now.strftime("%Y1231"),
+                }, fields="roe,or_yoy,end_date")
+                roe = None
+                rev_growth = None
+                if fina and fina.get("items"):
+                    field_names = fina["fields"]
+                    # 取最新一期（end_date最大）
+                    latest = None
+                    for row_data in fina["items"]:
+                        row = dict(zip(field_names, row_data))
+                        if latest is None or row.get("end_date", "") > latest.get("end_date", ""):
+                            latest = row
+                    if latest:
+                        roe_val = latest.get("roe")
+                        if roe_val is not None:
+                            roe = float(roe_val)
+                        rg_val = latest.get("or_yoy")
+                        if rg_val is not None:
+                            rev_growth = float(rg_val)
+
+                # ── 获取行业基准 ──
+                stock_info = None
+                try:
+                    stock_info = get_stock_info(ts_code)
+                except Exception:
+                    pass
+                industry = stock_info.get("industry", "") if stock_info else ""
+                benchmark = get_industry_info(industry) if industry else None
+
+                # ── 检查3项条件 ──
+                if pe is not None and benchmark:
+                    pe_cheap = benchmark.get("pe_cheap_threshold", 0)
+                    pe_expensive = benchmark.get("pe_expensive_threshold", float("inf"))
+                    if pe_cheap <= pe <= pe_expensive:
+                        improvements.append(
+                            f"PE={pe:.1f}回到行业合理区间({pe_cheap}-{pe_expensive})"
+                        )
+                elif pe is not None:
+                    # 无行业信息时，PE>0且<200视为基本合理
+                    if 0 < pe < 200:
+                        improvements.append(f"PE={pe:.1f}在基本合理范围")
+
+                if roe is not None and roe > 0:
+                    improvements.append(f"ROE转正={roe:.1f}%")
+
+                if rev_growth is not None and rev_growth > 0:
+                    improvements.append(f"营收增速转正={rev_growth:.1f}%")
+
+                if len(improvements) >= 3:
+                    candidates.append({
+                        "code": code,
+                        "term": entry.get("term", ""),
+                        "reason": entry.get("reason", "未知原因"),
+                        "improvements": improvements,
+                        "added_at": entry.get("added_at", ""),
+                        "expires_at": entry.get("expires_at", ""),
+                    })
+
+            except Exception as e:
+                logger.warning(
+                    "[PoolManager] 检查黑名单基本面改善失败 %s: %s", code, e
+                )
+                continue
+
+        # 按改善项数量降序
+        candidates.sort(key=lambda x: len(x["improvements"]), reverse=True)
+        return candidates
+
+    def suggest_blacklist_removal(self, term: str = None) -> List[Dict[str, Any]]:
+        """
+        获取建议提前解除黑名单的股票列表。
+
+        Args:
+            term: 限定期限；None 返回所有期限
+
+        Returns:
+            [{code, term, reason, improvements, ...}, ...]
+        """
+        candidates = self.check_blacklist_fundamental_improvements()
+        if term:
+            candidates = [c for c in candidates if c.get("term") == term]
+        return candidates
 
     def get_pool_health(self,
                         lines_status: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -238,7 +625,7 @@ class PoolManager:
             # ── 指标计算 ──
             low_score_count = sum(
                 1 for s in stocks_with_scores
-                if (isinstance(s, dict) and s.get("score", 50) < 50)
+                if (isinstance(s, dict) and s.get("final_score", s.get("score", 50)) < 50)
             )
             low_score_pct = (low_score_count / max(pool_size, 1)) * 100
 
@@ -253,10 +640,18 @@ class PoolManager:
                 not_held = [c for c in pool_codes if c not in held_stocks_set]
                 not_held_pct = len(not_held) / max(len(pool_codes), 1) * 100
 
-            # 黑名单检查
+            # 黑名单检查 (查所有 term, 捕捉跨期限污染)
             active_blacklist_codes: set = set()
             now = datetime.now()
-            for entry in self.pools.get("blacklist", []):
+            bl = self.pools.get("blacklist", {})
+            all_bl_entries = []
+            if isinstance(bl, dict):
+                for t in ("short", "medium", "long"):
+                    all_bl_entries.extend(bl.get(t, []))
+            else:
+                all_bl_entries = bl
+            term_entries = all_bl_entries
+            for entry in term_entries:
                 expires_str = entry.get("expires_at", "")
                 if expires_str:
                     try:
@@ -271,12 +666,34 @@ class PoolManager:
             triggers = []
             status = "green"
 
+            # ── 读取健康历史用于连续交易日检查 ──
+            health_history = self.pools.get("pool_health_history", {}).get(term, [])
+
             if low_score_pct > 30:
-                triggers.append(
-                    f"池内{low_score_pct:.0f}%的股票连续5日评分<50，"
-                    f"建议部分更新（替换评分垫底的20%股票）"
+                # 总纲 §4.2 RED条件1: >30%评分<50 连续5个交易日
+                consecutive_low = self._count_consecutive_days_above(
+                    health_history, "low_score_pct", 30
                 )
-                status = "red"
+                if consecutive_low >= 5:
+                    triggers.append(
+                        f"池内{low_score_pct:.0f}%的股票连续{consecutive_low}日评分<50，"
+                        f"建议部分更新（替换评分垫底的20%股票）"
+                    )
+                    status = "red"
+                elif consecutive_low > 0:
+                    triggers.append(
+                        f"池内{low_score_pct:.0f}%的股票评分<50"
+                        f"（连续{consecutive_low}/5天，尚未触发RED）"
+                    )
+                    if status != "red":
+                        status = "yellow"
+                else:
+                    triggers.append(
+                        f"池内{low_score_pct:.0f}%的股票评分<50"
+                        f"（快照首次触发，需连续5个交易日确认）"
+                    )
+                    if status != "red":
+                        status = "yellow"
 
             if llm_free_exceeds.get(term, False):
                 triggers.append("LLM自主线累计收益超过所有Agent线，系统评分策略需审查")
@@ -284,7 +701,7 @@ class PoolManager:
 
             if blacklist_in_pool:
                 blacklist_descs = []
-                for entry in self.pools.get("blacklist", []):
+                for entry in term_entries:
                     if entry.get("code", "") in blacklist_in_pool:
                         blacklist_descs.append(
                             f"{entry.get('code', '?')}"
@@ -294,6 +711,25 @@ class PoolManager:
                     f"黑名单股票仍在精筛池内: {', '.join(blacklist_descs[:3])}"
                 )
                 status = "red"
+
+                # ── 检查黑名单股是否有基本面改善（Gap #3）──
+                try:
+                    improved = self.suggest_blacklist_removal(term)
+                    pool_improved = [
+                        c for c in improved
+                        if c.get("code", "") in blacklist_in_pool
+                    ]
+                    if pool_improved:
+                        for c in pool_improved[:3]:
+                            triggers.append(
+                                f"黑名单股{c['code']}基本面已改善"
+                                f"（{'; '.join(c['improvements'][:2])}），"
+                                f"建议提前解除黑名单"
+                            )
+                except Exception as e:
+                    logger.warning(
+                        "[PoolManager] 黑名单改善检查失败: %s", e
+                    )
 
             # ── 欠填充检测（当前池容量显著低于目标） ──
             min_size = DEFAULT_POOL_CONFIG[term]["min_size"]
@@ -309,9 +745,25 @@ class PoolManager:
                     status = "yellow"
 
                 if not_held_pct > 20:
-                    triggers.append(
-                        f"池内{not_held_pct:.0f}%的股票未被任何线路持有（连续10日）"
+                    # 总纲 §4.2 YELLOW条件4: >20%未被持有 连续10个交易日
+                    consecutive_not_held = self._count_consecutive_days_above(
+                        health_history, "not_held_pct", 20
                     )
+                    if consecutive_not_held >= 10:
+                        triggers.append(
+                            f"池内{not_held_pct:.0f}%的股票未被任何线路持有"
+                            f"（连续{consecutive_not_held}日）"
+                        )
+                    elif consecutive_not_held > 0:
+                        triggers.append(
+                            f"池内{not_held_pct:.0f}%的股票未被任何线路持有"
+                            f"（连续{consecutive_not_held}/10天，进度中）"
+                        )
+                    else:
+                        triggers.append(
+                            f"池内{not_held_pct:.0f}%的股票未被任何线路持有"
+                            f"（快照首次触发，需连续10个交易日确认）"
+                        )
                     status = "yellow"
 
                 if days_since_update >= max_days:

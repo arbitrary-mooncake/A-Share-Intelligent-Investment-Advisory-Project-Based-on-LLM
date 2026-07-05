@@ -439,6 +439,7 @@ class EvalOrchestrator:
                 day_result["status"] = "failed"
                 day_result["error"] = str(e)[:200]
                 results["failed"] += 1
+                self.current_batch_id = prev_batch_id
                 try:
                     self.finish_batch(success=False, error=str(e)[:200])
                 except Exception:
@@ -586,21 +587,30 @@ class EvalOrchestrator:
         pool_data = self.pool_manager.get_pool_with_scores(term)
         for s in pool_data:
             code = s.get("code", "") if isinstance(s, dict) else s
-            score = s.get("score", 50) if isinstance(s, dict) else 50
+            score = s.get("final_score", s.get("score", 50)) if isinstance(s, dict) else 50
             pool_scores_for_tier[code] = score
 
         # 计算每个股票的分析频率等级
         tiers = EvalOrchestrator._get_scoring_frequency_tier(
             pool_scores_for_tier, all_holdings, term
         )
-        # 基于当天日期确定哪些等级需要分析
+        # 基于当天日期确定哪些等级需要分析（含动态频率调整 — Gap #19/#20）
         day_of_year = datetime.strptime(current_date, "%Y-%m-%d").timetuple().tm_yday
-        stocks_to_analyze = [
-            code for code in pool
-            if EvalOrchestrator._should_analyze_today(
-                tiers.get(code, "daily"), day_of_year, is_monday
+        stocks_to_analyze = []
+        for code in pool:
+            static_tier = tiers.get(code, "daily")
+            # Gap #19: 动态频率调整
+            effective_tier, reason = EvalOrchestrator._check_dynamic_frequency_triggers(
+                code, static_tier, current_date, term, all_holdings,
+                market_data_map
             )
-        ]
+            if reason:
+                logger.info("评分频率调整: %s %s → %s, 原因: %s",
+                            code, static_tier, effective_tier, reason)
+            if EvalOrchestrator._should_analyze_today(
+                effective_tier, day_of_year, is_monday
+            ):
+                stocks_to_analyze.append(code)
         # 持仓股始终分析（不受分级限制）
         for code in all_holdings:
             if code in pool and code not in stocks_to_analyze:
@@ -614,6 +624,9 @@ class EvalOrchestrator:
         elif is_monday:
             logger.info("Monday full run: pool-wide analysis for %s (%d stocks)",
                         term, len(pool))
+
+        # 控制评分记录仅首条线执行（避免同一term多线重复写入）
+        scores_recorded = False
 
         for line in lines:
             # 每条线使用独立的MarketSimulator实例（T+1隔离）
@@ -636,11 +649,33 @@ class EvalOrchestrator:
                     if code not in scores:
                         scores[code] = pool_scores_for_tier.get(code, 50.0)
 
+                # Gap #19: 记录每只股票的评分到 memory_manager（仅首次）
+                if not scores_recorded:
+                    try:
+                        from src.eval.memory_manager import MemoryManager
+                        mm = MemoryManager()
+                        for code in stocks_to_analyze:
+                            if code in scores:
+                                mm.record_stock_score(
+                                    code, scores[code], current_date, term
+                                )
+                    except Exception:
+                        pass
+                    scores_recorded = True
+
                 # 策略选股
-                buy_orders = strategy.select_stocks(
-                    pool, scores, line.holdings, line.cash,
-                    {code: market_data_map.get(code) for code in pool}
-                )
+                select_kwargs = {
+                    "pool": pool,
+                    "scores": scores,
+                    "holdings": line.holdings,
+                    "cash": line.cash,
+                    "market_data_map": {code: market_data_map.get(code) for code in pool},
+                }
+                # 中线策略需要 current_date 用于越跌越买基本面检查
+                from src.eval.strategies.medium_term import MediumTermStrategy
+                if isinstance(strategy, MediumTermStrategy):
+                    select_kwargs["current_date"] = current_date
+                buy_orders = strategy.select_stocks(**select_kwargs)
 
                 # 策略卖出
                 sell_orders = strategy.generate_sell_orders(
@@ -779,14 +814,33 @@ class EvalOrchestrator:
                     else:
                         all_fresh = False
 
-                # ── Step 2: 缓存全命中 → 跳过管线 ──
+                # ── Step 2: 缓存全命中 → 直接用缓存运行 + 运行scorer ──
                 if all_fresh and cached_signal_packs:
-                    logger.debug("All %d agent caches hit for %s @ %s, skipping pipeline",
+                    logger.debug("All %d agent caches hit for %s @ %s, running scorers from cache",
                                 len(cached_signal_packs), code, as_of_date)
-                    # 从独立缓存组装结果
-                    result = self._assemble_from_agent_caches(
+                    # 从独立缓存组装结果 + 运行scorer
+                    result = await self._assemble_from_agent_caches(
                         code, as_of_date, cached_signal_packs, term
                     )
+                    # 如果scorer失败，回退到完整管线
+                    if result.get("_scorer_failed"):
+                        logger.warning(
+                            "Scorer from cache failed for %s, falling back to pipeline",
+                            code, as_of_date
+                        )
+                        result = await run_stock_analysis(code, "", as_of_date, eval_mode=True)
+                        if not result.get("error"):
+                            signal_packs = result.get("signal_packs", {})
+                            analysis_texts = result.get("analysis_texts", {})
+                            for agent_name, _ in _ALL_AGENTS:
+                                sp = signal_packs.get(agent_name)
+                                if sp and isinstance(sp, dict):
+                                    write_signal_pack_cache(
+                                        agent_name, code, as_of_date, sp
+                                    )
+                                txt = analysis_texts.get(agent_name, "")
+                                if txt:
+                                    write_cache(agent_name, code, as_of_date, txt)
                 else:
                     # ── Step 3: 有缓存未命中 → 运行完整管线 ──
                     stale_agents = [
@@ -850,28 +904,210 @@ class EvalOrchestrator:
 
         return scores
 
-    @staticmethod
-    def _assemble_from_agent_caches(stock_code: str, as_of_date: str,
-                                     signal_packs: dict, term: str) -> dict:
+    async def _assemble_from_agent_caches(
+        self, stock_code: str, as_of_date: str,
+        signal_packs: dict, term: str
+    ) -> dict:
         """
-        从独立agent缓存组装结果。
+        从独立agent缓存组装结果 — 直接运行scorer获取真实评分。
 
-        当所有7个agent的signal_pack都在各自TTL内时调用。
-        注意：scorer结果不缓存（依赖完整signal_pack组合），
-        因此返回占位评分，调用方应运行管线获取真实评分。
-        此方法主要用于：
-          1. 提供缓存的signal_packs给管线复用
-          2. 统计缓存命中率
-          3. 未来支持跳过管线（当scorer缓存也命中时）
+        当所有7个agent的signal_pack都在各自TTL内时调用：
+          1. 先检查scorer缓存（1天TTL），命中则直接返回
+          2. scorer缓存未命中 → 用缓存的signal_pack+analysis_text直接调用scorer
+          3. scorer结果写入eval缓存，下次可直接命中
+
+        这避免了返回硬编码50.0导致策略选股退化为随机的问题。
         """
-        return {
+        from src.eval.cache import read_cache, write_cache
+        from src.utils.analysis_package_builder import build_analysis_package
+        from src.utils.risk_gate import apply_risk_gate
+
+        # ── Step A: 检查scorer缓存（1天TTL） ──
+        scorer_keys = ["short_term_scorer", "medium_term_scorer", "long_term_scorer"]
+        cached_scores = {}
+        all_scorer_cached = True
+
+        for scorer_name in scorer_keys:
+            scorer_result_str = read_cache(scorer_name, stock_code, as_of_date)
+            if scorer_result_str:
+                try:
+                    cached_scores[scorer_name] = json.loads(scorer_result_str)
+                except (json.JSONDecodeError, TypeError):
+                    all_scorer_cached = False
+                    break
+            else:
+                all_scorer_cached = False
+                break
+
+        if all_scorer_cached and len(cached_scores) == 3:
+            logger.debug("All scorer caches hit for %s @ %s, using cached scores",
+                        stock_code, as_of_date)
+            result = {
+                "stock_code": stock_code,
+                "as_of_date": as_of_date,
+                "signal_packs": signal_packs,
+                "analysis_texts": {},
+                "short_term_score": cached_scores["short_term_scorer"],
+                "medium_term_score": cached_scores["medium_term_scorer"],
+                "long_term_score": cached_scores["long_term_scorer"],
+                "_from_agent_cache": True,
+                "_scorer_cache_hit": True,
+            }
+            # Apply risk gate on cached scores
+            state_data = {f"{a}_signal_pack": sp for a, sp in signal_packs.items()}
+            state_data["current_date"] = as_of_date
+            try:
+                pkg = build_analysis_package(state_data, as_of_date)
+                for term_label, scorer_name in [
+                    ("short", "short_term_scorer"),
+                    ("medium", "medium_term_scorer"),
+                    ("long", "long_term_scorer"),
+                ]:
+                    score_val = cached_scores[scorer_name].get("score", 50)
+                    gate = apply_risk_gate(pkg, term_label, score_val)
+                    if gate.score_cap is not None:
+                        cached_scores[scorer_name]["score"] = min(score_val, gate.score_cap)
+                        result[f"{term_label}_term_score"] = cached_scores[scorer_name]
+            except Exception as e:
+                logger.warning("Risk gate on cached scores failed for %s: %s", stock_code, e)
+            return result
+
+        # ── Step B: scorer缓存未命中 → 恢复analysis texts, 直接调用scorer ──
+        logger.info("Scorer cache miss for %s @ %s, calling scorers directly from agent caches",
+                    stock_code, as_of_date)
+
+        _AGENTS = ["fundamental", "value", "quality_risk",
+                   "technical", "news", "event", "moneyflow"]
+
+        analysis_texts = {}
+        for agent_name in _AGENTS:
+            txt = read_cache(agent_name, stock_code, as_of_date)
+            if txt:
+                analysis_texts[agent_name] = txt
+
+        # 构建state_data（scorer所需格式）
+        state_data = {
             "stock_code": stock_code,
-            "as_of_date": as_of_date,
-            "signal_packs": signal_packs,
-            "analysis_texts": {},
-            f"{term}_term_score": {"score": 50.0, "_cache_only": True},
-            "_from_agent_cache": True,
+            "company_name": "",
+            "current_date": as_of_date,
+            "thinking_enabled": True,
         }
+        for agent_name, sp in signal_packs.items():
+            state_data[f"{agent_name}_signal_pack"] = sp
+        for agent_name, txt in analysis_texts.items():
+            state_data[f"{agent_name}_analysis"] = txt
+
+        try:
+            pkg = build_analysis_package(state_data, as_of_date)
+
+            from src.agents.short_term_scorer import short_term_scorer
+            from src.agents.medium_term_scorer import medium_term_scorer
+            from src.agents.long_term_scorer import long_term_scorer
+
+            # Short-term scorer (only needs 4 agents)
+            short_result = await short_term_scorer(
+                stock_code=stock_code, company_name="",
+                technical_analysis=analysis_texts.get("technical", ""),
+                news_analysis=analysis_texts.get("news", ""),
+                event_analysis=analysis_texts.get("event", ""),
+                moneyflow_analysis=analysis_texts.get("moneyflow", ""),
+                analysis_package=pkg,
+                current_date=as_of_date,
+                thinking_enabled=True,
+            )
+            gate = apply_risk_gate(pkg, "short", short_result.get("score", 50))
+            if gate.score_cap is not None:
+                short_result["score"] = min(short_result["score"], gate.score_cap)
+            short_result["risk_gate"] = {
+                "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
+                "score_cap": gate.score_cap, "abstain": gate.abstain,
+                "data_quality_score": gate.data_quality_score,
+            }
+
+            # Medium-term scorer (all 7 agents)
+            medium_result = await medium_term_scorer(
+                stock_code=stock_code, company_name="",
+                fundamental_analysis=analysis_texts.get("fundamental", ""),
+                technical_analysis=analysis_texts.get("technical", ""),
+                value_analysis=analysis_texts.get("value", ""),
+                news_analysis=analysis_texts.get("news", ""),
+                event_analysis=analysis_texts.get("event", ""),
+                quality_risk_analysis=analysis_texts.get("quality_risk", ""),
+                moneyflow_analysis=analysis_texts.get("moneyflow", ""),
+                analysis_package=pkg,
+                current_date=as_of_date,
+                thinking_enabled=True,
+            )
+            gate = apply_risk_gate(pkg, "medium", medium_result.get("score", 50))
+            if gate.score_cap is not None:
+                medium_result["score"] = min(medium_result["score"], gate.score_cap)
+            medium_result["risk_gate"] = {
+                "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
+                "score_cap": gate.score_cap, "abstain": gate.abstain,
+                "data_quality_score": gate.data_quality_score,
+            }
+
+            # Long-term scorer (all 7 agents)
+            long_result = await long_term_scorer(
+                stock_code=stock_code, company_name="",
+                fundamental_analysis=analysis_texts.get("fundamental", ""),
+                technical_analysis=analysis_texts.get("technical", ""),
+                value_analysis=analysis_texts.get("value", ""),
+                news_analysis=analysis_texts.get("news", ""),
+                event_analysis=analysis_texts.get("event", ""),
+                quality_risk_analysis=analysis_texts.get("quality_risk", ""),
+                moneyflow_analysis=analysis_texts.get("moneyflow", ""),
+                analysis_package=pkg,
+                current_date=as_of_date,
+                thinking_enabled=True,
+            )
+            gate = apply_risk_gate(pkg, "long", long_result.get("score", 50))
+            if gate.score_cap is not None:
+                long_result["score"] = min(long_result["score"], gate.score_cap)
+            long_result["risk_gate"] = {
+                "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
+                "score_cap": gate.score_cap, "abstain": gate.abstain,
+                "data_quality_score": gate.data_quality_score,
+            }
+
+            # 写scorer缓存（1天TTL）
+            for scorer_name, scorer_result in [
+                ("short_term_scorer", short_result),
+                ("medium_term_scorer", medium_result),
+                ("long_term_scorer", long_result),
+            ]:
+                write_cache(scorer_name, stock_code, as_of_date,
+                           json.dumps(scorer_result, ensure_ascii=False, default=str))
+
+            logger.info("Scorers completed for %s from cached agents: short=%s medium=%s long=%s",
+                       stock_code,
+                       short_result.get("score"), medium_result.get("score"),
+                       long_result.get("score"))
+
+            return {
+                "stock_code": stock_code,
+                "as_of_date": as_of_date,
+                "signal_packs": signal_packs,
+                "analysis_texts": analysis_texts,
+                "short_term_score": short_result,
+                "medium_term_score": medium_result,
+                "long_term_score": long_result,
+                "_from_agent_cache": True,
+                "_scorer_cache_hit": False,
+            }
+
+        except Exception as e:
+            logger.error("Failed to run scorers from cached signal_packs for %s: %s",
+                        stock_code, e, exc_info=True)
+            return {
+                "stock_code": stock_code,
+                "as_of_date": as_of_date,
+                "signal_packs": signal_packs,
+                "analysis_texts": analysis_texts,
+                f"{term}_term_score": {"score": 50.0, "_scorer_failed": True},
+                "_from_agent_cache": True,
+                "_scorer_failed": True,
+            }
 
     @staticmethod
     def _get_scoring_frequency_tier(pool_scores: Dict[str, float],
@@ -884,9 +1120,9 @@ class EvalOrchestrator:
         减少对稳定股票的冗余分析。
 
         频率等级:
-          - "daily":    持仓股 + 高波动候选（每日必跑）
-          - "3day":     稳定高分区 score>75且近10日波动<5%
-          - "5day":     中位区 score 45-65
+          - "daily":    持仓股 + 高波动候选 score 60-80（Gap #20：可买入区间，每日跟踪）
+          - "3day":     稳定高分区 score>80（稳定高分，低频即可）
+          - "5day":     中位区 score 45-60
           - "7day":     稳定低分区 score<45且无明显改善
           - "weekly":   周一全量（覆盖所有未在其他等级中的股票）
 
@@ -897,14 +1133,17 @@ class EvalOrchestrator:
         for code, score in pool_scores.items():
             if code in holdings:
                 tiers[code] = "daily"
-            elif score >= 75:
+            elif 60 <= score <= 80:
+                # Gap #20: 高波动候选（可买入区间，每日跟踪）
+                tiers[code] = "daily"
+            elif score > 80:
                 tiers[code] = "3day"
-            elif 45 <= score < 65:
+            elif 45 <= score < 60:
                 tiers[code] = "5day"
             elif score < 45:
                 tiers[code] = "7day"
             else:
-                tiers[code] = "3day"  # score 65-75
+                tiers[code] = "3day"  # fallback
         return tiers
 
     @staticmethod
@@ -932,6 +1171,106 @@ class EvalOrchestrator:
         elif frequency_tier == "weekly":
             return is_monday
         return True  # 未知等级默认每天跑
+
+    @staticmethod
+    def _check_dynamic_frequency_triggers(
+            stock_code: str, current_tier: str, current_date: str,
+            term: str, all_holdings: set, market_data_map: dict = None) -> tuple:
+        """
+        动态检查评分频率升级/降级触发条件（总纲 §14.4 扩展 / Gap #19）。
+
+        4个动态触发条件：
+          1. 评分连续2次变化>10分 → 升级
+          2. 近5日价格变化>15% → 升级
+          3. 持仓股评分<50 → 强制daily
+          4. 评分连续3次变化<3分 → 降级
+
+        Args:
+            stock_code: 股票代码
+            current_tier: 当前静态分配的频率等级
+            current_date: 当前日期
+            term: short/medium/long
+            all_holdings: 所有线路持仓代码集合
+            market_data_map: {code: MarketData} 可选，用于价格变化检查
+
+        Returns:
+            (effective_tier: str, reason: str or "")
+            reason 为空串表示无动态调整
+        """
+        from src.eval.memory_manager import MemoryManager
+
+        # ── Trigger 3: 持仓股评分<50 → 强制daily ──
+        if stock_code in all_holdings:
+            mm = MemoryManager()
+            history = mm.get_stock_score_history(stock_code, term, days=30)
+            latest_scores = [e["score"] for e in history[-2:]] if history else []
+            if latest_scores and latest_scores[-1] < 50:
+                if current_tier != "daily":
+                    return ("daily", f"持仓股最新评分{latest_scores[-1]:.0f}<50，强制每日分析")
+                return (current_tier, "")
+
+        # ── Trigger 1: 评分连续2次变化>10分 → 升级 ──
+        mm = MemoryManager()
+        history = mm.get_stock_score_history(stock_code, term, days=60)
+        scores_list = [e["score"] for e in history]
+        if len(scores_list) >= 3:
+            change1 = abs(scores_list[-1] - scores_list[-2])
+            change2 = abs(scores_list[-2] - scores_list[-3])
+            if change1 > 10 and change2 > 10:
+                upgrade_map = {"weekly": "7day", "7day": "5day", "5day": "3day", "3day": "daily"}
+                new_tier = upgrade_map.get(current_tier, current_tier)
+                if new_tier != current_tier:
+                    return (new_tier,
+                            f"评分连续2次大幅变化(Δ{change1:.0f},Δ{change2:.0f}>10)，"
+                            f"从{current_tier}升级为{new_tier}")
+
+        # ── Trigger 4: 评分连续3次变化<3分 → 降级 ──
+        if len(scores_list) >= 4:
+            c1 = abs(scores_list[-1] - scores_list[-2])
+            c2 = abs(scores_list[-2] - scores_list[-3])
+            c3 = abs(scores_list[-3] - scores_list[-4])
+            if c1 < 3 and c2 < 3 and c3 < 3:
+                downgrade_map = {"daily": "3day", "3day": "5day", "5day": "7day", "7day": "weekly"}
+                new_tier = downgrade_map.get(current_tier, current_tier)
+                if new_tier != current_tier:
+                    return (new_tier,
+                            f"评分连续3次微小变化(Δ{c1:.0f},Δ{c2:.0f},Δ{c3:.0f}<3)，"
+                            f"从{current_tier}降级为{new_tier}")
+
+        # ── Trigger 2: 近5日价格变化>15% → 升级 ──
+        if market_data_map:
+            md = market_data_map.get(stock_code)
+            if md and md.close > 0:
+                try:
+                    from src.eval.data_fetcher import fetch_daily_prices
+                    if stock_code.startswith("sh."):
+                        ts_code = stock_code[3:] + ".SH"
+                    elif stock_code.startswith("sz."):
+                        ts_code = stock_code[3:] + ".SZ"
+                    else:
+                        ts_code = stock_code
+                    start = (datetime.strptime(current_date, "%Y-%m-%d")
+                             - timedelta(days=15)).strftime("%Y%m%d")
+                    end = current_date.replace("-", "")
+                    prices = fetch_daily_prices(ts_code, start, end)
+                    if len(prices) >= 5:
+                        recent_close = prices[-1]["close"]
+                        past_idx = max(0, len(prices) - 6)
+                        past_close = prices[past_idx]["close"]
+                        if past_close > 0:
+                            pct_chg = abs(recent_close - past_close) / past_close * 100
+                            if pct_chg > 15:
+                                upgrade_map = {"weekly": "7day", "7day": "5day",
+                                               "5day": "3day", "3day": "daily"}
+                                new_tier = upgrade_map.get(current_tier, current_tier)
+                                if new_tier != current_tier:
+                                    return (new_tier,
+                                            f"近5日价格变化{pct_chg:.0f}%>15%，"
+                                            f"从{current_tier}升级为{new_tier}")
+                except Exception:
+                    pass  # 价格查询失败不阻断
+
+        return (current_tier, "")
 
     @staticmethod
     def _adjust_score_for_ablation(base_score: float,
@@ -1008,6 +1347,7 @@ class EvalOrchestrator:
             return {}
 
     async def run_pool_update(self, term: str = "short",
+                               mode: str = "full",
                                on_stage: callable = None,
                                on_progress: callable = None) -> Dict[str, Any]:
         """
@@ -1031,8 +1371,12 @@ class EvalOrchestrator:
         Returns:
             完整结果字典
         """
-        from src.eval.pool_screening import run_pool_update_v3 as _run
-        return await _run(term=term, on_stage=on_stage, on_progress=on_progress)
+        if mode == "partial":
+            from src.eval.pool_screening import run_pool_update_partial as _run
+            return await _run(term=term, on_stage=on_stage, on_progress=on_progress)
+        else:
+            from src.eval.pool_screening import run_pool_update_v3 as _run
+            return await _run(term=term, on_stage=on_stage, on_progress=on_progress)
 
     async def run_pool_update_light(self, term: str = "short") -> Dict[str, Any]:
         """[已废弃] 保留兼容旧接口，内部转调 run_pool_update（四层管线）"""
@@ -1150,6 +1494,46 @@ class EvalOrchestrator:
 
         # 更新最后结算日（当日结算完成即记录）
         self._save_last_settled_date(current_date)
+
+        # ── Gap #2: 记录池健康快照用于连续交易日检查 ──
+        try:
+            for term in ["short", "medium", "long"]:
+                pool_stocks = self.pool_manager.get_pool_with_scores(term)
+                pool_size = len(pool_stocks)
+
+                # 计算 low_score_pct
+                low_score_count = sum(
+                    1 for s in pool_stocks
+                    if (isinstance(s, dict)
+                        and s.get("final_score", s.get("score", 50)) < 50)
+                )
+                low_score_pct = (low_score_count / max(pool_size, 1)) * 100
+
+                # 计算 not_held_pct（从各线路持仓聚合）
+                pool_codes = [
+                    s.get("code", "") if isinstance(s, dict) else s
+                    for s in pool_stocks
+                ]
+                held_stocks: set = set()
+                for line in self.line_manager.lines.values():
+                    if line.definition.get("term") == term:
+                        for code, shares in line.holdings.items():
+                            if shares > 0:
+                                held_stocks.add(code)
+
+                if held_stocks and pool_codes:
+                    not_held = [c for c in pool_codes if c not in held_stocks]
+                    not_held_pct = len(not_held) / max(len(pool_codes), 1) * 100
+                else:
+                    not_held_pct = 0.0
+
+                self.pool_manager.record_pool_health_snapshot(
+                    date=current_date, term=term,
+                    low_score_pct=low_score_pct,
+                    not_held_pct=not_held_pct,
+                )
+        except Exception as e:
+            logger.warning("记录池健康快照失败: %s", e)
 
         # 阶段4: 生成报告并记录记忆
         try:

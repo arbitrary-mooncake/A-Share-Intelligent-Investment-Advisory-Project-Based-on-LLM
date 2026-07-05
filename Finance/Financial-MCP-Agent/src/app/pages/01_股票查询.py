@@ -137,10 +137,10 @@ if task_id and not st.session_state.get("_report_result") and not st.session_sta
     ) as status:
         progress = st.progress(0, text="初始化分析任务...")
 
-        def on_progress(attempt, max_attempts):
-            pct = min(attempt / max_attempts, 1.0)
-            stage = "正在执行多维分析..." if pct < 0.5 else "正在生成报告..."
-            progress.progress(pct, text=f"{stage} (第 {attempt} 步)")
+        def on_progress(real_progress):
+            pct = min(real_progress, 1.0)
+            stage = "正在执行多维分析..." if pct < 0.6 else "正在生成报告..."
+            progress.progress(pct, text=f"{stage} ({pct:.0%})")
 
         try:
             result = handle_poll_report(task_id, on_progress=on_progress)

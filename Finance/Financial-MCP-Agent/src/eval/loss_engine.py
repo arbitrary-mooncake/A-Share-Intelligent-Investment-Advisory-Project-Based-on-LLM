@@ -64,18 +64,30 @@ class LossEngine:
 
         Args:
             config: 可选配置字典，支持键：
-                - loss_effect_weight (float): L_effect权重，默认0.75
-                - loss_stability_weight (float): L_stability权重，默认0.15
-                - loss_efficiency_weight (float): L_efficiency权重，默认0.10
+                - loss_effect_weight (float): L_effect权重，默认0.60
+                - loss_stability_weight (float): L_stability权重，默认0.12
+                - loss_efficiency_weight (float): L_efficiency权重，默认0.08
+                - loss_risk_gate_weight (float): L_risk_gate权重，默认0.05
+                - loss_consistency_weight (float): L_consistency权重，默认0.05
+                - loss_fidelity_weight (float): L_fidelity权重，默认0.05
+                - loss_eval_model_fidelity_weight (float): L_eval_model_fidelity权重，默认0.05
                 - return_component_weights (dict): 可覆盖L_return 5子项权重
                 - risk_component_weights (dict): 可覆盖L_risk 4子项权重
                 - structure_component_weights (dict): 可覆盖L_structure 4子项权重
                 - term_weights (dict): 可覆盖各term的(w_return, w_risk, w_structure)
         """
-        cfg = config or {}
-        self.w_effect = float(cfg.get("loss_effect_weight", 0.75))
-        self.w_stability = float(cfg.get("loss_stability_weight", 0.15))
-        self.w_efficiency = float(cfg.get("loss_efficiency_weight", 0.10))
+        self.config = config or {}
+        cfg = self.config
+        # Core weights — slightly reduced to make room for 4 new modules
+        self.w_effect = float(cfg.get("loss_effect_weight", 0.60))
+        self.w_stability = float(cfg.get("loss_stability_weight", 0.12))
+        self.w_efficiency = float(cfg.get("loss_efficiency_weight", 0.08))
+
+        # New module weights — monitoring metrics, not optimization targets
+        self.w_risk_gate = float(cfg.get("loss_risk_gate_weight", 0.05))
+        self.w_consistency = float(cfg.get("loss_consistency_weight", 0.05))
+        self.w_fidelity = float(cfg.get("loss_fidelity_weight", 0.05))
+        self.w_eval_model_fidelity = float(cfg.get("loss_eval_model_fidelity_weight", 0.05))
 
         # L_return 子项权重
         self.return_weights = cfg.get("return_component_weights", {
@@ -193,8 +205,10 @@ class LossEngine:
             bucket_returns = [r for s, r in zip(scores, returns) if low <= s < high]
             if bucket_returns:
                 w = len(bucket_returns) / n
-                # Expected return from score bucket midpoint (normalized)
-                expected = (low + high) / 200.0  # 0-100 score to ~0-1 expected return fraction
+                # Expected return from score bucket midpoint (normalized to daily scale)
+                # Score 0→-1%, 50→0%, 100→+1% daily expected return
+                midpoint = (low + high) / 2.0
+                expected = (midpoint - 50.0) / 5000.0  # maps [0,100] to [-0.01, +0.01]
                 actual = sum(bucket_returns) / len(bucket_returns)
                 ece += w * abs(actual - expected)
                 total_weight += w
@@ -447,10 +461,9 @@ class LossEngine:
         }
 
     # ========== L_stability 稳定性端 ==========
-    # Simplified implementation per spec §9.2.
-    # Full spec calls for rolling-window score correlation + multi-line drawdown
-    # rank correlation. This version uses score volatility and drawdown variance
-    # across periods as a practical approximation.
+    # Phase 1 (简化版): score volatility + drawdown CV approximation.
+    # Phase 2 (总纲 §9.2 完整版): rolling-window score correlation +
+    #   multi-line drawdown rank correlation. 需要 ≥30 期历史数据。
 
     def compute_L_stability(
         self,
@@ -536,10 +549,9 @@ class LossEngine:
         }
 
     # ========== L_efficiency 效率端 ==========
-    # Simplified implementation per spec §9.3.
-    # Full spec calls for transaction cost models, multi-period turnover tracking,
-    # and detailed cash-flow impact analysis. This version uses single-period
-    # turnover/cash/concentration as a practical first cut.
+    # Phase 1 (简化版): single-period turnover / cash drag / concentration.
+    # Phase 2 (总纲 §9.3 完整版): transaction cost models, multi-period
+    #   turnover tracking, detailed cash-flow impact analysis. 需要 ≥12 期换手数据。
 
     def compute_L_efficiency(
         self,
@@ -637,11 +649,18 @@ class LossEngine:
         sector_weights: Optional[List[float]] = None,
         scores_history: Optional[List[List[float]]] = None,
         returns_history: Optional[List[List[float]]] = None,
+        risk_gate_events: Optional[List[Dict[str, Any]]] = None,
+        consistency_data: Optional[Dict[str, Any]] = None,
+        fidelity_result: Optional[Dict[str, Any]] = None,
+        fidelity_snapshots: Optional[List[dict]] = None,
+        eval_model_fidelity_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """计算总Loss — 三端合一。
+        """计算总Loss — 8模块合一。
 
         L_effect = w_return * L_return + w_risk * L_risk + w_structure * L_structure
         L_total  = w_effect * L_effect + w_stability * L_stability + w_efficiency * L_efficiency
+                 + w_risk_gate * L_risk_gate + w_consistency * L_consistency
+                 + w_fidelity * L_fidelity + w_eval_model_fidelity * L_eval_model_fidelity
 
         Args:
             term: "short" / "medium" / "long"
@@ -655,14 +674,19 @@ class LossEngine:
             sector_weights: 行业权重列表
             scores_history: （可选）多期评分历史，用于L_stability计算
             returns_history: （可选）多期收益历史，用于L_stability计算
+            risk_gate_events: （可选）风险门控事件列表，用于L_risk_gate计算
+            consistency_data: （可选）一致性测试数据，用于L_consistency计算
+            fidelity_result: （可选）FidelityEngine预计算结果
+            fidelity_snapshots: （可选）快照列表，用于内部计算fidelity
+            eval_model_fidelity_data: （可选）评测模型保真度数据dict
 
         Returns:
-            dict: 完整Loss分解，含score_total=100*(1-L_total)
+            dict: 完整Loss分解，含score_total=100*(1-L_total)及8模块详细分解
         """
         # Defaults
         n = len(scores)
         benchmark_returns = list(benchmark_returns) if benchmark_returns else [0.0] * max(n, 1)
-        daily_returns = list(daily_returns) if daily_returns else list(returns)  # fallback
+        daily_returns = list(daily_returns) if daily_returns else []
         holdings_weights = list(holdings_weights) if holdings_weights else []
         sector_weights = list(sector_weights) if sector_weights else []
 
@@ -670,7 +694,19 @@ class LossEngine:
 
         # Compute three loss components
         return_result = self.compute_L_return(scores, returns, benchmark_returns)
-        risk_result = self.compute_L_risk(daily_returns)
+        if daily_returns:
+            risk_result = self.compute_L_risk(daily_returns)
+        else:
+            risk_result = {
+                "L_risk": 0.0,
+                "max_drawdown": 0.0,
+                "volatility_annual": 0.0,
+                "downside_deviation_annual": 0.0,
+                "max_consecutive_loss_days": 0,
+                "sample_size": 0,
+                "insufficient_data": True,
+                "note": "No daily returns data available; risk component skipped",
+            }
         structure_result = self.compute_L_structure(
             holdings_weights, turnover_rate, cash_ratio, sector_weights
         )
@@ -696,6 +732,23 @@ class LossEngine:
             + self.w_efficiency * L_efficiency
         )
 
+        # ---- Compute 4 new module losses ----
+        risk_gate_detail = self.compute_L_risk_gate(risk_gate_events)
+        consistency_detail = self.compute_L_consistency(consistency_data)
+        fidelity_detail = self.compute_L_fidelity(fidelity_result, fidelity_snapshots)
+        eval_fidelity_detail = self.compute_L_eval_model_fidelity(
+            eval_snapshots=(eval_model_fidelity_data or {}).get("eval_snapshots"),
+            production_snapshots=(eval_model_fidelity_data or {}).get("production_snapshots"),
+            eval_vs_prod_score_pairs=(eval_model_fidelity_data or {}).get("eval_vs_prod_score_pairs"),
+        )
+
+        L_total += (
+            self.w_risk_gate * risk_gate_detail.get("L_risk_gate", 0.0)
+            + self.w_consistency * consistency_detail.get("L_consistency", 0.0)
+            + self.w_fidelity * fidelity_detail.get("L_fidelity", 0.0)
+            + self.w_eval_model_fidelity * eval_fidelity_detail.get("L_eval_model_fidelity", 0.0)
+        )
+
         score_total = 100.0 * (1.0 - L_total)
 
         return {
@@ -709,15 +762,396 @@ class LossEngine:
             "structure_detail": structure_result,
             "stability_detail": stability_result,
             "efficiency_detail": efficiency_result,
+            "risk_gate_detail": risk_gate_detail,
+            "consistency_detail": consistency_detail,
+            "fidelity_detail": fidelity_detail,
+            "eval_model_fidelity_detail": eval_fidelity_detail,
             "term": term,
             "sample_size": n,
         }
 
 
+    # ========== L_risk_gate 风险门控端 ==========
+
+    def compute_L_risk_gate(
+        self,
+        risk_gate_events: Optional[List[Dict[str, Any]]] = None,
+        total_stocks: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """计算风险门控端损失 — 衡量风险门控触发频率和评分削减幅度。
+
+        总纲 §10: risk_gate loss 衡量风险门控规则对评分的压制程度，
+        当频繁触发时说明系统在数据质量或风险检测方面存在问题。
+
+        Args:
+            risk_gate_events: 风险门控事件列表，每项包含:
+                - term: 期限 (short/medium/long)
+                - stock_code: 股票代码
+                - original_score: 原始评分
+                - capped_score: 门控后评分
+                - score_cap: 触发的cap值
+                - triggered_flags: 触发的风险标签列表
+                - downgrade: 降级动作 (谨慎/观察/None)
+            total_stocks: 评分股票总数，用于计算触发率。
+                若未提供，使用事件涉及的唯一股票数作为分母。
+
+        Returns:
+            dict: L_risk_gate及所有子项细节
+        """
+        risk_gate_events = risk_gate_events or []
+
+        if not risk_gate_events:
+            return {
+                "L_risk_gate": 0.0,
+                "trigger_count": 0,
+                "mean_score_reduction": 0.0,
+                "max_score_reduction": 0.0,
+                "trigger_rate": 0.0,
+                "flag_frequency": {},
+                "insufficient_data": True,
+            }
+
+        n_events = len(risk_gate_events)
+        reductions = []
+        flag_counter = {}
+        downgrade_counter = {}
+
+        for event in risk_gate_events:
+            orig = event.get("original_score", 0)
+            capped = event.get("capped_score", orig)
+            reduction = orig - capped
+            if reduction > 0:
+                reductions.append(reduction)
+
+            for flag in event.get("triggered_flags", []):
+                flag_counter[flag] = flag_counter.get(flag, 0) + 1
+
+            downgrade = event.get("downgrade", "")
+            if downgrade:
+                downgrade_counter[downgrade] = downgrade_counter.get(downgrade, 0) + 1
+
+        mean_reduction = sum(reductions) / max(len(reductions), 1)
+        max_reduction = max(reductions) if reductions else 0.0
+
+        # Normalize: mean_reduction of 30 points → penalty 1.0
+        score_reduction_penalty = min(mean_reduction / 30.0, 1.0)
+
+        # Trigger rate penalty: >50% trigger rate → high concern
+        # Use total_stocks if provided, else count unique stocks in events
+        n_unique_stocks = len({e.get("stock_code", "") for e in risk_gate_events})
+        denominator = total_stocks or n_unique_stocks or n_events or 1
+        trigger_rate = float(n_events) / denominator
+        trigger_rate_penalty = min(trigger_rate / 0.50, 1.0)  # >50% trigger rate = max concern
+
+        L_risk_gate = 0.55 * score_reduction_penalty + 0.45 * trigger_rate_penalty
+
+        return {
+            "L_risk_gate": round(L_risk_gate, 4),
+            "trigger_count": n_events,
+            "mean_score_reduction": round(mean_reduction, 2),
+            "max_score_reduction": round(max_reduction, 2),
+            "trigger_rate": round(trigger_rate, 4),
+            "flag_frequency": flag_counter,
+            "downgrade_frequency": downgrade_counter,
+            "insufficient_data": False,
+        }
+
+    # ========== L_consistency 一致性端 ==========
+
+    def compute_L_consistency(
+        self,
+        consistency_data: Optional[Dict[str, Any]] = None,
+        scores_run_pairs: Optional[List[Tuple[List[float], List[float]]]] = None,
+    ) -> Dict[str, Any]:
+        """计算一致性端损失 — 衡量同一输入重复运行时的评分稳定性。
+
+        总纲 §10: consistency loss 衡量 LLM 输出的非确定性对系统的影响。
+        输入可来自 ExperimentEngine.run_consistency_test() 的结果，
+        或直接传入多组 (run1_scores, run2_scores) 对。
+
+        Args:
+            consistency_data: 来自 ExperimentEngine.run_consistency_test() 的结果dict。
+                应包含: mean_score_diff, action_flip_rate, top_k_overlap。
+            scores_run_pairs: 多组 (run1_scores, run2_scores) 的列表，
+                作为备选输入路径。当 consistency_data 为空时使用。
+
+        Returns:
+            dict: L_consistency及所有子项细节
+        """
+        if consistency_data and consistency_data.get("experiment_type") == "consistency":
+            # Direct ingestion from ExperimentEngine
+            mean_diff = consistency_data.get("mean_score_diff", 0.0)
+            flip_rate = consistency_data.get("action_flip_rate", 0.0)
+            topk_overlap = consistency_data.get("top_k_overlap", 1.0)
+            sample_size = consistency_data.get("sample_size", 0)
+
+            # Normalize
+            score_diff_penalty = min(mean_diff / 20.0, 1.0)
+            flip_rate_penalty = min(flip_rate / 0.30, 1.0)
+            overlap_penalty = max(0.0, (1.0 - topk_overlap) / 0.50)
+
+            L_consistency = (
+                0.35 * score_diff_penalty
+                + 0.35 * flip_rate_penalty
+                + 0.30 * overlap_penalty
+            )
+
+            return {
+                "L_consistency": round(L_consistency, 4),
+                "mean_score_diff": mean_diff,
+                "action_flip_rate": flip_rate,
+                "top_k_overlap": topk_overlap,
+                "sample_size": sample_size,
+                "insufficient_data": sample_size == 0,
+            }
+
+        if scores_run_pairs:
+            all_diffs = []
+            all_flips = 0
+            all_pairs = 0
+            all_overlaps = []
+            k_default = 10
+
+            for run1, run2 in scores_run_pairs:
+                n = min(len(run1), len(run2))
+                if n == 0:
+                    continue
+
+                all_pairs += n
+                for i in range(n):
+                    all_diffs.append(abs(run1[i] - run2[i]))
+                    if (run1[i] >= 50) != (run2[i] >= 50):
+                        all_flips += 1
+
+                k = min(k_default, n)
+                top1 = set(sorted(range(n), key=lambda i: run1[i], reverse=True)[:k])
+                top2 = set(sorted(range(n), key=lambda i: run2[i], reverse=True)[:k])
+                overlap = len(top1 & top2) / k if k > 0 else 1.0
+                all_overlaps.append(overlap)
+
+            mean_diff = sum(all_diffs) / max(len(all_diffs), 1) if all_diffs else 0.0
+            flip_rate = all_flips / max(all_pairs, 1)
+            avg_overlap = sum(all_overlaps) / max(len(all_overlaps), 1) if all_overlaps else 1.0
+
+            score_diff_penalty = min(mean_diff / 20.0, 1.0)
+            flip_rate_penalty = min(flip_rate / 0.30, 1.0)
+            overlap_penalty = max(0.0, (1.0 - avg_overlap) / 0.50)
+
+            L_consistency = (
+                0.35 * score_diff_penalty
+                + 0.35 * flip_rate_penalty
+                + 0.30 * overlap_penalty
+            )
+
+            return {
+                "L_consistency": round(L_consistency, 4),
+                "mean_score_diff": round(mean_diff, 2),
+                "action_flip_rate": round(flip_rate, 4),
+                "top_k_overlap": round(avg_overlap, 4),
+                "sample_size": all_pairs,
+                "insufficient_data": all_pairs == 0,
+            }
+
+        # No data at all
+        return {
+            "L_consistency": 0.0,
+            "mean_score_diff": 0.0,
+            "action_flip_rate": 0.0,
+            "top_k_overlap": 1.0,
+            "sample_size": 0,
+            "insufficient_data": True,
+        }
+
+    # ========== L_fidelity 保真度端 ==========
+
+    def compute_L_fidelity(
+        self,
+        fidelity_result: Optional[Dict[str, Any]] = None,
+        snapshots: Optional[List[dict]] = None,
+    ) -> Dict[str, Any]:
+        """计算保真度端损失 — 包装 FidelityEngine 的输出并映射到 0-1 损失。
+
+        可以直接接收 FidelityEngine.compute_fidelity_loss() 的输出，
+        或传入 snapshots 列表内部调用 FidelityEngine。
+
+        Args:
+            fidelity_result: FidelityEngine.compute_fidelity_loss() 的返回结果
+            snapshots: 快照列表，当 fidelity_result 为空时自行计算
+
+        Returns:
+            dict: L_fidelity及所有子项细节
+        """
+        try:
+            if fidelity_result is None and snapshots:
+                from src.eval.fidelity_engine import FidelityEngine
+                fe = FidelityEngine(self.config)
+                fidelity_result = fe.compute_fidelity_loss(snapshots)
+        except Exception as e:
+            # Graceful fallback: return neutral when FidelityEngine is unavailable
+            return {
+                "L_fidelity": 0.0,
+                "action_flip_rate": 0.0,
+                "score_drift": 0.0,
+                "topK_overlap": 1.0,
+                "rank_drift": 0.0,
+                "fidelity_loss": 0.0,
+                "warnings": [f"FidelityEngine调用失败: {str(e)}"],
+                "insufficient_data": True,
+            }
+
+        if fidelity_result is None:
+            return {
+                "L_fidelity": 0.0,
+                "action_flip_rate": 0.0,
+                "score_drift": 0.0,
+                "topK_overlap": 1.0,
+                "rank_drift": 0.0,
+                "fidelity_loss": 0.0,
+                "insufficient_data": True,
+            }
+
+        # Map FidelityEngine's fidelity_loss (already 0-1) to L_fidelity
+        # If period_pairs_analyzed is 0, there's insufficient data
+        n_pairs = fidelity_result.get("period_pairs_analyzed", 0)
+        raw_fidelity_loss = fidelity_result.get("fidelity_loss", 0.0)
+
+        L_fidelity = raw_fidelity_loss  # Already in 0-1 range from FidelityEngine
+
+        return {
+            "L_fidelity": round(L_fidelity, 4),
+            "action_flip_rate": fidelity_result.get("action_flip_rate", 0.0),
+            "score_drift": fidelity_result.get("score_drift", 0.0),
+            "topK_overlap": fidelity_result.get("topK_overlap", 1.0),
+            "rank_drift": fidelity_result.get("rank_drift", 0.0),
+            "fidelity_loss_raw": raw_fidelity_loss,
+            "period_pairs_analyzed": n_pairs,
+            "warnings": fidelity_result.get("warnings", []),
+            "insufficient_data": n_pairs == 0,
+        }
+
+    # ========== L_eval_model_fidelity 评测模型保真度端 ==========
+
+    def compute_L_eval_model_fidelity(
+        self,
+        eval_snapshots: Optional[List[dict]] = None,
+        production_snapshots: Optional[List[dict]] = None,
+        eval_vs_prod_score_pairs: Optional[List[Tuple[float, float]]] = None,
+    ) -> Dict[str, Any]:
+        """计算评测模型保真度损失 — 比较评测模型(M5/MiMo-V2.5)与生产模型(M1/M3)的评分差异。
+
+        总纲 §10: eval_model_fidelity 衡量评测结果在多大程度上可以代表生产环境。
+        如果评测模型和生产模型的评分系统性偏离，则评测结论可能不适用于生产。
+
+        Args:
+            eval_snapshots: 评测模型(M5)的快照列表
+            production_snapshots: 生产模型(M1/M3)的快照列表
+            eval_vs_prod_score_pairs: (eval_score, prod_score) 对列表，作为备选输入
+
+        Returns:
+            dict: L_eval_model_fidelity及所有子项细节
+        """
+        try:
+            if eval_snapshots and production_snapshots:
+                # Build score pairs by aligning snapshots on period and symbol.
+                # This measures the actual score agreement between eval (M5) and
+                # production (M1/M3) models, NOT each model's self-consistency.
+                eval_by_period = {}
+                for s in eval_snapshots:
+                    period = str(s.get("period", ""))
+                    if period:
+                        syms = s.get("symbols", [])
+                        scores = s.get("scores", [])
+                        eval_by_period[period] = dict(zip(syms, scores))
+
+                prod_by_period = {}
+                for s in production_snapshots:
+                    period = str(s.get("period", ""))
+                    if period:
+                        syms = s.get("symbols", [])
+                        scores = s.get("scores", [])
+                        prod_by_period[period] = dict(zip(syms, scores))
+
+                # Collect (eval_score, prod_score) pairs for shared period+symbol
+                score_pairs = []
+                for period in eval_by_period:
+                    if period in prod_by_period:
+                        for sym, eval_s in eval_by_period[period].items():
+                            prod_s = prod_by_period[period].get(sym)
+                            if prod_s is not None:
+                                score_pairs.append((eval_s, prod_s))
+
+                if score_pairs:
+                    # Reuse the score-pair comparison logic below
+                    eval_vs_prod_score_pairs = score_pairs
+                else:
+                    return {
+                        "L_eval_model_fidelity": 0.0,
+                        "status": "no_overlapping_periods_or_symbols",
+                        "insufficient_data": True,
+                    }
+
+            if eval_vs_prod_score_pairs:
+                n = len(eval_vs_prod_score_pairs)
+                if n == 0:
+                    return {
+                        "L_eval_model_fidelity": 0.0,
+                        "status": "no_production_data",
+                        "insufficient_data": True,
+                    }
+
+                eval_scores = [p[0] for p in eval_vs_prod_score_pairs]
+                prod_scores = [p[1] for p in eval_vs_prod_score_pairs]
+
+                # Mean absolute difference
+                mean_diff = sum(abs(e - p) for e, p in eval_vs_prod_score_pairs) / n
+                # Correlation
+                rho = spearman_rank_correlation(eval_scores, prod_scores)
+                # Action agreement
+                actions_agree = sum(
+                    1 for e, p in eval_vs_prod_score_pairs
+                    if (e >= 50) == (p >= 50)
+                ) / n
+
+                score_diff_penalty = min(mean_diff / 15.0, 1.0)
+                rank_divergence = max(0.0, (1.0 - rho) / 2.0)  # 0-1
+                action_disagreement = 1.0 - actions_agree
+
+                L_eval_model_fidelity = (
+                    0.40 * score_diff_penalty
+                    + 0.35 * rank_divergence
+                    + 0.25 * action_disagreement
+                )
+
+                return {
+                    "L_eval_model_fidelity": round(L_eval_model_fidelity, 4),
+                    "mean_score_diff": round(mean_diff, 2),
+                    "spearman_rho": round(rho, 4),
+                    "action_agreement_rate": round(actions_agree, 4),
+                    "sample_size": n,
+                    "source": "score_pairs",
+                    "insufficient_data": False,
+                }
+
+            # No production data available — return neutral placeholder
+            return {
+                "L_eval_model_fidelity": 0.0,
+                "status": "no_production_data",
+                "note": "生产模型快照或评分对数据不可用，无法计算评测模型保真度",
+                "insufficient_data": True,
+            }
+
+        except Exception as e:
+            return {
+                "L_eval_model_fidelity": 0.0,
+                "status": "computation_error",
+                "error": str(e),
+                "insufficient_data": True,
+            }
+
     # ========== Module-Level Loss Tracking ==========
-    # Simplified implementation per spec §10.
-    # Computes per-module losses: stock short/medium/long lines + agent ablation.
-    # Thin wrappers around existing compute_total_loss with term-specific configs.
+    # Full implementation per spec §10.
+    # Computes all 8 module losses: stock short/medium/long, risk_gate,
+    # consistency, fidelity, agent_ablation, eval_model_fidelity.
 
     def compute_module_losses(
         self,
@@ -725,25 +1159,34 @@ class LossEngine:
         stock_medium_term_data: Optional[Dict[str, Any]] = None,
         stock_long_term_data: Optional[Dict[str, Any]] = None,
         contribution_data: Optional[Dict[str, Any]] = None,
+        risk_gate_events: Optional[List[Dict[str, Any]]] = None,
+        consistency_data: Optional[Dict[str, Any]] = None,
+        fidelity_result: Optional[Dict[str, Any]] = None,
+        fidelity_snapshots: Optional[List[dict]] = None,
+        eval_model_fidelity_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """计算模块级Loss追踪。
+        """计算模块级Loss追踪 — 全部8个模块。
 
         Args:
             stock_short_term_data: 短期线的scores/returns/daily_returns等dict
             stock_medium_term_data: 中期线的数据dict
             stock_long_term_data: 长期线的数据dict
             contribution_data: 贡献分析结果dict，含"contributions"列表
+            risk_gate_events: 风险门控事件列表，参见 compute_L_risk_gate()
+            consistency_data: 一致性测试数据，参见 compute_L_consistency()
+            fidelity_result: FidelityEngine预计算结果
+            fidelity_snapshots: 快照列表，用于内部计算fidelity
+            eval_model_fidelity_data: dict with keys:
+                - eval_snapshots: 评测模型(M5)快照列表
+                - production_snapshots: 生产模型(M1/M3)快照列表
+                - eval_vs_prod_score_pairs: (eval_score, prod_score) 对列表
 
         Returns:
-            dict: {
-                "stock_short_term": {...},
-                "stock_medium_term": {...},
-                "stock_long_term": {...},
-                "agent_ablation": {"deltas": {...}, "mean_delta": ...},
-            }
+            dict: 包含全部8个模块的loss结果
         """
         result = {}
 
+        # 1-3: Stock term modules
         if stock_short_term_data:
             result["stock_short_term"] = self.compute_total_loss(
                 "short",
@@ -783,6 +1226,16 @@ class LossEngine:
                 stock_long_term_data.get("sector_weights"),
             )
 
+        # 4: Risk gate module
+        result["stock_risk_gate"] = self.compute_L_risk_gate(risk_gate_events)
+
+        # 5: Consistency module
+        result["consistency"] = self.compute_L_consistency(consistency_data)
+
+        # 6: Fidelity module
+        result["fidelity"] = self.compute_L_fidelity(fidelity_result, fidelity_snapshots)
+
+        # 7: Agent ablation module
         if contribution_data:
             contributions = contribution_data.get("contributions", [])
             ablation_deltas = {}
@@ -797,6 +1250,23 @@ class LossEngine:
                 "max_negative": min(ablation_deltas.values()) if ablation_deltas else 0.0,
                 "n_agents": len(ablation_deltas),
             }
+        else:
+            result["agent_ablation"] = {
+                "deltas": {},
+                "mean_delta": 0.0,
+                "max_positive": 0.0,
+                "max_negative": 0.0,
+                "n_agents": 0,
+                "insufficient_data": True,
+            }
+
+        # 8: Eval model fidelity module
+        eval_mf_data = eval_model_fidelity_data or {}
+        result["evaluation_model_fidelity"] = self.compute_L_eval_model_fidelity(
+            eval_snapshots=eval_mf_data.get("eval_snapshots"),
+            production_snapshots=eval_mf_data.get("production_snapshots"),
+            eval_vs_prod_score_pairs=eval_mf_data.get("eval_vs_prod_score_pairs"),
+        )
 
         return result
 

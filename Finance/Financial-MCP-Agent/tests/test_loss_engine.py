@@ -230,9 +230,12 @@ def test_total_loss_long_term():
 def test_total_loss_empty():
     engine = LossEngine()
     result = engine.compute_total_loss("medium", [], [])
-    # L_return=1.0, L_risk=1.0, L_structure derived from empty -> high penalty
-    assert result["L_total"] > 0.5
+    # L_return=1.0 (empty scores), L_risk=0.0 (no daily_returns → skipped),
+    # L_structure from empty → penalty; L_total lower than before because
+    # risk component is neutral when no data is available (was wrongly max penalty)
+    assert result["L_total"] >= 0.3
     assert result["sample_size"] == 0
+    assert result["risk_detail"]["insufficient_data"] is True
 
 
 def test_total_loss_config_overrides():

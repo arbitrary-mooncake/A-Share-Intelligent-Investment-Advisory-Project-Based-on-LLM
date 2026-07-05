@@ -130,9 +130,25 @@ def cmd_pool(args):
                     print(f"      {s.get('code', '?')} {s.get('name', '?')}: {s.get('score', '?')}分")
 
     elif action == "update":
-        print(f"  全量更新需要运行完整的精筛池筛选流程（批量打分+快筛+精筛）")
-        print(f"  该功能需要调用本项目生产模型(M1/M3)进行批量打分，耗时较长")
-        print(f"  请在Web UI中点击'精筛池更新'按钮触发，或稍后实现CLI批量打分流程")
+        mode = getattr(args, "mode", "full") or "full"
+        print(f"  更新模式: {mode}")
+        print(f"  期限: {term}")
+        from src.eval.orchestrator import EvalOrchestrator
+        import asyncio
+        orch = EvalOrchestrator()
+        result = asyncio.run(orch.run_pool_update(term, mode=mode))
+        if result.get("error"):
+            print(f"  ❌ 错误: {result['error']}")
+            if result.get("message"):
+                print(f"  {result['message']}")
+        else:
+            pool_size = result.get("final_pool_size", 0)
+            stats = result.get("stats", {})
+            print(f"  ✅ 更新完成: {pool_size}只")
+            if mode == "partial":
+                print(f"  替换: {stats.get('removed', 0)}只, "
+                      f"新增: {stats.get('added', 0)}只, "
+                      f"保留: {stats.get('kept', 0)}只")
 
 
 def cmd_backtest(args):

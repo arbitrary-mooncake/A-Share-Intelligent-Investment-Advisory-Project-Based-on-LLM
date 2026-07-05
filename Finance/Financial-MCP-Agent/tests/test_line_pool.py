@@ -70,7 +70,7 @@ def test_pool_manager_update():
 
 def test_pool_manager_blacklist():
     pm = PoolManager()
-    pm.add_to_blacklist("sh.999999", "测试")
+    pm.add_to_blacklist("sh.999999", reason="测试")
     assert pm.is_blacklisted("sh.999999")
     assert not pm.is_blacklisted("sh.601888")
 

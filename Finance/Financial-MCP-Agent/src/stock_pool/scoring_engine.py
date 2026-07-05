@@ -65,7 +65,17 @@ class ScoringEngine:
     """
 
     def __init__(self, pool_manager: Optional[StockPoolManager] = None):
-        self.pool_manager = pool_manager or StockPoolManager()
+        """
+        Args:
+            pool_manager: StockPoolManager 实例。
+                - None (默认): 自动创建，评分结果写入 stock_pool.json
+                - StockPoolManager 实例: 使用指定实例
+                - False: 禁用池写入（pool screening 等外部调用场景）
+        """
+        if pool_manager is False:
+            self.pool_manager = None
+        else:
+            self.pool_manager = pool_manager or StockPoolManager()
         self._workflow = None
 
     def _build_workflow(self) -> StateGraph:
@@ -239,6 +249,7 @@ class ScoringEngine:
                 "short_term_score": short_term_score,
                 "medium_term_score": medium_term_score,
                 "long_term_score": long_term_score,
+                "company_name": company_name,
                 "status": "scored",
             }
 
@@ -288,6 +299,7 @@ class ScoringEngine:
                     "short_term_score": {},
                     "medium_term_score": {},
                     "long_term_score": {},
+                    "company_name": company_name,
                     "status": "failed",
                 })
 

@@ -48,7 +48,7 @@ def strip_exchange_prefix(code: str) -> str:
 
 
 def format_price_change(val) -> str:
-    """格式化涨跌幅，统一保留一位小数"""
+    """格式化涨跌幅，统一保留两位小数"""
     if val is None or val == "N/A" or val == "" or val == "数据待查询":
         return "N/A"
     s = str(val).replace("…", "").replace("...", "").strip()
@@ -56,7 +56,7 @@ def format_price_change(val) -> str:
         return "N/A"
     try:
         num = float(s.replace("%", ""))
-        return f"{num:.1f}%"
+        return f"{num:.2f}%"
     except (ValueError, TypeError):
         return s if s else "N/A"
 
@@ -70,11 +70,11 @@ def format_turnover(val) -> str:
 
 
 def price_color(val) -> str:
-    """涨跌幅正负颜色"""
+    """涨跌幅正负颜色（A股惯例：红涨绿跌）"""
     if val == "N/A":
         return "#888"
     try:
         num = float(val.replace("%", ""))
-        return "#dc3545" if num < 0 else "#28a745" if num > 0 else "#888"
+        return "#dc3545" if num > 0 else "#28a745" if num < 0 else "#888"
     except (ValueError, TypeError):
         return "#888"

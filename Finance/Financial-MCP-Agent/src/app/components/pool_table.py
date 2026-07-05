@@ -281,7 +281,7 @@ def render_fine_pool_list(
     page: int = 0,
     page_size: int = 20,
 ) -> None:
-    """精筛股票列表 — 名称 | 短线 | 中线 | 长线 | 操作"""
+    """精筛股票列表 — 名称 | 打分时间 | 短线 | 中线 | 长线 | 操作"""
     if not stocks:
         return
 
@@ -295,6 +295,8 @@ def render_fine_pool_list(
         code = s.get("stock_code", "")
         name = s.get("company_name", "")
         scores = s.get("scores", {})
+        last_updated = s.get("last_updated", "")
+        score_date = (last_updated or "")[:10] if last_updated else ""
 
         is_selected = (code == selected_code)
 
@@ -316,7 +318,7 @@ def render_fine_pool_list(
                 unsafe_allow_html=True,
             )
 
-        cols = st.columns([2, 1, 1, 1, 0.5])
+        cols = st.columns([2, 1, 1, 1, 1, 0.5])
 
         with cols[0]:
             st.markdown(
@@ -328,8 +330,15 @@ def render_fine_pool_list(
                 unsafe_allow_html=True,
             )
 
+        with cols[1]:
+            if score_date:
+                st.markdown(
+                    f'<div style="font-size:0.78em;color:#94a3b8;margin-top:4px;">{score_date}</div>',
+                    unsafe_allow_html=True,
+                )
+
         for j, (term, label) in enumerate([("short", "短线"), ("medium", "中线"), ("long", "长线")]):
-            with cols[1 + j]:
+            with cols[2 + j]:
                 ts = scores.get(term, {})
                 sc = ts.get("score")
                 if sc is not None:
@@ -348,7 +357,7 @@ def render_fine_pool_list(
                         unsafe_allow_html=True,
                     )
 
-        with cols[4]:
+        with cols[5]:
             btn_label = "✓" if is_selected else "查看"
             btn_type = "primary" if is_selected else "secondary"
             if st.button(btn_label, key=f"fine_sel_{term_key}_{code}",

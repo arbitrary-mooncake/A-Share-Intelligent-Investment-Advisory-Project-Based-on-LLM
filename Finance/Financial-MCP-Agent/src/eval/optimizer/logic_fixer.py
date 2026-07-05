@@ -12,12 +12,339 @@
   4. **不稳定性检测**：同一 agent 的贡献在不同批次间剧烈波动（CV > 2.0）
      → 可能 agent 逻辑对输入质量过度敏感
 
+规则引擎（RuleEngine）：在调用 LLM 之前先进行纯规则检测。
+如果问题能 100% 被已知规则覆盖，直接应用确定性修复，跳过 LLM。
+否则回退到 LLM-based/generate_fix() 模板生成。
+
 所有检测均为纯 Python 实现，不依赖 LLM。
 generate_fix() 和 generate_test() 生成代码模板（用户需手动验证）。
 """
 
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# ── 规则引擎 ──────────────────────────────────────────────────────
+
+class RuleEngine:
+    """纯规则检测引擎 — 在涉及 LLM 之前先判断问题是否可通过已知规则修复。
+
+    提供4类检测器：
+      1. 评分计算Bug检测 (check_score_calculation_bug)
+      2. 权重归一化检查 (check_weight_normalization)
+      3. 阈值一致性检查 (check_threshold_consistency)
+      4. 数据字段名匹配检查 (check_data_field_mismatch)
+    """
+
+    # 已知的评分计算Bug模式
+    SCORE_BUG_PATTERNS = [
+        {
+            "name": "score_range_inversion",
+            "pattern": r"(?:score|scoring)\s*[=:]\s*(?:100\s*-\s*|1\.0\s*-\s*)",
+            "description": "评分可能使用了反向映射（100-score 或 1.0-score），导致高分对应差表现",
+            "fix_hint": "检查评分赋值的正负方向，确保高分=好表现、低分=差表现",
+        },
+        {
+            "name": "weight_out_of_bounds",
+            "pattern": r"(?:weight|权重)\s*[=:]\s*[-]?\d+\.\d+\s*[*/]",
+            "description": "权重计算中可能出现负值或 >10 的极端值",
+            "fix_hint": "检查权重计算的取值范围，确保在 [0, 1] 区间",
+        },
+        {
+            "name": "missing_normalization",
+            "pattern": r"(?:weight|w_)\w*\s*=\s*\w+\s*/\s*\w+",
+            "description": "权重有除法但缺少显式归一化步骤",
+            "fix_hint": "添加归一化步骤：weight_i = weight_i / sum(all_weights)",
+        },
+        {
+            "name": "integer_division",
+            "pattern": r"(?:score|count|total)\s*/\s*(?:2|3|5|10)\b",
+            "description": "整数除法可能导致精度丢失",
+            "fix_hint": "改用浮点除法：value / 2.0 或 from __future__ import division",
+        },
+    ]
+
+    @staticmethod
+    def check_score_calculation_bug(error_pattern: Dict[str, Any]) -> Dict[str, Any]:
+        """检测评分计算中的常见 Bug 模式。
+
+        Args:
+            error_pattern: 包含 code_snippet / error_message / agent_name 的字典
+
+        Returns:
+            {"matched": bool, "pattern_name": str, "fix_hint": str, "confidence": float}
+        """
+        code = error_pattern.get("code_snippet", "")
+        error_msg = error_pattern.get("error_message", "")
+
+        # 合并为搜索文本
+        search_text = f"{code}\n{error_msg}"
+
+        for pattern_info in RuleEngine.SCORE_BUG_PATTERNS:
+            if re.search(pattern_info["pattern"], search_text, re.IGNORECASE):
+                return {
+                    "matched": True,
+                    "pattern_name": pattern_info["name"],
+                    "description": pattern_info["description"],
+                    "fix_hint": pattern_info["fix_hint"],
+                    "confidence": 0.90 if code else 0.60,
+                }
+
+        # 检查是否 score 输出范围异常
+        if re.search(r"(?:score|Score)\s*[><=]+\s*(?:-?\d{3,}|1\d{3,})", search_text):
+            return {
+                "matched": True,
+                "pattern_name": "score_range_anomaly",
+                "description": "评分值出现超出预期范围（如 >999 或负数），可能是溢出或未裁剪",
+                "fix_hint": "添加 score = max(0, min(100, score)) 裁剪逻辑",
+                "confidence": 0.85,
+            }
+
+        return {"matched": False, "pattern_name": None, "fix_hint": None, "confidence": 0.0}
+
+    @staticmethod
+    def check_weight_normalization(params: Dict[str, Any]) -> Dict[str, Any]:
+        """检查权重是否归一化（Σ=1.0）。
+
+        Args:
+            params: 包含多个参数及其值的字典，其中 weight 相关参数以 'w_' 或 '_weight_' 结尾
+
+        Returns:
+            {"all_normalized": bool, "violations": [...], "fix_suggestion": str}
+        """
+        violations = []
+
+        # 按组检测：查找以权重前缀归组的参数
+        # 例如：short_weight_tech, short_weight_volume → "short_weight" 组
+        weight_groups: Dict[str, Dict[str, float]] = {}
+        for key, value in params.items():
+            if not isinstance(value, (int, float)):
+                continue
+            # 匹配 _w_xxx 或 _weight_xxx 模式的分组
+            match = re.match(r"^(.+?)(?:_w_|_weight_)(.+)$", key)
+            if match:
+                group_key = match.group(1) + "_w"  # 如 "loss_w", "effect_short_w"
+                weight_name = match.group(2)
+                if group_key not in weight_groups:
+                    weight_groups[group_key] = {}
+                weight_groups[group_key][weight_name] = float(value)
+
+        for group_key, weights in weight_groups.items():
+            if len(weights) < 2:
+                continue
+            total = sum(weights.values())
+            if abs(total - 1.0) > 0.01:
+                violations.append({
+                    "group": group_key,
+                    "total": total,
+                    "drift": total - 1.0,
+                    "weights": dict(weights),
+                })
+
+        if violations:
+            return {
+                "all_normalized": False,
+                "violations": violations,
+                "fix_suggestion": (
+                    f"以下权重组的 Σ != 1.0: "
+                    + ", ".join(f"{v['group']}(Σ={v['total']:.3f})" for v in violations)
+                    + "。请对每组执行 weights_i = weights_i / sum(weights) 归一化。"
+                ),
+            }
+
+        return {"all_normalized": True, "violations": [], "fix_suggestion": None}
+
+    @staticmethod
+    def check_threshold_consistency(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """检查阈值列表中是否存在逻辑间隙或重叠。
+
+        常见问题：
+          - buy_threshold > sell_threshold（买卖阈值颠倒）
+          - 相邻阈值之间有未覆盖的区间（gap）
+          - 阈值范围超出 [0, 100] 或 [0.0, 1.0]
+
+        Args:
+            rules: 规则列表，每项 {"name": str, "threshold": float/int, "type": "buy"/"sell"/"cap"}
+
+        Returns:
+            {"consistent": bool, "gaps": [...], "overlaps": [...], "fix_suggestions": [...]}
+        """
+        gaps = []
+        overlaps = []
+        fix_suggestions = []
+
+        # 分离购买和卖出阈值
+        buy_rules = [r for r in rules if r.get("type") == "buy"]
+        sell_rules = [r for r in rules if r.get("type") == "sell"]
+        cap_rules = [r for r in rules if r.get("type") == "cap"]
+
+        # 检查: buy_threshold 不应高于 sell_threshold（否则永远不买）
+        for buy in buy_rules:
+            for sell in sell_rules:
+                if buy.get("threshold", 0) > sell.get("threshold", 100):
+                    overlaps.append({
+                        "type": "buy_above_sell",
+                        "buy_rule": buy.get("name"),
+                        "buy_val": buy.get("threshold"),
+                        "sell_rule": sell.get("name"),
+                        "sell_val": sell.get("threshold"),
+                        "message": (
+                            f"购买阈值 ({buy.get('threshold')}) > 卖出阈值 ({sell.get('threshold')})，"
+                            f"可能导致永远不买入"
+                        ),
+                    })
+                    fix_suggestions.append(
+                        f"确保 buy_threshold <= sell_threshold: "
+                        f"将 {buy.get('name')} 从 {buy.get('threshold')} 降低到 ≤ {sell.get('threshold')}，"
+                        f"或将 {sell.get('name')} 提高到 ≥ {buy.get('threshold')}"
+                    )
+
+        # 检查：cap 值是否合理
+        for cap in cap_rules:
+            threshold = cap.get("threshold", 50)
+            cap_name = cap.get("name", "unknown")
+            if threshold > 100 or threshold < 0:
+                gaps.append({
+                    "type": "cap_out_of_bounds",
+                    "rule": cap_name,
+                    "value": threshold,
+                    "message": f"上限值 {threshold} 超出合理范围 [0, 100]",
+                })
+                fix_suggestions.append(f"将 {cap_name} 裁剪到 [0, 100] 范围")
+
+        # 检查：相邻 cap 阈值是否分层合理（不允许相邻 cap 差 < 3）
+        sorted_caps = sorted(cap_rules, key=lambda r: r.get("threshold", 50))
+        for i in range(len(sorted_caps) - 1):
+            curr = sorted_caps[i].get("threshold", 50)
+            nxt = sorted_caps[i + 1].get("threshold", 50)
+            if abs(curr - nxt) < 3 and abs(curr - nxt) > 0:
+                overlaps.append({
+                    "type": "caps_too_close",
+                    "rule_a": sorted_caps[i].get("name"),
+                    "rule_b": sorted_caps[i + 1].get("name"),
+                    "value_a": curr,
+                    "value_b": nxt,
+                    "message": f"上限值 {curr} 和 {nxt} 过于接近（差={abs(curr - nxt)}）",
+                })
+
+        consistent = len(gaps) == 0 and len(overlaps) == 0
+
+        return {
+            "consistent": consistent,
+            "gaps": gaps,
+            "overlaps": overlaps,
+            "fix_suggestions": fix_suggestions,
+        }
+
+    @staticmethod
+    def check_data_field_mismatch(
+        code_refs: List[str], schema: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """检查代码引用的字段名是否与数据schema一致。
+
+        检测模式：
+          - 字段名拼写错误（如 "clsoe" vs "close"）
+          - 废弃字段名（如 "pct_chg" vs "pct_change"）
+          - 已迁移/重命名的字段
+
+        Args:
+            code_refs: 代码中引用的字段名列表
+            schema: 已知的数据schema键集合（可选）
+
+        Returns:
+            {"mismatches": [...], "suggestions": [...]}
+        """
+        mismatches = []
+        suggestions = []
+
+        # 常见拼写错误映射
+        common_typos = {
+            "clsoe": "close",
+            "volme": "volume",
+            "amout": "amount",
+            "pct_chg": "pct_change",
+            "turnover_r": "turnover_rate",
+            "pe_ttm": "pe_ttm",
+            "pre_close": "prev_close",
+            "change_pct": "pct_chg",
+            "high_price": "high",
+            "low_price": "low",
+            "open_price": "open",
+            "close_price": "close",
+            "daily_amout": "amount",
+            "avg_price": "vwap",
+            "total_shares": "total_share",
+            "circ_market_cap": "circ_mv",
+            "total_market_cap": "total_mv",
+        }
+
+        # 已知废弃/重命名字段
+        deprecated_fields = {
+            "vol": "改用 volume",
+            "pct_chg": "改用 pct_change（更明确）",
+            "pe": "改用 pe_ttm 或 pe_lyr",
+            "pb": "改用 pb_lf",
+            "total_mv": "total_market_cap",
+            "circ_mv": "circ_market_cap",
+        }
+
+        for ref in code_refs:
+            ref_lower = ref.lower().strip()
+            # 检查拼写错误
+            if ref_lower in common_typos:
+                correct = common_typos[ref_lower]
+                mismatches.append({
+                    "field": ref,
+                    "issue": "likely_typo",
+                    "suggested_fix": correct,
+                    "message": f"字段 '{ref}' 可能是拼写错误，建议改为 '{correct}'",
+                })
+                suggestions.append(f"将 '{ref}' 改为 '{correct}'")
+
+            # 检查废弃字段
+            if ref_lower in deprecated_fields:
+                if not any(m["field"] == ref for m in mismatches):
+                    mismatches.append({
+                        "field": ref,
+                        "issue": "deprecated",
+                        "suggestion": deprecated_fields[ref_lower],
+                        "message": f"字段 '{ref}' 已废弃，{deprecated_fields[ref_lower]}",
+                    })
+                    suggestions.append(f"更新 '{ref}' 引用为 {deprecated_fields[ref_lower]}")
+
+            # 如果提供了 schema，检查字段是否存在
+            if schema and ref_lower not in schema and ref not in schema:
+                # 尝试找最接近的字段名
+                closest = RuleEngine._find_closest_field(ref_lower, schema)
+                if closest:
+                    mismatches.append({
+                        "field": ref,
+                        "issue": "not_in_schema",
+                        "closest_match": closest,
+                        "message": f"字段 '{ref}' 不在 schema 中，最接近的是 '{closest}'",
+                    })
+                    suggestions.append(f"将 '{ref}' 改为 '{closest}'")
+
+        return {
+            "mismatches": mismatches,
+            "suggestions": suggestions,
+            "has_issues": len(mismatches) > 0,
+        }
+
+    @staticmethod
+    def _find_closest_field(field: str, schema: Dict[str, Any]) -> Optional[str]:
+        """在 schema 中找最接近的字段名（基于 Levenshtein 距离）。"""
+        candidates = []
+        field_lower = field.lower()
+        for key in schema.keys():
+            key_lower = key.lower()
+            if field_lower == key_lower:
+                return key
+            # 简单相似度检查：开头相同 或 包含关系
+            if key_lower.startswith(field_lower[:3]) or field_lower.startswith(key_lower[:3]):
+                candidates.append(key)
+        return candidates[0] if len(candidates) == 1 else (candidates[0] if candidates else None)
 
 
 class LogicFixer:
@@ -357,7 +684,178 @@ class LogicFixer:
 
         return anomalies
 
+    # ── 规则驱动修复 ──────────────────────────────────────────────
+
+    def can_fix_by_rules(self, diagnosis: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """检查问题是否可以 100% 通过纯规则修复，无需 LLM。
+
+        根据 diagnosis 中的信息尝试匹配已知规则模式。
+        如果匹配成功，返回 (True, fix_payload, rule_name)。
+        如果无法被规则覆盖，返回 (False, None, None)。
+
+        Args:
+            diagnosis: 诊断信息，可能包含:
+                - anomaly_type (str): 异常类型
+                - evidence (dict): 证据数据
+                - code_snippet (str): 相关代码片段
+                - params (dict): 参数值
+                - affected_files (list): 受影响文件
+                - error_message (str): 错误消息
+
+        Returns:
+            (can_fix, fix_payload, rule_name) 三元组
+        """
+        anomaly_type = diagnosis.get("anomaly_type", "")
+        evidence = diagnosis.get("evidence", {})
+        code_snippet = diagnosis.get("code_snippet", "")
+        error_message = diagnosis.get("error_message", "")
+
+        # Rule 1: 评分计算Bug
+        if anomaly_type == "extreme_negative_contribution" or code_snippet or error_message:
+            result = RuleEngine.check_score_calculation_bug({
+                "code_snippet": code_snippet,
+                "error_message": error_message,
+                "agent_name": diagnosis.get("affected_agent", ""),
+            })
+            if result.get("matched"):
+                fix_payload = {
+                    "method": "rule_direct_fix",
+                    "rule_name": result["pattern_name"],
+                    "description": result["description"],
+                    "changes": [{
+                        "type": "modify",
+                        "location": diagnosis.get("affected_agent", "unknown"),
+                        "before": "当前评分逻辑（存在计算方向或范围 Bug）",
+                        "after": result["fix_hint"],
+                        "reason": f"规则引擎检测到已知 Bug 模式: {result['pattern_name']}",
+                    }],
+                    "patched_code": (
+                        f"# [LogicFixer/RuleEngine] 自动修复: {result['pattern_name']}\n"
+                        f"# {result['description']}\n"
+                        f"# 修复指引: {result['fix_hint']}\n"
+                    ),
+                    "test_needed": True,
+                    "confidence": result["confidence"],
+                }
+                return (True, fix_payload, result["pattern_name"])
+
+        # Rule 2: 权重归一化
+        params = diagnosis.get("params", {})
+        if params:
+            norm_check = RuleEngine.check_weight_normalization(params)
+            if not norm_check["all_normalized"]:
+                fix_payload = {
+                    "method": "rule_direct_fix",
+                    "rule_name": "weight_normalization",
+                    "description": "权重组 Σ != 1.0，自动归一化",
+                    "changes": [
+                        {
+                            "type": "modify",
+                            "location": v["group"],
+                            "before": f"Σ={v['total']:.4f}（未归一化）",
+                            "after": "归一化到 Σ=1.0",
+                            "reason": f"权重组 {v['group']} 和为 {v['total']:.4f}，需归一化",
+                        }
+                        for v in norm_check.get("violations", [])
+                    ],
+                    "patched_code": (
+                        "# [LogicFixer/RuleEngine] 权重自动归一化\n"
+                        + norm_check.get("fix_suggestion", "")
+                    ),
+                    "test_needed": True,
+                    "confidence": 0.95,
+                    "normalized_params": {
+                        v["group"]: {
+                            k: w / v["total"] for k, w in v["weights"].items()
+                        }
+                        for v in norm_check.get("violations", [])
+                    },
+                }
+                return (True, fix_payload, "weight_normalization")
+
+        # Rule 3: 阈值一致性
+        rules = diagnosis.get("rules", diagnosis.get("thresholds", []))
+        if rules:
+            threshold_check = RuleEngine.check_threshold_consistency(rules)
+            if not threshold_check["consistent"]:
+                fix_payload = {
+                    "method": "rule_direct_fix",
+                    "rule_name": "threshold_consistency",
+                    "description": "检测到阈值逻辑不一致",
+                    "changes": [
+                        {"type": "modify", "location": "threshold_config",
+                         "before": str(gap),
+                         "after": "修正后的阈值",
+                         "reason": gap.get("message", "")}
+                        for gap in threshold_check.get("gaps", []) + threshold_check.get("overlaps", [])
+                    ],
+                    "patched_code": (
+                        "# [LogicFixer/RuleEngine] 阈值一致性修复\n"
+                        + "\n".join(threshold_check.get("fix_suggestions", []))
+                    ),
+                    "test_needed": True,
+                    "confidence": 0.88,
+                }
+                return (True, fix_payload, "threshold_consistency")
+
+        # Rule 4: 数据字段不匹配
+        code_refs = diagnosis.get("code_refs", diagnosis.get("field_refs", []))
+        schema = diagnosis.get("schema", diagnosis.get("data_schema"))
+        if code_refs:
+            mismatch_check = RuleEngine.check_data_field_mismatch(code_refs, schema)
+            if mismatch_check.get("has_issues"):
+                fix_payload = {
+                    "method": "rule_direct_fix",
+                    "rule_name": "data_field_mismatch",
+                    "description": "检测到代码引用的字段名可能有问题",
+                    "changes": [
+                        {"type": "modify",
+                         "location": m.get("field", "unknown"),
+                         "before": m.get("field", ""),
+                         "after": m.get("suggested_fix", m.get("closest_match", "")),
+                         "reason": m.get("message", "")}
+                        for m in mismatch_check.get("mismatches", [])
+                    ],
+                    "patched_code": (
+                        "# [LogicFixer/RuleEngine] 字段名修复\n"
+                        + "\n".join(mismatch_check.get("suggestions", []))
+                    ),
+                    "test_needed": True,
+                    "confidence": 0.82,
+                }
+                return (True, fix_payload, "data_field_mismatch")
+
+        # 无法被已知规则覆盖
+        return (False, None, None)
+
     # ── 修复生成 ───────────────────────────────────────────────────
+
+    def fix(self, diagnosis: Dict[str, Any], source_code: str = "") -> Dict[str, Any]:
+        """主修复入口 — 先尝试规则驱动修复，失败才回退到模板生成。
+
+        流程：
+          1. 调用 can_fix_by_rules() 检查是否可被规则覆盖
+          2. 如果可以 → 直接返回规则修复结果（确定性、快速）
+          3. 如果不行 → 调用 generate_fix() 生成 LLM 模板
+
+        Args:
+            diagnosis: 诊断信息字典，格式与 can_fix_by_rules 相同
+            source_code: 受影响模块的源代码
+
+        Returns:
+            同 generate_fix() 的返回格式
+        """
+        can_fix, fix_payload, rule_name = self.can_fix_by_rules(diagnosis)
+        if can_fix and fix_payload is not None:
+            fix_payload["fix_source"] = "rule_engine"
+            fix_payload["rule_name"] = rule_name
+            return fix_payload
+
+        # 规则不覆盖，回退到 LLM 模板生成
+        anomaly = diagnosis.get("anomaly", diagnosis)
+        result = self.generate_fix(anomaly, source_code)
+        result["fix_source"] = "template_based"
+        return result
 
     def generate_fix(
         self,
@@ -377,6 +875,17 @@ class LogicFixer:
                 "test_needed": bool,
             }
         """
+        # 先检查规则引擎是否能处理
+        diagnosis = {"anomaly": anomaly, "anomaly_type": anomaly.get("anomaly_type", ""),
+                     "evidence": anomaly.get("evidence", {}),
+                     "affected_agent": anomaly.get("affected_agent", "")}
+        can_fix, fix_payload, rule_name = self.can_fix_by_rules(diagnosis)
+        if can_fix and fix_payload is not None:
+            fix_payload["fix_source"] = "rule_engine"
+            fix_payload["rule_name"] = rule_name
+            return fix_payload
+
+        # 规则不覆盖，使用模板生成
         anomaly_type = anomaly.get("anomaly_type", "")
         affected_agent = anomaly.get("affected_agent", "")
 

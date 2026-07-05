@@ -157,6 +157,17 @@ class ReportWriterAgent:
         """
         user_prompt = self._build_batch_report_prompt(batch_data)
         report_text = self._call_llm(REPORT_SYSTEM_PROMPT, user_prompt)
+
+        # Run self-consistency verification
+        verification_note = self.verify_with_self_consistency(
+            system_prompt=REPORT_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            primary_output=report_text,
+            source_data=batch_data,
+        )
+        if verification_note:
+            report_text = report_text + verification_note
+
         return self._verify_and_wrap(report_text, batch_data)
 
     def _build_batch_report_prompt(self, batch_data: dict) -> str:
@@ -226,6 +237,156 @@ class ReportWriterAgent:
 
         return "\n".join(parts)
 
+    # ──────────────── Self-Consistency Verification ────────────────
+
+    def verify_with_self_consistency(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        primary_output: str,
+        source_data: dict,
+        num_runs: int = 2,
+    ) -> str:
+        """运行自一致性验证：用不同温度/种子重复生成，比较结论差异。
+
+        在报告生成后调用，不阻塞报告输出。比较两次LLM运行的核心结论，
+        如果发现显著差异，追加验证说明到报告末尾。
+
+        Args:
+            system_prompt: 系统prompt
+            user_prompt: 用户prompt
+            primary_output: 第一次运行的输出文本
+            source_data: 源数据（用于日志记录）
+            num_runs: 重复运行次数（默认2，含第一次）
+
+        Returns:
+            str: 验证说明文本（追加到报告末尾），如无差异或验证失败则返回空字符串
+        """
+        if num_runs < 2:
+            return ""
+
+        try:
+            # Second run with higher temperature to test stability
+            secondary_output = self._call_llm(
+                system_prompt, user_prompt,
+                temperature=0.5,  # Higher temp for diversity
+                max_tokens=16000,
+            )
+
+            if not secondary_output or len(secondary_output) < 50:
+                logger.warning("Self-consistency: secondary run returned empty or too short")
+                return ""
+
+            # Compare key conclusions between primary and secondary
+            discrepancies = self._compare_report_conclusions(
+                primary_output, secondary_output
+            )
+
+            if not discrepancies:
+                verification_note = (
+                    "\n\n---\n"
+                    "**自一致性验证** [数据]: "
+                    "报告核心结论经二次生成验证，结论一致。"
+                    "验证方法：相同输入，不同温度参数（T=0.3 vs T=0.5），"
+                    "比较两次生成的核心判断。"
+                    "\n---\n"
+                )
+                logger.info("Self-consistency verification: conclusions consistent")
+                return verification_note
+
+            # Build discrepancy note
+            note_parts = [
+                "\n\n---\n",
+                "**自一致性验证** [判断]: ",
+                "报告经二次生成验证，发现以下结论差异，请谨慎参考：\n",
+            ]
+            for i, disc in enumerate(discrepancies, 1):
+                note_parts.append(f"{i}. {disc}\n")
+
+            note_parts.append(
+                "\n[数据] 验证方法：相同输入，不同温度参数（T=0.3 vs T=0.5），"
+                "比较两次生成的核心判断。差异可能源于LLM的非确定性。\n"
+                "---\n"
+            )
+            logger.warning(
+                f"Self-consistency verification: {len(discrepancies)} discrepancies found"
+            )
+            return "".join(note_parts)
+
+        except Exception as e:
+            logger.warning(f"Self-consistency verification failed: {e}")
+            return (
+                "\n\n---\n"
+                "**自一致性验证** [数据]: 验证过程异常，跳过二次生成比较。"
+                "\n---\n"
+            )
+
+    def _compare_report_conclusions(
+        self, primary: str, secondary: str
+    ) -> List[str]:
+        """比较两次报告的核心结论，返回差异列表。
+
+        检查维度：
+        1. 评分方向（正面/负面）是否一致
+        2. 识别的最佳/最差线路是否一致
+        3. 核心建议方向是否一致
+
+        Args:
+            primary: 第一次生成的报告文本
+            secondary: 第二次生成的报告文本
+
+        Returns:
+            List[str]: 差异描述列表，空列表表示一致
+        """
+        import re
+        discrepancies = []
+
+        # Extract "best line" mentions
+        best_pattern = re.compile(r'最佳[线路].*?[：:]\s*(\S+)')
+        worst_pattern = re.compile(r'最差[线路].*?[：:]\s*(\S+)')
+
+        primary_best = best_pattern.findall(primary)
+        secondary_best = best_pattern.findall(secondary)
+        primary_worst = worst_pattern.findall(primary)
+        secondary_worst = worst_pattern.findall(secondary)
+
+        # Compare best line
+        if primary_best and secondary_best:
+            if primary_best[0] != secondary_best[0]:
+                discrepancies.append(
+                    f"最佳线路识别差异：首次={primary_best[0]}, 二次={secondary_best[0]}"
+                )
+
+        # Compare worst line
+        if primary_worst and secondary_worst:
+            if primary_worst[0] != secondary_worst[0]:
+                discrepancies.append(
+                    f"最差线路识别差异：首次={primary_worst[0]}, 二次={secondary_worst[0]}"
+                )
+
+        # Compare overall sentiment direction
+        positive_keywords = ['积极', '正面', '向好', '改善', '优秀', '良好']
+        negative_keywords = ['负面', '恶化', '风险', '问题', '不足', '需关注']
+
+        def sentiment_score(text: str) -> float:
+            pos = sum(text.count(kw) for kw in positive_keywords)
+            neg = sum(text.count(kw) for kw in negative_keywords)
+            total = pos + neg
+            return pos / max(total, 1) if total > 0 else 0.5
+
+        primary_sentiment = sentiment_score(primary)
+        secondary_sentiment = sentiment_score(secondary)
+
+        if abs(primary_sentiment - secondary_sentiment) > 0.3:
+            direction = "偏正面" if primary_sentiment > 0.5 else "偏负面"
+            dir2 = "偏正面" if secondary_sentiment > 0.5 else "偏负面"
+            discrepancies.append(
+                f"整体判断基调差异：首次={direction}, 二次={dir2} "
+                f"(正面词占比: {primary_sentiment:.2f} vs {secondary_sentiment:.2f})"
+            )
+
+        return discrepancies
+
     # ───────────────────── Agent Contribution Report ─────────────────────
 
     def write_agent_contribution_report(self, contribution_data: dict) -> ReportOutput:
@@ -241,6 +402,17 @@ class ReportWriterAgent:
         """
         user_prompt = self._build_contribution_report_prompt(contribution_data)
         report_text = self._call_llm(REPORT_SYSTEM_PROMPT, user_prompt)
+
+        # Run self-consistency verification
+        verification_note = self.verify_with_self_consistency(
+            system_prompt=REPORT_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            primary_output=report_text,
+            source_data=contribution_data,
+        )
+        if verification_note:
+            report_text = report_text + verification_note
+
         return self._verify_and_wrap(report_text, contribution_data)
 
     def _build_contribution_report_prompt(self, data: dict) -> str:
@@ -320,6 +492,17 @@ class ReportWriterAgent:
 
         user_prompt = self._build_optimization_prompt(loss_data, contribution_data)
         report_text = self._call_llm(REPORT_SYSTEM_PROMPT, user_prompt)
+
+        # Run self-consistency verification
+        verification_note = self.verify_with_self_consistency(
+            system_prompt=REPORT_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            primary_output=report_text,
+            source_data=source_data,
+        )
+        if verification_note:
+            report_text = report_text + verification_note
+
         return self._verify_and_wrap(report_text, source_data)
 
     def _build_optimization_prompt(self, loss_data: dict,

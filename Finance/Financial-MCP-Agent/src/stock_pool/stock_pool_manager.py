@@ -110,16 +110,24 @@ class StockPoolManager:
             logger.info(f"{SUCCESS_ICON} 股票池已从旧格式迁移: {len(old_stocks)} 只股票 → 3个独立池")
             self._save()
 
+    @staticmethod
+    def _is_bad_name(name: str, stock_code: str) -> bool:
+        """检测 company_name 是否为无效占位（股票代码本身或空）"""
+        if not name:
+            return True
+        bare = stock_code.replace("sh.", "").replace("sz.", "")
+        return name == stock_code or name == bare
+
     def _migrate_to_fine(self):
         """将 short/medium/long 三池股票合并到 fine（精筛）池，去重，保留已有评分"""
         fine_stocks = self.pools["fine"]["stocks"]
         migrated = 0
         updated = 0
+        name_fixed = 0
 
         for src_term in ("short", "medium", "long"):
             for code, stock in self.pools[src_term]["stocks"].items():
                 if code in fine_stocks:
-                    # 合并评分：更新已有条目的对应期限评分
                     existing = fine_stocks[code]
                     if "scores" not in existing:
                         existing["scores"] = {}
@@ -133,8 +141,11 @@ class StockPoolManager:
                             "suggested_action": ts.get("suggested_action", ""),
                         }
                         updated += 1
-                    if stock.get("company_name") and not existing.get("company_name"):
-                        existing["company_name"] = stock["company_name"]
+                    src_name = stock.get("company_name", "")
+                    existing_name = existing.get("company_name", "")
+                    if src_name and self._is_bad_name(existing_name, code) and not self._is_bad_name(src_name, code):
+                        existing["company_name"] = src_name
+                        name_fixed += 1
                     existing["last_updated"] = stock.get("last_updated") or existing.get("last_updated", "")
                     if stock.get("status") == "scored":
                         existing["status"] = "scored"
@@ -159,8 +170,8 @@ class StockPoolManager:
                     fine_stocks[code] = entry
                     migrated += 1
 
-        if migrated > 0 or updated > 0:
-            logger.info(f"{SUCCESS_ICON} 精筛池迁移完成: 新{migrated}只, 更新{updated}只")
+        if migrated > 0 or updated > 0 or name_fixed > 0:
+            logger.info(f"{SUCCESS_ICON} 精筛池迁移完成: 新{migrated}只, 更新{updated}只, 名称修复{name_fixed}只")
             self._save()
 
     # ─── 精筛池专用操作 ───
@@ -209,18 +220,22 @@ class StockPoolManager:
         """获取精筛池中某股票"""
         return self.pools["fine"]["stocks"].get(stock_code)
 
-    def update_fine_scores(self, stock_code: str, scores_data: Dict[str, Any]):
+    def update_fine_scores(self, stock_code: str, scores_data: Dict[str, Any],
+                           company_name: str = ""):
         """一次性更新精筛池三期限评分
 
         Args:
             stock_code: 股票代码
             scores_data: {short_term_score: {...}, medium_term_score: {...}, long_term_score: {...}}
+            company_name: 公司名称（可选，用于修复缺失名称）
         """
         if stock_code not in self.pools["fine"]["stocks"]:
             logger.warning(f"{stock_code} 不在精筛池中")
             return
 
         stock = self.pools["fine"]["stocks"][stock_code]
+        if company_name and self._is_bad_name(stock.get("company_name", ""), stock_code):
+            stock["company_name"] = company_name
         term_map = {"short": "short_term_score", "medium": "medium_term_score", "long": "long_term_score"}
 
         for term, key in term_map.items():
@@ -380,6 +395,8 @@ class StockPoolManager:
         """
         更新股票评分（CLI 兼容：写入所有三个池的评分）
 
+        股票不在任何 term 池时自动添加到所有三个 term。
+
         Args:
             stock_code: 股票代码
             score_data: 包含 score, recommendation, short_term_score,
@@ -391,10 +408,22 @@ class StockPoolManager:
             "long": score_data.get("long_term_score", {}),
         }
 
+        new_company_name = score_data.get("company_name", "")
+
+        exists_in_any = any(
+            stock_code in self.pools[term]["stocks"]
+            for term in ("short", "medium", "long")
+        )
+        if not exists_in_any and new_company_name:
+            for term in ("short", "medium", "long"):
+                self.add_stock_to_term(term, stock_code, new_company_name)
+
         for term in ("short", "medium", "long"):
             ts = term_scores[term]
             if stock_code in self.pools[term]["stocks"]:
                 stock = self.pools[term]["stocks"][stock_code]
+                if new_company_name and self._is_bad_name(stock.get("company_name", ""), stock_code):
+                    stock["company_name"] = new_company_name
                 if stock["score"] is not None:
                     stock["score_history"].append({
                         "score": stock["score"],
@@ -406,6 +435,11 @@ class StockPoolManager:
                 stock["term_score"] = ts
                 stock["last_updated"] = datetime.now().isoformat()
                 stock["status"] = score_data.get("status", "scored")
+
+        if new_company_name and stock_code in self.pools.get("fine", {}).get("stocks", {}):
+            fine_stock = self.pools["fine"]["stocks"][stock_code]
+            if self._is_bad_name(fine_stock.get("company_name", ""), stock_code):
+                fine_stock["company_name"] = new_company_name
 
         self._save()
         main_score = score_data.get("score")

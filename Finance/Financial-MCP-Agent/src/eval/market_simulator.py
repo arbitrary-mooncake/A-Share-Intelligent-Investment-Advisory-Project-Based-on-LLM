@@ -2,9 +2,13 @@
 市场仿真层 — 模拟盘与回测共用基础设施。
 统一处理所有A股交易现实约束：佣金、印花税、滑点、成交量约束、涨跌停、停牌、T+1。
 """
+import logging
+import random
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class OrderStatus(Enum):
@@ -114,6 +118,9 @@ class MarketSimulator:
     LIMIT_RATIO_GEM = 0.20         # 创业板/科创板 ±20%
     LIMIT_RATIO_BSE = 0.30         # 北交所 ±30%
 
+    # ── 涨停触板未封成交概率 ──
+    LIMIT_UP_TOUCH_FILL_PROBABILITY = 0.5  # 盘中触及涨停但未封板时，买入成交概率50%
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """可从config覆盖默认参数"""
         if config:
@@ -121,6 +128,9 @@ class MarketSimulator:
             self.MIN_COMMISSION = config.get("min_commission", self.MIN_COMMISSION)
             self.SLIPPAGE_BASE = config.get("slippage_base", self.SLIPPAGE_BASE)
             self.MAX_SINGLE_ORDER_RATIO = config.get("max_single_order_ratio", self.MAX_SINGLE_ORDER_RATIO)
+            self.LIMIT_UP_TOUCH_FILL_PROBABILITY = config.get(
+                "limit_up_touch_fill_probability", self.LIMIT_UP_TOUCH_FILL_PROBABILITY
+            )
 
         # 日内追踪（用于T+1和单日累计约束）
         self._daily_bought: Dict[str, float] = {}       # stock_code -> 当日买入金额
@@ -155,10 +165,38 @@ class MarketSimulator:
         return self.SLIPPAGE_BASE
 
     def _check_limit(self, order: Order, market_data: MarketData) -> Optional[str]:
-        """检查涨跌停，返回拒绝原因或None"""
+        """检查涨跌停，返回拒绝原因或None
+
+        涨停买入规则：
+          - 收盘封涨停（close == limit_up_price）→ 拒绝（无法买入）
+          - 盘中触及涨停但未封板（high >= limit_up_price, close < limit_up_price）
+            → 50%概率成交（模拟盘中排板买入的可能性）
+        """
         if order.direction == "buy" and market_data.is_limit_up:
-            # 盘中触及涨停但未封板 → 50%概率成交（简化处理：直接拒绝）
-            return RejectReason.LIMIT_UP.value
+            limit_ratio = self._get_limit_ratio(order.stock_code)
+            if market_data.pre_close <= 0:
+                # 数据异常：无法计算涨停价，直接拒绝
+                return RejectReason.LIMIT_UP.value
+            limit_up_price = round(market_data.pre_close * (1 + limit_ratio), 2)
+
+            if market_data.close < limit_up_price:
+                # 盘中触及涨停但未封板 → 50%概率成交
+                if random.random() < self.LIMIT_UP_TOUCH_FILL_PROBABILITY:
+                    logger.info(
+                        "涨停触板未封: %s, 概率成交判定: 成交 (收盘%.2f < 涨停价%.2f)",
+                        order.stock_code, market_data.close, limit_up_price
+                    )
+                    return None  # 允许成交（后续在execute_order中以涨停价执行）
+                else:
+                    logger.info(
+                        "涨停触板未封: %s, 概率成交判定: 拒绝 (收盘%.2f < 涨停价%.2f)",
+                        order.stock_code, market_data.close, limit_up_price
+                    )
+                    return RejectReason.LIMIT_UP.value
+            else:
+                # 收盘封涨停 → 无法买入
+                return RejectReason.LIMIT_UP.value
+
         if order.direction == "sell" and market_data.is_limit_down:
             return RejectReason.LIMIT_DOWN.value
         return None
@@ -167,17 +205,6 @@ class MarketSimulator:
         """检查停牌"""
         if market_data.is_suspended:
             return RejectReason.SUSPENDED.value
-        return None
-
-    def _check_volume(self, order: Order, market_data: MarketData) -> Optional[str]:
-        """检查成交量约束"""
-        if market_data.amount <= 0:
-            return None  # 数据缺失时放行
-        max_single = market_data.amount * self.MAX_SINGLE_ORDER_RATIO
-        daily_bought = self._daily_bought.get(order.stock_code, 0)
-        remaining = market_data.amount * self.MAX_DAILY_BUY_RATIO - daily_bought
-        if order.target_value > min(max_single, remaining):
-            return RejectReason.LIQUIDITY.value
         return None
 
     def _check_t1(self, order: Order) -> Optional[str]:
@@ -250,6 +277,14 @@ class MarketSimulator:
             result.actual_price = base_price * (1 + slippage)
         else:
             result.actual_price = base_price * (1 - slippage)
+
+        # 4.5 涨停触板未封：以涨停价执行（盘中排板买入的唯一价格）
+        if (order.direction == "buy" and market_data.is_limit_up
+                and market_data.pre_close > 0):
+            limit_ratio = self._get_limit_ratio(order.stock_code)
+            limit_up_price = round(market_data.pre_close * (1 + limit_ratio), 2)
+            if market_data.close < limit_up_price:
+                result.actual_price = limit_up_price
 
         # 价格有效性检查
         if result.actual_price <= 0:

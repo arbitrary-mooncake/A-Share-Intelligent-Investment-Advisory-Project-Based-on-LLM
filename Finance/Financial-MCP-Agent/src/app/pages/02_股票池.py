@@ -112,6 +112,8 @@ for tk in TERM_KEYS:
         ("_action_result", None), ("_action_error", None),
         ("_selected", None), ("_page", 0), ("_page_size", 20),
         ("_confirm_delete", False),
+        ("_sort_term", ""), ("_sort_order", ""), ("_sort_active", False),
+        ("_search_query", ""),
     ]:
         k = f"_pool{s}_{tk}"
         if k not in st.session_state:
@@ -292,6 +294,63 @@ for tab, tk in zip(tabs, TERM_KEYS):
         )
         st.markdown("---")
 
+        # ── 搜索 + 排序工具栏 ──
+        _term_labels = ["选择期限", "短线", "中线", "长线"]
+        _term_values = ["", "short", "medium", "long"]
+        _order_labels = ["选择排序", "降序（高→低）", "升序（低→高）"]
+        _order_values = ["", "desc", "asc"]
+
+        toolbar_cols = st.columns([2.5, 1.8, 1.8, 1, 1])
+        with toolbar_cols[0]:
+            search_q = st.text_input(
+                "搜索",
+                value=st.session_state[_rk(tk, "_search_query")],
+                placeholder="🔍 输入名称或代码搜索...",
+                key=f"_search_input_{tk}",
+                label_visibility="collapsed",
+            )
+            if search_q != st.session_state[_rk(tk, "_search_query")]:
+                st.session_state[_rk(tk, "_search_query")] = search_q
+                if search_q:
+                    st.session_state[_rk(tk, "_page")] = 0
+                st.rerun()
+        with toolbar_cols[1]:
+            _cur_term_idx = _term_values.index(st.session_state[_rk(tk, "_sort_term")]) \
+                if st.session_state[_rk(tk, "_sort_term")] in _term_values else 0
+            _draft_term = st.selectbox(
+                "期限", _term_labels, index=_cur_term_idx,
+                key=f"_sort_term_sel_{tk}", label_visibility="collapsed",
+            )
+        with toolbar_cols[2]:
+            _cur_order_idx = _order_values.index(st.session_state[_rk(tk, "_sort_order")]) \
+                if st.session_state[_rk(tk, "_sort_order")] in _order_values else 0
+            _draft_order = st.selectbox(
+                "排序", _order_labels, index=_cur_order_idx,
+                key=f"_sort_order_sel_{tk}", label_visibility="collapsed",
+            )
+        with toolbar_cols[3]:
+            _draft_term_val = _term_values[_term_labels.index(_draft_term)]
+            _draft_order_val = _order_values[_order_labels.index(_draft_order)]
+            _can_sort = bool(_draft_term_val and _draft_order_val)
+            if st.button("确定排序", key=f"_sort_confirm_{tk}",
+                         disabled=not _can_sort, use_container_width=True):
+                st.session_state[_rk(tk, "_sort_term")] = _draft_term_val
+                st.session_state[_rk(tk, "_sort_order")] = _draft_order_val
+                st.session_state[_rk(tk, "_sort_active")] = True
+                st.session_state[_rk(tk, "_page")] = 0
+                st.rerun()
+        with toolbar_cols[4]:
+            _has_filter = search_q or st.session_state[_rk(tk, "_sort_active")]
+            if _has_filter:
+                if st.button("✕ 重置", key=f"_toolbar_reset_{tk}",
+                             use_container_width=True):
+                    st.session_state[_rk(tk, "_search_query")] = ""
+                    st.session_state[_rk(tk, "_sort_term")] = ""
+                    st.session_state[_rk(tk, "_sort_order")] = ""
+                    st.session_state[_rk(tk, "_sort_active")] = False
+                    st.session_state[_rk(tk, "_page")] = 0
+                    st.rerun()
+
         # 加载分数
         if tk == "quick_screen":
             qs = st.session_state["_pool_scores_quick"]
@@ -307,10 +366,20 @@ for tab, tk in zip(tabs, TERM_KEYS):
         # 构建展示数据
         if tk == "quick_screen":
             qs = st.session_state["_pool_scores_quick"]
-            d_stocks = [{"stock_code": s.get("stock_code", ""),
-                          "company_name": s.get("company_name", ""),
-                          "scores": qs.get(s.get("stock_code", ""), {})}
-                        for s in stocks]
+            d_stocks = []
+            for s in stocks:
+                code = s.get("stock_code", "")
+                scores = qs.get(code, {})
+                # 取最近的打分时间（精确到天）
+                _times = [scores[t].get("score_time", "") for t in ("short", "medium", "long")
+                          if scores.get(t, {}).get("score_time")]
+                _latest = max(_times) if _times else ""
+                d_stocks.append({
+                    "stock_code": code,
+                    "company_name": s.get("company_name", ""),
+                    "scores": scores,
+                    "last_updated": _latest,
+                })
         else:
             # 精筛池：直接从后端数据读取三期限评分
             d_stocks = []
@@ -329,6 +398,49 @@ for tab, tk in zip(tabs, TERM_KEYS):
                     "last_updated": s.get("last_updated", ""),
                     "status": s.get("status", "pending"),
                 })
+
+        # ── 搜索过滤 ──
+        _sq = st.session_state[_rk(tk, "_search_query")].strip().lower()
+        if _sq:
+            d_stocks = [
+                s for s in d_stocks
+                if _sq in s.get("company_name", "").lower()
+                or _sq in s.get("stock_code", "").lower()
+                or _sq in s.get("stock_code", "").replace("sh.", "").replace("sz.", "")
+            ]
+            # 搜索时自动选中第一个匹配项并跳转到对应页
+            if d_stocks and not st.session_state.get(_rk(tk, "_selected")):
+                _match_code = d_stocks[0]["stock_code"]
+                st.session_state[_rk(tk, "_selected")] = _match_code
+                # 计算匹配项在未排序列表中的位置以跳转页码
+                _full_codes = [s.get("stock_code", "") for s in (
+                    [{"stock_code": s.get("stock_code", "")} for s in stocks]
+                )]
+                if _match_code in _full_codes:
+                    _match_idx = _full_codes.index(_match_code)
+                    _ps = st.session_state.get(_rk(tk, "_page_size"), 20)
+                    st.session_state[_rk(tk, "_page")] = _match_idx // _ps
+
+        # ── 排序 ──
+        _sort_active = st.session_state[_rk(tk, "_sort_active")]
+        _sf = st.session_state[_rk(tk, "_sort_term")]
+        _sort_order = st.session_state[_rk(tk, "_sort_order")]
+        if _sort_active and _sf and _sort_order:
+            _asc = (_sort_order == "asc")
+            # 降序 reverse=True → 用 -inf 让 null 排最后（reverse 后 -inf 变最大→末尾）
+            # 升序 reverse=False → 用 +inf 让 null 排最后（+inf 本身就是最大→末尾）
+            _null_sentinel = float("-inf") if not _asc else float("inf")
+
+            def _sort_key(s):
+                sc = s.get("scores", {}).get(_sf, {}).get("score")
+                if sc is None:
+                    return _null_sentinel
+                try:
+                    return float(sc)
+                except (ValueError, TypeError):
+                    return _null_sentinel
+
+            d_stocks = sorted(d_stocks, key=_sort_key, reverse=not _asc)
 
         # 选中状态
         sk = _rk(tk, "_selected")
@@ -396,6 +508,18 @@ for tab, tk in zip(tabs, TERM_KEYS):
         page = st.session_state.get(pk, 0)
         page_size = st.session_state.get(psk, 20)
 
+        # 搜索/排序状态提示
+        _status_parts = []
+        if _sq:
+            _total_before = len(st.session_state.get(f"_pool_data_{tk}", []))
+            _status_parts.append(f"搜索「{_sq}」匹配 {len(d_stocks)}/{_total_before} 只")
+        if _sort_active and _sf and _sort_order:
+            _dim_label = {"short": "短线", "medium": "中线", "long": "长线"}.get(_sf, _sf)
+            _dir_label = "升序" if _sort_order == "asc" else "降序"
+            _status_parts.append(f"按{_dim_label}分数{_dir_label}排列")
+        if _status_parts:
+            st.caption(" | ".join(_status_parts))
+
         if tk == "quick_screen":
             st.caption("点击列表行选中股票，在上方显示行中进行交互。使用 qwen3.6-flash 高速模型。")
             render_quick_list(d_stocks, tk, sel_code, lambda c: _on_select(tk, c), page, page_size)
@@ -404,7 +528,10 @@ for tab, tk in zip(tabs, TERM_KEYS):
             render_fine_pool_list(d_stocks, tk, sel_code, lambda c: _on_select(tk, c), page, page_size)
 
         if not d_stocks:
-            st.info("当前池为空，请添加股票")
+            if _sq:
+                st.info(f"未找到匹配「{_sq}」的股票")
+            else:
+                st.info("当前池为空，请添加股票")
 
         # ── 分页 ──
         np_, nps = render_pagination(tk, len(d_stocks), page, page_size)

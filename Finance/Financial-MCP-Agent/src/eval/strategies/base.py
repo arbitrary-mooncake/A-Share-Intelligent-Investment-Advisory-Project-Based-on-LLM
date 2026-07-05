@@ -22,8 +22,9 @@ class SellOrder:
 class BaseStrategy:
     """策略基类 — 所有交易策略继承此类"""
 
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(self, config: Dict[str, Any] = None, term: str = "short"):
         self.config = config or {}
+        self._term = term
         self._load_config()
 
     def _load_config(self):

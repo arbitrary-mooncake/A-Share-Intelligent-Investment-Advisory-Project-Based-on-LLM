@@ -1,5 +1,0 @@
-# Job state + worker logs are ephemeral; not version-controlled
-*.json
-*.log
-*.tmp
-!.gitkeep

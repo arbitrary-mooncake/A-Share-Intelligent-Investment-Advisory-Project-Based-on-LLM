@@ -6,8 +6,12 @@
   - 卖出：基本面恶化 + PE估值卖出 + 趋势破位3日确认 + 最大回撤
   - 跨期限协同：与长线score联动调整仓位上限
 """
+import logging
 from typing import Dict, Any, List, Optional
 from src.eval.strategies.base import BaseStrategy, BuyOrder, SellOrder
+from src.utils.cache_utils import read_signal_pack_cache
+
+logger = logging.getLogger(__name__)
 
 
 class MediumTermStrategy(BaseStrategy):
@@ -156,10 +160,60 @@ class MediumTermStrategy(BaseStrategy):
 
         return True, []
 
+    def _check_fundamental_health(self, stock_code: str, date_str: str) -> bool:
+        """检查基本面是否健康（用于越跌越买前置条件）。
+
+        读取 fundamental agent 的 signal_pack 缓存，
+        检查是否有盈利质量担忧或现金流背离等基本面恶化信号。
+        无缓存数据时保守处理：返回 False（跳过越跌越买）。
+
+        Args:
+            stock_code: 股票代码
+            date_str: 分析日期 YYYY-MM-DD
+
+        Returns:
+            True if fundamentals are healthy, False if concerns found or cache miss.
+        """
+        if not date_str:
+            logger.debug("无日期参数，跳过基本面健康检查")
+            return False
+
+        # 读取 fundamental agent 的 signal_pack 缓存
+        # 先尝试当前命名空间，若未命中则尝试另一个命名空间
+        signal_pack = None
+        try:
+            signal_pack = read_signal_pack_cache("fundamental", stock_code, date_str)
+        except Exception:
+            pass
+
+        if signal_pack is None:
+            logger.info(
+                "无基本面缓存数据，跳过越跌越买检查: %s @ %s",
+                stock_code, date_str
+            )
+            return False
+
+        risk_flags = signal_pack.get("risk_flags", [])
+        if not isinstance(risk_flags, list):
+            risk_flags = [str(risk_flags)]
+
+        concern_keywords = ("earnings_quality_concern", "cash_flow_divergence")
+        for flag in risk_flags:
+            flag_lower = str(flag).lower()
+            if any(kw in flag_lower for kw in concern_keywords):
+                logger.warning(
+                    "越跌越买跳过: %s 基本面恶化风险 (risk_flag=%s)",
+                    stock_code, flag
+                )
+                return False
+
+        return True
+
     # ── 选股 ──────────────────────────────────────────────────────────
 
     def select_stocks(self, pool, scores, holdings, cash, market_data_map=None,
-                      total_capital: float = 0.0, long_scores: Dict[str, float] = None):
+                      total_capital: float = 0.0, long_scores: Dict[str, float] = None,
+                      current_date: str = None):
         """中线选股：五维买入条件 + 四因子复合排序
 
         总纲 §5.4 排序公式：
@@ -278,10 +332,11 @@ class MediumTermStrategy(BaseStrategy):
                     orders.append(order)
 
             # SPEC: 越跌越买（有限）— score>70 且股价较建仓价跌>10%
-            # 前提：基本面没有恶化 (由调用方保证)
+            # 前提：基本面没有恶化（通过 fundamental signal_pack 缓存校验）
             build_price = self._build_prices.get(code)
             if (score > 70 and build_price and build_price > 0 and
-                    md.close > 0 and md.close < build_price * 0.90):
+                    md.close > 0 and md.close < build_price * 0.90 and
+                    self._check_fundamental_health(code, current_date)):
                 add_amount = total_capital * self.single_weight_limit * 0.30
                 if add_amount > total_capital * 0.005:
                     order = BuyOrder(code, add_amount, score)

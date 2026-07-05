@@ -94,6 +94,7 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
             if eval_ready:
                 status_box = st.status("四层管线初始化...", expanded=True)
                 progress_bar = st.progress(0, text="Layer 0 硬筛...")
+                cancel_col1, cancel_col2 = st.columns([1, 4])
                 from src.eval.job_manager import JobManager, JobStatus
                 jm = JobManager()
 
@@ -109,8 +110,24 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
 
                     st.session_state[f"pool_job_{pool_term}"] = job_id
 
+                    # ── Gap #23: 取消按钮（放在 while 循环外部，确保 Streamlit 能捕获点击）──
+                    cancel_key = f"cancel_pool_{pool_term}"
+                    with cancel_col1:
+                        if st.button("⏹ 取消", key=f"cancel_btn_pool_{pool_term}", use_container_width=True):
+                            st.session_state[cancel_key] = True
+                            st.rerun()
+
                     # 轮询进度
+                    cancelled = False
                     while True:
+                        # 检查取消请求（必须在循环顶部，绕过阻塞）
+                        if st.session_state.get(cancel_key):
+                            jm.cancel(job_id)
+                            st.session_state[cancel_key] = False
+                            status_box.update(label="更新已取消", state="complete")
+                            progress_bar.progress(100, text="已取消")
+                            st.warning("精筛池更新已被用户取消。")
+                            break
                         job = jm.poll(job_id)
                         if not job:
                             st.error("任务信息丢失")
@@ -140,11 +157,16 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
                                 f"共{job.get('progress', {}).get('result', {}).get('final_pool_size', 0)}只"
                             )
                             st.rerun()
-                        if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value):
-                            status_box.update(label="更新失败", state="error")
-                            st.error(job.get("error") or f"任务状态: {status}")
-                            with st.expander("📋 Worker 日志", expanded=False):
-                                st.code(jm.read_log(job_id, tail=200), language="log")
+                        if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value, JobStatus.CANCELLED.value):
+                            if status == JobStatus.CANCELLED.value:
+                                status_box.update(label="更新已取消", state="complete")
+                                progress_bar.progress(100, text="已取消")
+                                st.warning("精筛池更新已被用户取消。")
+                            else:
+                                status_box.update(label="更新失败", state="error")
+                                st.error(job.get("error") or f"任务状态: {status}")
+                                with st.expander("📋 Worker 日志", expanded=False):
+                                    st.code(jm.read_log(job_id, tail=200), language="log")
                             break
 
                         time.sleep(1.0)

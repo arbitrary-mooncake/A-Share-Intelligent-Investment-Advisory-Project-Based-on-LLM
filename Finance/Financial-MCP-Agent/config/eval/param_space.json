@@ -1,0 +1,208 @@
+{
+  "_description": "参数空间定义 — 自动参数优化器(param_tuner.py)的搜索空间。包含约40个参数，按类别分组。",
+  "_note": "constraint: sum_to_one 表示该组参数在扰动/采样后需归一化使 Σ=1.0。distribution: dirichlet 表示使用Dirichlet采样保持Σ=1.0。",
+  "_version": "1.0.0",
+
+  "scorer_weights": {
+    "_description": "评分器融合权重 — 每组7维，Σ必须=1.0",
+    "_constraint": "sum_to_one",
+
+    "short_term": {
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "_description": "短期评分器融合权重",
+      "parameters": {
+        "short_weight_technical": {"default": 0.25, "bounds": [0.10, 0.40], "type": "float", "step": 0.01},
+        "short_weight_volume": {"default": 0.20, "bounds": [0.05, 0.35], "type": "float", "step": 0.01},
+        "short_weight_capital": {"default": 0.20, "bounds": [0.05, 0.35], "type": "float", "step": 0.01},
+        "short_weight_event": {"default": 0.20, "bounds": [0.05, 0.35], "type": "float", "step": 0.01},
+        "short_weight_sentiment": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01},
+        "short_weight_industry": {"default": 0.00, "bounds": [0.00, 0.10], "type": "float", "step": 0.01},
+        "short_weight_quality": {"default": 0.00, "bounds": [0.00, 0.10], "type": "float", "step": 0.01}
+      }
+    },
+
+    "medium_term": {
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "_description": "中期评分器融合权重",
+      "parameters": {
+        "medium_weight_fundamental": {"default": 0.20, "bounds": [0.10, 0.35], "type": "float", "step": 0.01},
+        "medium_weight_valuation": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01},
+        "medium_weight_quality": {"default": 0.20, "bounds": [0.10, 0.35], "type": "float", "step": 0.01},
+        "medium_weight_event": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01},
+        "medium_weight_tech": {"default": 0.10, "bounds": [0.00, 0.25], "type": "float", "step": 0.01},
+        "medium_weight_industry": {"default": 0.10, "bounds": [0.00, 0.25], "type": "float", "step": 0.01},
+        "medium_weight_sentiment": {"default": 0.10, "bounds": [0.00, 0.25], "type": "float", "step": 0.01}
+      }
+    },
+
+    "long_term": {
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "_description": "长期评分器融合权重",
+      "parameters": {
+        "long_weight_returns": {"default": 0.25, "bounds": [0.10, 0.40], "type": "float", "step": 0.01},
+        "long_weight_quality": {"default": 0.20, "bounds": [0.10, 0.35], "type": "float", "step": 0.01},
+        "long_weight_valuation": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01},
+        "long_weight_moat": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01},
+        "long_weight_capital": {"default": 0.10, "bounds": [0.00, 0.25], "type": "float", "step": 0.01},
+        "long_weight_policy": {"default": 0.10, "bounds": [0.00, 0.25], "type": "float", "step": 0.01},
+        "long_weight_tech": {"default": 0.05, "bounds": [0.00, 0.20], "type": "float", "step": 0.01}
+      }
+    }
+  },
+
+  "loss_weights": {
+    "_description": "Loss计算权重 — 3层嵌套，每组 Σ必须=1.0",
+    "_constraint": "sum_to_one",
+
+    "total_loss": {
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "_description": "L_total = w_effect*L_effect + w_stability*L_stability + w_efficiency*L_efficiency",
+      "parameters": {
+        "loss_w_effect": {"default": 0.60, "bounds": [0.55, 0.85], "type": "float", "step": 0.01},
+        "loss_w_stability": {"default": 0.25, "bounds": [0.05, 0.30], "type": "float", "step": 0.01},
+        "loss_w_efficiency": {"default": 0.15, "bounds": [0.05, 0.25], "type": "float", "step": 0.01}
+      }
+    },
+
+    "effect_short": {
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "_description": "L_effect 短期子维度分解权重",
+      "parameters": {
+        "effect_short_w_return": {"default": 0.45, "bounds": [0.30, 0.60], "type": "float", "step": 0.01},
+        "effect_short_w_risk": {"default": 0.40, "bounds": [0.25, 0.55], "type": "float", "step": 0.01},
+        "effect_short_w_structure": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01}
+      }
+    },
+
+    "effect_medium": {
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "_description": "L_effect 中期子维度分解权重",
+      "parameters": {
+        "effect_medium_w_return": {"default": 0.50, "bounds": [0.35, 0.65], "type": "float", "step": 0.01},
+        "effect_medium_w_risk": {"default": 0.35, "bounds": [0.20, 0.50], "type": "float", "step": 0.01},
+        "effect_medium_w_structure": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01}
+      }
+    },
+
+    "effect_long": {
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "_description": "L_effect 长期子维度分解权重",
+      "parameters": {
+        "effect_long_w_return": {"default": 0.55, "bounds": [0.40, 0.70], "type": "float", "step": 0.01},
+        "effect_long_w_risk": {"default": 0.30, "bounds": [0.15, 0.45], "type": "float", "step": 0.01},
+        "effect_long_w_structure": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01}
+      }
+    },
+
+    "monitoring_modules": {
+      "_description": "4个监控模块权重的全局修正系数（从L_effect/L_stability中拆分），Σ=1.0",
+      "constraint": "sum_to_one",
+      "distribution": "dirichlet",
+      "parameters": {
+        "monitor_w_risk_gate": {"default": 0.25, "bounds": [0.00, 0.50], "type": "float", "step": 0.01},
+        "monitor_w_consistency": {"default": 0.25, "bounds": [0.00, 0.50], "type": "float", "step": 0.01},
+        "monitor_w_fidelity": {"default": 0.25, "bounds": [0.00, 0.50], "type": "float", "step": 0.01},
+        "monitor_w_eval_model_fidelity": {"default": 0.25, "bounds": [0.00, 0.50], "type": "float", "step": 0.01}
+      }
+    }
+  },
+
+  "term_weights": {
+    "_description": "跨期权重 — 用于组合短期/中期/长期收益为综合评分",
+    "constraint": "sum_to_one",
+    "distribution": "dirichlet",
+    "parameters": {
+      "term_w_short": {"default": 0.50, "bounds": [0.30, 0.70], "type": "float", "step": 0.01},
+      "term_w_medium": {"default": 0.30, "bounds": [0.15, 0.50], "type": "float", "step": 0.01},
+      "term_w_long": {"default": 0.20, "bounds": [0.05, 0.40], "type": "float", "step": 0.01}
+    }
+  },
+
+  "risk_gate_caps": {
+    "_description": "风险门控上限分数 — 触发对应风险标志时评分上限",
+    "_note": "独立参数，无Σ约束，每个参数独立采样",
+    "parameters": {
+      "gate_cap_audit_risk": {"default": 60, "bounds": [45, 75], "type": "int"},
+      "gate_cap_delist_risk": {"default": 50, "bounds": [35, 65], "type": "int"},
+      "gate_cap_fraud_penalty": {"default": 55, "bounds": [40, 70], "type": "int"},
+      "gate_cap_pledge_concern": {"default": 65, "bounds": [50, 80], "type": "int"},
+      "gate_cap_goodwill_concern": {"default": 60, "bounds": [45, 75], "type": "int"},
+      "gate_cap_news_only_narrative": {"default": 55, "bounds": [40, 70], "type": "int"},
+      "gate_cap_data_quality_low": {"default": 50, "bounds": [35, 65], "type": "int"},
+      "gate_cap_liquidity_short_term": {"default": 50, "bounds": [35, 65], "type": "int"}
+    }
+  },
+
+  "strategy_params": {
+    "_description": "交易策略参数 — 按期限分组，无Σ约束",
+
+    "short_term": {
+      "_description": "短期策略参数 (ShortAblationStrategy)",
+      "parameters": {
+        "strategy_short_max_positions": {"default": 5, "bounds": [3, 12], "type": "int"},
+        "strategy_short_score_buy_threshold": {"default": 65, "bounds": [50, 80], "type": "int"},
+        "strategy_short_single_weight_limit": {"default": 0.25, "bounds": [0.10, 0.40], "type": "float", "step": 0.01},
+        "strategy_short_stop_loss_pct": {"default": 0.08, "bounds": [0.03, 0.20], "type": "float", "step": 0.01},
+        "strategy_short_take_profit_pct": {"default": 0.15, "bounds": [0.05, 0.40], "type": "float", "step": 0.01},
+        "strategy_short_max_hold_days": {"default": 20, "bounds": [5, 40], "type": "int"}
+      }
+    },
+
+    "medium_term": {
+      "_description": "中期策略参数 (MediumTermStrategy)",
+      "parameters": {
+        "strategy_medium_max_positions": {"default": 8, "bounds": [4, 15], "type": "int"},
+        "strategy_medium_score_buy_threshold": {"default": 70, "bounds": [55, 85], "type": "int"},
+        "strategy_medium_single_weight_limit": {"default": 0.18, "bounds": [0.08, 0.30], "type": "float", "step": 0.01},
+        "strategy_medium_position_building_weeks": {"default": 4, "bounds": [2, 8], "type": "int"},
+        "strategy_medium_buy_more_dip_threshold": {"default": 0.10, "bounds": [0.05, 0.25], "type": "float", "step": 0.01},
+        "strategy_medium_buy_more_add_ratio": {"default": 0.30, "bounds": [0.10, 0.50], "type": "float", "step": 0.01},
+        "strategy_medium_stop_loss_pct": {"default": 0.12, "bounds": [0.05, 0.25], "type": "float", "step": 0.01},
+        "strategy_medium_ma_period": {"default": 60, "bounds": [20, 120], "type": "int"}
+      }
+    },
+
+    "long_term": {
+      "_description": "长期策略参数 (LongTermStrategy)",
+      "parameters": {
+        "strategy_long_max_positions": {"default": 12, "bounds": [5, 20], "type": "int"},
+        "strategy_long_score_buy_threshold": {"default": 75, "bounds": [60, 90], "type": "int"},
+        "strategy_long_single_weight_limit": {"default": 0.12, "bounds": [0.05, 0.25], "type": "float", "step": 0.01},
+        "strategy_long_max_drawdown_tolerance": {"default": 0.25, "bounds": [0.10, 0.40], "type": "float", "step": 0.01},
+        "strategy_long_position_building_months": {"default": 3, "bounds": [1, 6], "type": "int"},
+        "strategy_long_buy_more_dip_threshold": {"default": 0.15, "bounds": [0.05, 0.30], "type": "float", "step": 0.01},
+        "strategy_long_buy_more_add_ratio": {"default": 0.20, "bounds": [0.10, 0.40], "type": "float", "step": 0.01}
+      }
+    }
+  },
+
+  "hard_screen": {
+    "_description": "硬筛选参数 — Layer 0筛选门槛，无Σ约束",
+    "parameters": {
+      "hard_screen_min_daily_amount": {"default": 20000, "bounds": [10000, 50000], "type": "int", "_note": "单位：万(10000=1亿)"},
+      "hard_screen_min_list_days": {"default": 60, "bounds": [30, 180], "type": "int"},
+      "hard_screen_exclude_st": {"default": true, "bounds": null, "_note": "布尔值：是否排除ST股"},
+      "hard_screen_exclude_new_stocks": {"default": true, "bounds": null, "_note": "布尔值：是否排除次新股(上市不足min_list_days)"}
+    }
+  },
+
+  "_sum_to_one_groups": {
+    "_description": "所有 Σ=1.0 约束组的索引，供 param_tuner 快速查找。由 param_tuner._load_param_space() 自动构建。",
+    "scorer_weights.short_term": ["short_weight_technical", "short_weight_volume", "short_weight_capital", "short_weight_event", "short_weight_sentiment", "short_weight_industry", "short_weight_quality"],
+    "scorer_weights.medium_term": ["medium_weight_fundamental", "medium_weight_valuation", "medium_weight_quality", "medium_weight_event", "medium_weight_tech", "medium_weight_industry", "medium_weight_sentiment"],
+    "scorer_weights.long_term": ["long_weight_returns", "long_weight_quality", "long_weight_valuation", "long_weight_moat", "long_weight_capital", "long_weight_policy", "long_weight_tech"],
+    "loss_weights.total_loss": ["loss_w_effect", "loss_w_stability", "loss_w_efficiency"],
+    "loss_weights.effect_short": ["effect_short_w_return", "effect_short_w_risk", "effect_short_w_structure"],
+    "loss_weights.effect_medium": ["effect_medium_w_return", "effect_medium_w_risk", "effect_medium_w_structure"],
+    "loss_weights.effect_long": ["effect_long_w_return", "effect_long_w_risk", "effect_long_w_structure"],
+    "loss_weights.monitoring_modules": ["monitor_w_risk_gate", "monitor_w_consistency", "monitor_w_fidelity", "monitor_w_eval_model_fidelity"],
+    "term_weights": ["term_w_short", "term_w_medium", "term_w_long"]
+  }
+}

@@ -402,12 +402,31 @@ def _fetch_light_stock_data_sync(
     """获取单只股票的轻量数据: HTTP 实时行情 + K线 + Tushare 缓存合并。
 
     Tushare 数据在批量预取阶段已完成，此处仅做内存合并。
+    支持磁盘缓存: 命中时跳过 HTTP 请求 (fundamentals 7d, market_data 1d)。
     """
+    from src.utils.stock_data_cache import (
+        read_data_cache, write_data_cache,
+        split_cached_result, merge_cached_into_result,
+    )
     import requests as req
 
     pure_code = stock_code.replace("sh.", "").replace("sz.", "")
     tx_code = f"{_get_exchange_prefix(pure_code)}{pure_code}"
     result = {"code": stock_code, "name": "", "status": "fetched"}
+
+    # ── 0. Disk cache check ──
+    today = datetime.now().strftime("%Y-%m-%d")
+    cached_fund = read_data_cache("fundamentals", stock_code, today)
+    cached_mkt = read_data_cache("market_data", stock_code, today)
+    cache_hit = cached_fund and cached_mkt
+    if cache_hit:
+        result.update(cached_fund)
+        result.update(cached_mkt)
+        cached_info = read_data_cache("company_info", stock_code, today)
+        if cached_info:
+            result.update(cached_info)
+        result["_cache_hit"] = True
+        return result
 
     # ── 1. Tencent 实时行情 ──
     try:
@@ -512,6 +531,11 @@ def _fetch_light_stock_data_sync(
             ]
     else:
         result["_enrich_errors"] = ["无 Tushare 缓存 (预取阶段可能失败)"]
+
+    # ── 5. Write to disk cache ──
+    buckets = split_cached_result(result)
+    for data_type, data in buckets.items():
+        write_data_cache(data_type, stock_code, today, data)
 
     return result
 

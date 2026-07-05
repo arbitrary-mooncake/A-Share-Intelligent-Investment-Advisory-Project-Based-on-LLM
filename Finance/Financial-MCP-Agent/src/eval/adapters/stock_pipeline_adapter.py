@@ -73,7 +73,7 @@ async def run_stock_analysis(
     start_time = datetime.now()
 
     try:
-        engine = ScoringEngine()
+        engine = ScoringEngine(pool_manager=False)  # eval 系统不应写入 stock_pool.json
 
         # 运行完整评分管线
         # 注意: 标准 score_stock() 不接受 model_config / as_of_date，

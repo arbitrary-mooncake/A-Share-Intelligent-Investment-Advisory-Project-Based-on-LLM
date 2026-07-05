@@ -8,15 +8,25 @@ v2升级（2026-06）:
   - 定义22条命名回测线 (SB-L0~L5, MB-L0~L7, LB-L0~L7)
   - 季度校准(方案B): 每锚点动态重筛池，消除存活偏差
   - 市场环境切片: 牛/熊/震荡市分别回测
+
+v2.1升级（2026-07）:
+  - Gap #9: 财务数据PIT对齐 — 按披露日期(disclosure_date)过滤，消除前视偏差
+  - Gap #8: 存活偏差量化 — 检测回测期间ST/退市/长期停牌事件
+  - Gap #15: Prompt补丁回测验证 — mini backtest + prompt_override支持
 """
 import os
 import json
 import math
 import random
 import asyncio
+import logging
+import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
+from collections import namedtuple
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -33,6 +43,43 @@ class BacktestConfig:
     benchmark_symbol: str = "sh.000300"     # CSI 300
     train_split: str = "2023-12-31"
     validation_split: str = "2025-06-30"
+    # Gap #15: 允许在回测中覆写prompt以验证补丁效果
+    prompt_override: Optional[Dict[str, str]] = None  # {agent_name: new_prompt, ...}
+    # Gap #11: 策略参数覆盖
+    param_overrides: Optional[Dict[str, Any]] = None  # {score_buy_threshold: 70, ...}
+
+
+# Gap #8: 存活偏差量化数据结构
+SurvivorshipStats = namedtuple("SurvivorshipStats", [
+    "total_pool_stocks",         # 精筛池总股票数
+    "st_events_count",           # 发生过ST的股票数
+    "st_events_pct",             # ST比例 (%)
+    "delisted_count",            # 已退市股票数
+    "delisted_pct",              # 退市比例 (%)
+    "long_suspended_count",      # 长期停牌(>30日)股票数
+    "long_suspended_pct",        # 长期停牌比例 (%)
+    "affected_count",            # 受任一影响股票数（去重）
+    "affected_pct",              # 受影响比例 (%)
+    "clean_count",               # 无事件股票数
+    "clean_pct",                 # 无事件比例 (%)
+    "details",                   # [{code, name, event_type, first_date, description}]
+])
+
+
+# Gap #15: Prompt补丁回测验证结果
+@dataclass
+class VerificationResult:
+    """Prompt补丁回测验证结果"""
+    passed: bool                            # 验证是否通过
+    determination: str                      # "improvement" / "no_change" / "regression"
+    mean_score_diff: float                  # 平均分数差异 (patched - original)
+    rank_correlation: float                 # 排名相关性 (Spearman-like)
+    score_volatility_change: float          # 分数波动性变化
+    direction_flip_rate: float              # 方向翻转率 (0-1)
+    performance_metrics: Dict[str, Any]     # 性能对比指标
+    anchor_results: List[Dict[str, Any]]    # 每锚点详细结果
+    baseline_summary: Dict[str, Any]        # 基线回测汇总
+    patched_summary: Dict[str, Any]         # 补丁回测汇总
 
 
 # ══════════════════════════════════════════════════════════════
@@ -187,6 +234,11 @@ class ReplayBacktestEngine:
     def __init__(self, config: BacktestConfig = None):
         self.config = config or BacktestConfig()
         self.results: Dict[str, Any] = {}
+        # Gap #9: PIT disclosure date and fundamentals caches
+        self._disclosure_date_cache: Dict[Tuple[str, str, str], Dict[str, str]] = {}  # {(ts_code, start_date, end_date): {report_period: ann_date}}
+        self._pit_fundamentals_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}  # {(stock_code, anchor_date): pit_data}
+        # Gap #8: Survivorship stats
+        self._survivor_stats: Optional[SurvivorshipStats] = None
 
     def generate_anchor_dates(self) -> List[str]:
         """生成回测anchor date列表"""
@@ -372,19 +424,233 @@ class ReplayBacktestEngine:
             return code[3:] + ".SZ"
         return code
 
+    # ═══════════════════════════════════════════════════════════
+    # Gap #9: Financial data PIT alignment using disclosure_date
+    # ═══════════════════════════════════════════════════════════
+
+    def _get_disclosure_dates(
+        self, stock_code: str, start_date: str, end_date: str
+    ) -> Dict[str, str]:
+        """
+        Fetch disclosure (announcement) dates for financial reports.
+
+        Calls Tushare disclosure_date API to get the actual announcement
+        dates for each report period. Results are cached per stock since
+        disclosure dates are historical facts that never change.
+
+        Args:
+            stock_code: Internal format (sh.603871)
+            start_date: YYYYMMDD (start of query range for report periods)
+            end_date: YYYYMMDD (end of query range for report periods)
+
+        Returns:
+            {report_period_end_date (YYYYMMDD): disclosure_date (YYYYMMDD), ...}
+            Empty dict if API fails.
+        """
+        ts_code = self._convert_to_ts_code(stock_code)
+        cache_key = (ts_code, start_date, end_date)
+
+        # Check cache first
+        if cache_key in self._disclosure_date_cache:
+            cached = self._disclosure_date_cache[cache_key]
+            if cached is not None:
+                return cached
+
+        # On cache miss, also check if a broader cached range covers our range
+        for (cached_ts_code, cached_start, cached_end), cached_data in list(
+            self._disclosure_date_cache.items()
+        ):
+            if cached_ts_code == ts_code and cached_start <= start_date and cached_end >= end_date:
+                if cached_data is not None:
+                    return cached_data
+
+        try:
+            from src.eval.data_fetcher import _call as tushare_call
+
+            result = tushare_call("disclosure_date", {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+            }, fields="ts_code,ann_date,end_date,pre_date")
+
+            if not result or "items" not in result:
+                logger.warning("disclosure_date API returned no data for %s (%s~%s)",
+                             stock_code, start_date, end_date)
+                return {}
+
+            fields = result["fields"]
+            disclosure_map: Dict[str, str] = {}
+
+            for row in result["items"]:
+                item = dict(zip(fields, row))
+                report_period = str(item.get("end_date", ""))
+                ann_date = str(item.get("ann_date", ""))
+                if report_period and ann_date:
+                    # Only store actual disclosure dates (skip pre-dates if not yet disclosed)
+                    disclosure_map[report_period] = ann_date
+
+            # Cache the result — keyed by (ts_code, start_date, end_date) to avoid
+            # stale narrow-range cache poisoning broader queries.
+            self._disclosure_date_cache[cache_key] = disclosure_map
+
+            logger.debug("Got %d disclosure dates for %s", len(disclosure_map), stock_code)
+            return disclosure_map
+
+        except Exception as e:
+            logger.warning("Failed to fetch disclosure dates for %s: %s", stock_code, str(e))
+            # Return empty — caller will fall back to report_date (current behavior)
+            return {}
+
+    def _get_pit_financial_data(
+        self, stock_code: str, anchor_date: str
+    ) -> Dict[str, Any]:
+        """
+        Get Point-in-Time financial data: only reports disclosed on or before
+        the anchor_date are used. This eliminates look-ahead bias.
+
+        Steps:
+        1. Fetch financial indicators via fina_indicator (extended range)
+        2. Fetch disclosure dates for the same range
+        3. For each report, check if ann_date <= anchor_date
+        4. Return the latest available (by report period) disclosed report
+
+        Args:
+            stock_code: Internal format (sh.603871)
+            anchor_date: YYYY-MM-DD — the analysis date
+
+        Returns:
+            Dict of financial indicators from the latest disclosed report,
+            or empty dict if no data available / Tushare unavailable.
+        """
+        try:
+            from src.eval.data_fetcher import _call as tushare_call
+
+            ts_code = self._convert_to_ts_code(stock_code)
+            ts_anchor = anchor_date.replace("-", "")
+
+            # Query financial data going back several years to ensure coverage
+            # Anchor date minus ~3 years of reporting periods
+            anchor_year = int(anchor_date[:4])
+            start_period = f"{anchor_year - 3}0101"
+
+            # 1. Fetch financial indicators (reports up to anchor_date)
+            fina = tushare_call("fina_indicator", {
+                "ts_code": ts_code,
+                "start_date": start_period,
+                "end_date": ts_anchor,
+                "limit": "8",  # ~2 years of quarterly reports
+            }, ("end_date,roe,roe_dt,roa,grossprofit_margin,netprofit_margin,"
+                "debt_to_assets,current_ratio,quick_ratio,"
+                "or_yoy,profit_yoy,ocf_yoy,ocf_netprofit,assets_turn"))
+
+            if not fina or "items" not in fina or not fina["items"]:
+                return {"_has_data": False, "_pit_filtered": True,
+                        "_reason": "No fina_indicator data available"}
+
+            fina_fields = fina["fields"]
+
+            # 2. Try to get disclosure dates for this stock
+            disclosure_map = self._get_disclosure_dates(
+                stock_code, start_period, ts_anchor
+            )
+
+            # 3. Filter reports by disclosure date
+            # If disclosure_map is empty (API failed), fall back to report_date
+            # (current behavior — no filtering)
+            pit_filtered = False
+            usable_reports = []
+
+            for row in fina["items"]:
+                item = dict(zip(fina_fields, row))
+                report_period = str(item.get("end_date", ""))
+
+                if disclosure_map:
+                    # PIT mode: check if report was disclosed by anchor_date
+                    ann_date = disclosure_map.get(report_period, "")
+                    if ann_date and ann_date <= ts_anchor:
+                        usable_reports.append(item)
+                        pit_filtered = True
+                    elif not ann_date:
+                        # No disclosure date known — conservatively include only
+                        # reports with end_date well before anchor (3 month buffer)
+                        try:
+                            rp_dt = datetime.strptime(report_period, "%Y%m%d")
+                            ad_dt = datetime.strptime(anchor_date, "%Y-%m-%d")
+                            if (ad_dt - rp_dt).days >= 90:
+                                usable_reports.append(item)
+                                pit_filtered = True
+                                logger.debug(
+                                    "Including %s report %s (no disclosure date, "
+                                    ">=90d before anchor, conservative fallback)",
+                                    stock_code, report_period
+                                )
+                        except ValueError:
+                            pass
+                else:
+                    # No disclosure data at all — fall back to report_date-based
+                    # filtering (current behavior, no PIT)
+                    if report_period <= ts_anchor:
+                        usable_reports.append(item)
+
+            if not usable_reports:
+                return {"_has_data": False, "_pit_filtered": pit_filtered,
+                        "_reason": "No reports disclosed by anchor date"}
+
+            # 4. Sort by report period (descending) and take the latest
+            usable_reports.sort(key=lambda x: str(x.get("end_date", "")), reverse=True)
+            latest = usable_reports[0]
+            latest_period = str(latest.get("end_date", ""))
+
+            fina_data = {
+                "end_date": latest_period,
+                "roe": _safe_float(latest.get("roe")),
+                "roe_dt": _safe_float(latest.get("roe_dt")),
+                "roa": _safe_float(latest.get("roa")),
+                "grossprofit_margin": _safe_float(latest.get("grossprofit_margin")),
+                "netprofit_margin": _safe_float(latest.get("netprofit_margin")),
+                "debt_to_assets": _safe_float(latest.get("debt_to_assets")),
+                "current_ratio": _safe_float(latest.get("current_ratio")),
+                "quick_ratio": _safe_float(latest.get("quick_ratio")),
+                "or_yoy": _safe_float(latest.get("or_yoy")),
+                "profit_yoy": _safe_float(latest.get("profit_yoy")),
+                "ocf_yoy": _safe_float(latest.get("ocf_yoy")),
+                "ocf_netprofit": _safe_float(latest.get("ocf_netprofit")),
+                "assets_turn": _safe_float(latest.get("assets_turn")),
+                "_pit_filtered": pit_filtered,
+            }
+
+            if pit_filtered and disclosure_map:
+                ann_date = disclosure_map.get(latest_period, "unknown")
+                fina_data["_disclosure_date"] = ann_date
+                logger.debug(
+                    "PIT fundamental for %s @ %s: using report %s (disclosed %s)",
+                    stock_code, anchor_date, latest_period, ann_date
+                )
+
+            return fina_data
+
+        except Exception as e:
+            logger.warning("PIT financial data failed for %s @ %s: %s",
+                         stock_code, anchor_date, str(e))
+            return {"_has_data": False, "_pit_filtered": False,
+                    "_reason": f"Exception: {str(e)}"}
+
     def _fetch_pit_fundamentals(
         self, stock_code: str, anchor_date: str
     ) -> Dict[str, Any]:
         """
-        从Tushare获取PIT(Point-in-Time)基本面数据。
+        Fetch PIT(Point-in-Time) fundamental data from Tushare.
+
+        Gap #9 upgrade: Uses disclosure_date to filter out financial reports
+        that were not yet announced as of the anchor date.
 
         Args:
-            stock_code: 内部格式 (sh.603871)
+            stock_code: Internal format (sh.603871)
             anchor_date: YYYY-MM-DD
 
         Returns:
             {pe, pb, roe, revenue_growth, profit_growth, debt_ratio, ocf_ratio, ...}
-            如果Tushare不可用，返回空dict
+            Returns dict with _has_data=False if Tushare unavailable.
         """
         try:
             from src.eval.data_fetcher import _call as tushare_call
@@ -392,7 +658,13 @@ class ReplayBacktestEngine:
             ts_code = self._convert_to_ts_code(stock_code)
             ts_date = anchor_date.replace("-", "")
 
-            # 1. 获取anchor_date当日的PE/PB/换手率/总市值
+            # Check PIT fundamentals cache first (Gap #9)
+            cache_key = (stock_code, anchor_date)
+            if cache_key in self._pit_fundamentals_cache:
+                logger.debug("PIT fundamentals cache hit for %s @ %s", stock_code, anchor_date)
+                return self._pit_fundamentals_cache[cache_key]
+
+            # 1. Get PE/PB/turnover/total_mv as of anchor_date
             basic = tushare_call("daily_basic", {
                 "ts_code": ts_code,
                 "trade_date": ts_date,
@@ -410,38 +682,29 @@ class ReplayBacktestEngine:
                 turnover = _safe_float(item.get("turnover_rate"))
                 total_mv = _safe_float(item.get("total_mv"))
 
-            # 2. 获取anchor_date之前最新的财务指标
-            fina = tushare_call("fina_indicator", {
-                "ts_code": ts_code,
-                "end_date": ts_date,  # 只取end_date <= anchor_date的报告
-                "limit": "2",
-                "offset": "0",
-            }, ("roe,roe_dt,roa,grossprofit_margin,netprofit_margin,"
-                "debt_to_assets,current_ratio,quick_ratio,"
-                "or_yoy,profit_yoy,ocf_yoy,ocf_netprofit,assets_turn"))
+            # 2. Get PIT financial data (Gap #9: disclosure-date filtered)
+            pit_financial = self._get_pit_financial_data(stock_code, anchor_date)
 
+            # Extract financial fields from PIT result
             fina_data = {}
-            if fina and "items" in fina and fina["items"]:
-                fields = fina["fields"]
-                # 取最新一期 (按end_date降序, Tushare默认返回)
-                f = dict(zip(fields, fina["items"][0]))
+            if pit_financial.get("_has_data") is True or "roe" in pit_financial:
                 fina_data = {
-                    "roe": _safe_float(f.get("roe")),
-                    "roe_dt": _safe_float(f.get("roe_dt")),
-                    "roa": _safe_float(f.get("roa")),
-                    "grossprofit_margin": _safe_float(f.get("grossprofit_margin")),
-                    "netprofit_margin": _safe_float(f.get("netprofit_margin")),
-                    "debt_to_assets": _safe_float(f.get("debt_to_assets")),
-                    "current_ratio": _safe_float(f.get("current_ratio")),
-                    "quick_ratio": _safe_float(f.get("quick_ratio")),
-                    "or_yoy": _safe_float(f.get("or_yoy")),
-                    "profit_yoy": _safe_float(f.get("profit_yoy")),
-                    "ocf_yoy": _safe_float(f.get("ocf_yoy")),
-                    "ocf_netprofit": _safe_float(f.get("ocf_netprofit")),
-                    "assets_turn": _safe_float(f.get("assets_turn")),
+                    "roe": pit_financial.get("roe", 0),
+                    "roe_dt": pit_financial.get("roe_dt", 0),
+                    "roa": pit_financial.get("roa", 0),
+                    "grossprofit_margin": pit_financial.get("grossprofit_margin", 0),
+                    "netprofit_margin": pit_financial.get("netprofit_margin", 0),
+                    "debt_to_assets": pit_financial.get("debt_to_assets", 0),
+                    "current_ratio": pit_financial.get("current_ratio", 0),
+                    "quick_ratio": pit_financial.get("quick_ratio", 0),
+                    "or_yoy": pit_financial.get("or_yoy", 0),
+                    "profit_yoy": pit_financial.get("profit_yoy", 0),
+                    "ocf_yoy": pit_financial.get("ocf_yoy", 0),
+                    "ocf_netprofit": pit_financial.get("ocf_netprofit", 0),
+                    "assets_turn": pit_financial.get("assets_turn", 0),
                 }
 
-            # 3. 获取行业分类
+            # 3. Get industry classification
             industry = "default"
             try:
                 stock_info = tushare_call("stock_basic", {
@@ -454,7 +717,7 @@ class ReplayBacktestEngine:
             except Exception:
                 pass
 
-            return {
+            result = {
                 "pe": pe,
                 "pb": pb,
                 "turnover_rate": turnover,
@@ -462,7 +725,13 @@ class ReplayBacktestEngine:
                 "industry": industry,
                 **fina_data,
                 "_has_data": True,
+                "_pit_filtered": pit_financial.get("_pit_filtered", False),
             }
+
+            # Cache result (Gap #9)
+            self._pit_fundamentals_cache[cache_key] = result
+
+            return result
 
         except Exception:
             return {"_has_data": False}
@@ -717,9 +986,24 @@ class ReplayBacktestEngine:
                 result = await run_stock_analysis(
                     stock_code, company_name, anchor_date, eval_mode=True
                 )
+                # Only cache if result has no error AND contains valid term scores
                 if not result.get("error"):
-                    write_cache("full_analysis", stock_code, anchor_date,
-                               json.dumps(result, ensure_ascii=False, default=str))
+                    term = self.config.term
+                    term_key = f"{term}_term_score"
+                    term_score = result.get(term_key, {})
+                    has_valid_score = (
+                        isinstance(term_score, dict)
+                        and term_score.get("score") is not None
+                    )
+                    if has_valid_score:
+                        write_cache("full_analysis", stock_code, anchor_date,
+                                   json.dumps(result, ensure_ascii=False, default=str))
+                    else:
+                        logger.warning(
+                            "Backtest analysis for %s @ %s completed but missing "
+                            "valid %s score; not caching to allow retry.",
+                            stock_code, anchor_date, term_key
+                        )
 
             # 提取该期限评分
             term = self.config.term
@@ -762,6 +1046,240 @@ class ReplayBacktestEngine:
     # ═══════════════════════════════════════════════════════════
     # Core backtest methods
     # ═══════════════════════════════════════════════════════════
+
+    # ── Gap #8: Survivorship Bias Quantification ──
+    async def _check_survivor_events(
+        self, pool_stocks: List[str], start_date: str, end_date: str
+    ) -> SurvivorshipStats:
+        """
+        Check pool stocks for adverse events during the backtest period:
+        ST designation, delisting, and long suspensions (>30 trading days).
+
+        Uses Tushare namechange API to detect ST/delisting events and
+        suspend_d API to check for long suspensions.
+
+        Args:
+            pool_stocks: List of stock codes in internal format (sh.603871)
+            start_date: Backtest start date YYYY-MM-DD
+            end_date: Backtest end date YYYY-MM-DD
+
+        Returns:
+            SurvivorshipStats with counts and percentages.
+        """
+        from src.eval.data_fetcher import _call as tushare_call
+
+        ts_start = start_date.replace("-", "")
+        ts_end = end_date.replace("-", "")
+
+        st_stocks: Dict[str, Dict] = {}       # code -> {name, first_date, reason}
+        delisted_stocks: Dict[str, Dict] = {} # code -> {name, first_date, reason}
+        long_suspended_stocks: Dict[str, Dict] = {}  # code -> {name, max_days, periods}
+        affected: set = set()                  # stock codes affected by any event
+
+        total = len(pool_stocks)
+        processed = 0
+
+        for stock_code in pool_stocks:
+            processed += 1
+            ts_code = self._convert_to_ts_code(stock_code)
+
+            # ── 1. Check namechange for ST/delisting events ──
+            try:
+                nc_result = tushare_call("namechange", {
+                    "ts_code": ts_code,
+                    "start_date": ts_start,
+                    "end_date": ts_end,
+                }, fields="ts_code,name,start_date,end_date,change_reason")
+
+                if nc_result and "items" in nc_result:
+                    nc_fields = nc_result["fields"]
+                    for row in nc_result["items"]:
+                        item = dict(zip(nc_fields, row))
+                        name = str(item.get("name", ""))
+                        change_reason = str(item.get("change_reason", ""))
+                        start_date_item = str(item.get("start_date", ""))
+
+                        # Detect ST events
+                        if ("ST" in name or "*ST" in name or
+                            "退市" in name or "终止上市" in change_reason or
+                            "ST" in change_reason):
+                            if "退市" in name or "终止上市" in change_reason:
+                                if stock_code not in delisted_stocks:
+                                    delisted_stocks[stock_code] = {
+                                        "code": stock_code,
+                                        "name": name,
+                                        "first_date": start_date_item,
+                                        "reason": change_reason,
+                                    }
+                            else:
+                                if stock_code not in st_stocks:
+                                    st_stocks[stock_code] = {
+                                        "code": stock_code,
+                                        "name": name,
+                                        "first_date": start_date_item,
+                                        "reason": change_reason,
+                                    }
+            except Exception as e:
+                logger.debug("namechange check failed for %s: %s", stock_code, str(e))
+
+            # ── 2. Check for long suspensions ──
+            try:
+                susp_result = tushare_call("suspend_d", {
+                    "ts_code": ts_code,
+                    "start_date": ts_start,
+                    "end_date": ts_end,
+                }, fields="ts_code,suspend_date,resume_date,suspend_type,suspend_reason")
+
+                if susp_result and "items" in susp_result:
+                    susp_fields = susp_result["fields"]
+                    suspension_periods = []
+
+                    for row in susp_result["items"]:
+                        item = dict(zip(susp_fields, row))
+                        susp_date = str(item.get("suspend_date", ""))
+                        resume_date = str(item.get("resume_date", ""))
+
+                        if susp_date and resume_date:
+                            try:
+                                sd = datetime.strptime(susp_date, "%Y%m%d")
+                                rd = datetime.strptime(resume_date, "%Y%m%d")
+                                susp_days = (rd - sd).days
+                                if susp_days > 30:
+                                    suspension_periods.append({
+                                        "suspend_date": susp_date,
+                                        "resume_date": resume_date,
+                                        "days": susp_days,
+                                        "reason": str(item.get("suspend_reason", "")),
+                                    })
+                            except ValueError:
+                                pass
+                        elif susp_date and not resume_date:
+                            # Still suspended — count from suspend_date to end_date
+                            try:
+                                sd = datetime.strptime(susp_date, "%Y%m%d")
+                                ed = datetime.strptime(end_date, "%Y-%m-%d")
+                                susp_days = (ed - sd).days
+                                if susp_days > 30:
+                                    suspension_periods.append({
+                                        "suspend_date": susp_date,
+                                        "resume_date": "still_suspended",
+                                        "days": susp_days,
+                                        "reason": str(item.get("suspend_reason", "")),
+                                    })
+                            except ValueError:
+                                pass
+
+                    if suspension_periods:
+                        max_days = max(p["days"] for p in suspension_periods)
+                        long_suspended_stocks[stock_code] = {
+                            "code": stock_code,
+                            "name": stock_code,
+                            "max_days": max_days,
+                            "periods": suspension_periods,
+                        }
+            except Exception as e:
+                logger.debug("suspend_d check failed for %s: %s", stock_code, str(e))
+
+            # Track affected stocks
+            if stock_code in st_stocks:
+                affected.add(stock_code)
+            if stock_code in delisted_stocks:
+                affected.add(stock_code)
+            if stock_code in long_suspended_stocks:
+                affected.add(stock_code)
+
+            # Progress logging for large pools
+            if processed % 50 == 0 and total >= 100:
+                logger.info("Survivorship check: %d/%d stocks processed", processed, total)
+
+        # Build details list
+        details = []
+        for code, info in st_stocks.items():
+            details.append({
+                "code": code,
+                "event_type": "ST",
+                "first_date": info["first_date"],
+                "description": f"ST: {info.get('name', '')} — {info.get('reason', '')}",
+            })
+        for code, info in delisted_stocks.items():
+            details.append({
+                "code": code,
+                "event_type": "DELIST",
+                "first_date": info["first_date"],
+                "description": f"退市: {info.get('name', '')} — {info.get('reason', '')}",
+            })
+        for code, info in long_suspended_stocks.items():
+            details.append({
+                "code": code,
+                "event_type": "LONG_SUSPEND",
+                "first_date": info["periods"][0]["suspend_date"] if info.get("periods") else "",
+                "description": f"长期停牌: max={info.get('max_days', 0)}天 — {len(info.get('periods', []))}次",
+            })
+
+        clean_count = total - len(affected)
+
+        stats = SurvivorshipStats(
+            total_pool_stocks=total,
+            st_events_count=len(st_stocks),
+            st_events_pct=round(len(st_stocks) / total * 100, 1) if total > 0 else 0,
+            delisted_count=len(delisted_stocks),
+            delisted_pct=round(len(delisted_stocks) / total * 100, 1) if total > 0 else 0,
+            long_suspended_count=len(long_suspended_stocks),
+            long_suspended_pct=round(len(long_suspended_stocks) / total * 100, 1) if total > 0 else 0,
+            affected_count=len(affected),
+            affected_pct=round(len(affected) / total * 100, 1) if total > 0 else 0,
+            clean_count=clean_count,
+            clean_pct=round(clean_count / total * 100, 1) if total > 0 else 0,
+            details=details,
+        )
+
+        logger.info(
+            "Survivorship check complete: %d/%d stocks affected (%.1f%%), "
+            "ST=%d, Delisted=%d, LongSuspended=%d, Clean=%d",
+            stats.affected_count, stats.total_pool_stocks, stats.affected_pct,
+            stats.st_events_count, stats.delisted_count,
+            stats.long_suspended_count, stats.clean_count
+        )
+
+        return stats
+
+    def _compute_survivorship_bias(self) -> Optional[Dict[str, Any]]:
+        """
+        Compute survivorship bias impact assessment from cached stats.
+
+        Returns a dict with bias quantification suitable for inclusion
+        in backtest results.
+        """
+        if self._survivor_stats is None:
+            return None
+
+        stats = self._survivor_stats
+
+        # Estimate bias impact:
+        # - Each affected stock that would have been in the pool introduces
+        #   negative return that is not captured in the backtest
+        # - The bias magnitude is roughly proportional to the affected ratio
+        bias_severity = "low"
+        if stats.affected_pct > 15:
+            bias_severity = "high"
+        elif stats.affected_pct > 5:
+            bias_severity = "medium"
+
+        return {
+            "total_pool_stocks": stats.total_pool_stocks,
+            "st_events": {"count": stats.st_events_count, "pct": stats.st_events_pct},
+            "delisted": {"count": stats.delisted_count, "pct": stats.delisted_pct},
+            "long_suspended": {"count": stats.long_suspended_count, "pct": stats.long_suspended_pct},
+            "affected_any": {"count": stats.affected_count, "pct": stats.affected_pct},
+            "clean": {"count": stats.clean_count, "pct": stats.clean_pct},
+            "bias_severity": bias_severity,
+            "details": stats.details[:50],  # Top 50, avoid bloating output
+            "caveat": (
+                f"回测池中{stats.affected_pct:.1f}%的股票在回测期间经历了ST/退市/长期停牌事件。"
+                f"由于当前精筛池已自动排除这些股票，回测收益可能高估{bias_severity}程度。"
+                f"建议使用季度动态重筛池(run_quarterly_calibration)以减少存活偏差。"
+            ),
+        }
 
     async def run_single_anchor(self, anchor_date: str, pool: List[str],
                                  price_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -949,10 +1467,19 @@ class ReplayBacktestEngine:
                     hold_days_state.pop(code, None)
 
             # ── 8. 选股 ──
-            buy_orders = strategy.select_stocks(
-                pool, scores, holdings, cash,
-                market_data_map, total_capital,
-            )
+            select_kwargs = {
+                "pool": pool,
+                "scores": scores,
+                "holdings": holdings,
+                "cash": cash,
+                "market_data_map": market_data_map,
+                "total_capital": total_capital,
+            }
+            # 中线策略需要 current_date 用于越跌越买基本面检查
+            from src.eval.strategies.medium_term import MediumTermStrategy
+            if isinstance(strategy, MediumTermStrategy):
+                select_kwargs["current_date"] = anchor_date
+            buy_orders = strategy.select_stocks(**select_kwargs)
 
             # ── 9. 仓位调整 ──
             sized = strategy.size_positions(
@@ -1083,13 +1610,19 @@ class ReplayBacktestEngine:
         }
 
     async def run_full_backtest(self, pool: List[str],
-                                 price_data: Dict[str, Any]) -> Dict[str, Any]:
+                                 price_data: Dict[str, Any],
+                                 param_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        运行完整回测（所有anchor dates）。
+        Run full backtest across all anchor dates.
+
+        Gap #8: Includes survivorship bias quantification.
+        Gap #9: Uses PIT financial data filtered by disclosure date.
 
         Returns:
-            包含所有anchor dates的结果和汇总统计
+            Dict with all anchor results, summaries, survivorship stats.
         """
+        if param_overrides:
+            self.config.param_overrides = param_overrides
         anchors = self.generate_anchor_dates()
         splits = self.get_train_val_test_split(anchors)
 
@@ -1097,6 +1630,18 @@ class ReplayBacktestEngine:
         print(f"[回测] 共{total_anchors}个anchor dates "
               f"(训练{len(splits['train'])} 验证{len(splits['validate'])} "
               f"测试{len(splits['test'])})")
+
+        # ── Gap #8: Survivorship bias check ──
+        print(f"\n[回测] 检测存活偏差 (检查ST/退市/长期停牌)...")
+        try:
+            self._survivor_stats = await self._check_survivor_events(
+                pool, self.config.start_date, self.config.end_date
+            )
+            print(f"  [存活偏差] {self._survivor_stats.affected_count}/{self._survivor_stats.total_pool_stocks}"
+                  f" 受影响的股票 ({self._survivor_stats.affected_pct}%)")
+        except Exception as e:
+            logger.warning("Survivorship check failed: %s", str(e))
+            self._survivor_stats = None
 
         all_results = []
         processed = 0
@@ -1133,6 +1678,33 @@ class ReplayBacktestEngine:
                 print(f"  [警告] SB-L6 参考线回测失败: {e}")
                 reference_results = {"error": str(e), "line_id": "SB-L6"}
 
+        # ── Gap #8: Survivorship bias assessment ──
+        survivorship = self._compute_survivorship_bias()
+
+        # ── Gap #9: PIT disclosure-date status ──
+        has_pit_alignment = bool(self._disclosure_date_cache)
+        pit_disclaimer = ""
+        if has_pit_alignment:
+            stocks_with_disclosures = len(self._disclosure_date_cache)
+            pit_disclaimer = (
+                f"财务数据已按披露日期(disclosure_date)做PIT对齐，"
+                f"共{stocks_with_disclosures}只股票启用了披露日期过滤，消除了前视偏差"
+            )
+        else:
+            pit_disclaimer = (
+                "披露日期(disclosure_date)数据获取失败，回退至报告期(report_date)过滤"
+            )
+
+        decls = [
+            "本回测基于当前精筛股票池，不含回测期间退市/暴雷股票",
+            "news_agent和event_agent在回测中被禁用",
+            "绝对收益可能高估，但agent贡献排序受偏差影响较小",
+            "评分基于Tushare PIT历史数据，回退至段位确定性估算（无随机哈希）",
+            "SB-L6为参考线（长持对照），使用ShortLongHoldStrategy连续持仓，不参与消融ΔLoss计算",
+        ]
+        if pit_disclaimer:
+            decls.append(pit_disclaimer)
+
         result = {
             "config": {
                 "term": self.config.term,
@@ -1141,20 +1713,97 @@ class ReplayBacktestEngine:
                 "holding_days": self.config.holding_days,
                 "num_anchors_executed": len(all_results),
                 "num_anchors_total": len(anchors),
+                "pit_financial_enabled": has_pit_alignment,
             },
             "splits": {k: len(v) for k, v in splits.items()},
             "anchor_results": all_results,
             "contribution_summary": contribution_summary,
             "reference_line": reference_results,
-            "declarations": [
-                "本回测基于当前精筛股票池，不含回测期间退市/暴雷股票",
-                "news_agent和event_agent在回测中被禁用",
-                "绝对收益可能高估，但agent贡献排序受偏差影响较小",
-                "评分基于Tushare PIT历史数据，回退至段位确定性估算（无随机哈希）",
-                "SB-L6为参考线（长持对照），使用ShortLongHoldStrategy连续持仓，不参与消融ΔLoss计算",
-            ],
+            "survivorship_bias": survivorship,
+            "declarations": decls,
         }
         return result
+
+    # ── Gap #15: Mini Backtest for Prompt Patch Verification ──
+
+    async def run_mini_backtest(
+        self,
+        pool: List[str],
+        price_data: Dict[str, Any],
+        num_anchors: int = 15,
+        num_stocks: int = 20,
+    ) -> Dict[str, Any]:
+        """
+        Run a small-scale backtest for quick prompt patch verification.
+
+        Uses a limited number of anchor dates (sampled evenly) and stocks
+        for fast turn-around. Supports prompt_override via BacktestConfig.
+
+        Args:
+            pool: Full stock pool list
+            price_data: Historical price data
+            num_anchors: Max anchor dates to include (sampled evenly)
+            num_stocks: Max stocks per anchor (top-N from pool)
+
+        Returns:
+            Mini backtest results dict (same structure as run_full_backtest,
+            but with fewer anchors/stocks).
+        """
+        all_anchors = self.generate_anchor_dates()
+
+        # Evenly sample anchors
+        if len(all_anchors) <= num_anchors:
+            sampled_anchors = all_anchors
+        else:
+            step = len(all_anchors) / num_anchors
+            sampled_anchors = [all_anchors[int(i * step)] for i in range(num_anchors)]
+            sampled_anchors = sorted(set(sampled_anchors))  # Dedup and sort
+
+        # Limit pool size
+        mini_pool = pool[:num_stocks] if len(pool) > num_stocks else list(pool)
+
+        logger.info(
+            "Running mini backtest: %d anchors x %d stocks (prompt_override=%s)",
+            len(sampled_anchors), len(mini_pool),
+            "yes" if self.config.prompt_override else "no"
+        )
+
+        all_results = []
+        for i, anchor_date in enumerate(sampled_anchors):
+            if (i + 1) % 5 == 0 or i == 0:
+                print(f"  [mini回测] {i+1}/{len(sampled_anchors)} - {anchor_date}")
+
+            result = await self.run_single_anchor(anchor_date, mini_pool, price_data)
+            all_results.append(result)
+
+        contribution_summary = self._summarize_contributions(all_results)
+
+        # Compute per-anchor aggregate metrics
+        per_anchor_metrics = []
+        for r in all_results:
+            ablation = r.get("ablation_results", {})
+            full_data = ablation.get("full", {})
+            per_anchor_metrics.append({
+                "anchor_date": r["anchor_date"],
+                "pool_size": r.get("pool_size", len(mini_pool)),
+                "mean_score": full_data.get("mean_score", 0),
+                "mean_return": full_data.get("mean_return", 0),
+            })
+
+        return {
+            "config": {
+                "term": self.config.term,
+                "start": self.config.start_date,
+                "end": self.config.end_date,
+                "num_anchors": len(sampled_anchors),
+                "num_stocks": len(mini_pool),
+                "anchor_dates": sampled_anchors,
+                "prompt_override_applied": self.config.prompt_override is not None,
+            },
+            "contribution_summary": contribution_summary,
+            "per_anchor_metrics": per_anchor_metrics,
+            "anchor_results": all_results,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # Fix 4: Quarterly Calibration (方案B)

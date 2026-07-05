@@ -23,7 +23,8 @@ class MemoryManager:
 
     def _load_trends(self) -> Dict[str, Any]:
         defaults = {"score_history": [], "loss_history": [], "contribution_history": [],
-                    "fidelity_history": [], "runtime_history": [], "batches": []}
+                    "fidelity_history": [], "runtime_history": [], "batches": [],
+                    "stock_scores": {}}
         if os.path.exists(TREND_FILE):
             try:
                 with open(TREND_FILE, "r", encoding="utf-8") as f:
@@ -78,6 +79,8 @@ class MemoryManager:
             self.trends["score_history"] = self.trends["score_history"][-200:]
         if len(self.trends["batches"]) > 200:
             self.trends["batches"] = self.trends["batches"][-200:]
+        if len(self.trends["loss_history"]) > 200:
+            self.trends["loss_history"] = self.trends["loss_history"][-200:]
 
         self._save_trends()
 
@@ -153,6 +156,53 @@ class MemoryManager:
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         return [e for e in self.trends["contribution_history"]
                 if e.get("agent_name") == agent_name and e.get("date", "") >= cutoff]
+
+    def record_stock_score(self, stock_code: str, score: float, date: str, term: str):
+        """
+        记录单只股票的单次评分，用于动态频率升级/降级判断（总纲 §14.4 扩展）。
+
+        每个 stock_code + term 组合保留最近30条评分记录。
+
+        Args:
+            stock_code: 股票代码 (如 sh.603871)
+            score: 综合评分 (0-100)
+            date: 评分日期 YYYY-MM-DD
+            term: short/medium/long
+        """
+        storage = self.trends.setdefault("stock_scores", {})
+        key = f"{stock_code}|{term}"
+        if key not in storage:
+            storage[key] = []
+        # 避免同一天重复记录
+        if storage[key] and storage[key][-1].get("date") == date:
+            storage[key][-1] = {"date": date, "score": score}
+        else:
+            storage[key].append({"date": date, "score": score})
+        # 只保留最近30条
+        if len(storage[key]) > 30:
+            storage[key] = storage[key][-30:]
+        self._save_trends()
+
+    def get_stock_score_history(self, stock_code: str, term: str,
+                                days: int = 30) -> List[Dict]:
+        """
+        获取单只股票的评分历史。
+
+        Args:
+            stock_code: 股票代码
+            term: short/medium/long
+            days: 回溯天数，0 表示返回全部
+
+        Returns:
+            [{"date": "YYYY-MM-DD", "score": 85.5}, ...] 按日期升序
+        """
+        storage = self.trends.get("stock_scores", {})
+        key = f"{stock_code}|{term}"
+        history = storage.get(key, [])
+        if days and history:
+            cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            history = [e for e in history if e.get("date", "") >= cutoff]
+        return history
 
     def get_summary(self) -> Dict[str, Any]:
         """获取记忆摘要"""

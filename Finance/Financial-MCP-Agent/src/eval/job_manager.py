@@ -27,6 +27,8 @@ JOB_DIR = Path(os.environ["POOL_UPDATE_JOB_DIR"]) if "POOL_UPDATE_JOB_DIR" in os
 class JobStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    CANCELLED = "cancelled"
+    CANCELLING = "cancelling"
     COMPLETED = "completed"
     FAILED = "failed"
     ORPHANED = "orphaned"
@@ -37,6 +39,7 @@ class Job:
     job_id: str
     term: str
     status: JobStatus = JobStatus.PENDING
+    mode: str = "full"
     pid: Optional[int] = None
     parent_pid: Optional[int] = None
     started_at: Optional[str] = None
@@ -50,6 +53,7 @@ class Job:
             "job_id": self.job_id,
             "term": self.term,
             "status": self.status.value,
+            "mode": self.mode,
             "pid": self.pid,
             "parent_pid": self.parent_pid,
             "started_at": self.started_at,
@@ -65,6 +69,7 @@ class Job:
             job_id=d["job_id"],
             term=d["term"],
             status=JobStatus(d.get("status", "pending")),
+            mode=d.get("mode", "full"),
             pid=d.get("pid"),
             parent_pid=d.get("parent_pid"),
             started_at=d.get("started_at"),
@@ -202,6 +207,7 @@ def _spawn_worker(
     job_id: str,
     term: str,
     log_path: str,
+    mode: str = "full",
     worker_module_override: Optional[str] = None,
 ) -> subprocess.Popen:
     """Launch the pool-update worker as a detached child process.
@@ -215,7 +221,7 @@ def _spawn_worker(
     else:
         cmd = [
             sys.executable, "-m", "src.eval.pool_update_worker",
-            "--job-id", job_id, "--term", term,
+            "--job-id", job_id, "--term", term, "--mode", mode,
         ]
 
     kwargs: Dict[str, Any] = dict(
@@ -252,7 +258,7 @@ _JOB_RETENTION_SECONDS = 365 * 24 * 3600  # 1 年
 class JobManager:
     """精筛池更新任务管理器 (UI 侧使用)。"""
 
-    def start_job(self, term: str) -> str:
+    def start_job(self, term: str, mode: str = "full") -> str:
         existing = self.find_running(term)
         if existing:
             return existing["job_id"]
@@ -265,11 +271,12 @@ class JobManager:
         writer = AtomicJobWriter(job_id)
         writer.update(
             status=JobStatus.PENDING.value,
+            mode=mode,
             parent_pid=os.getpid(),
             started_at=datetime.now().isoformat(),
         )
 
-        _spawn_worker(job_id=job_id, term=term, log_path=log_path)
+        _spawn_worker(job_id=job_id, term=term, mode=mode, log_path=log_path)
         self.cleanup()
         return job_id
 
@@ -297,7 +304,7 @@ class JobManager:
                 data = json.loads(f.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if data.get("status") == "running":
+            if data.get("status") in ("running", "cancelling"):
                 if detect_orphan(data):
                     orphan_writer = AtomicJobWriter(data["job_id"])
                     orphan_writer.update(
@@ -346,6 +353,93 @@ class JobManager:
         except Exception:
             return False
 
+    def cancel(self, job_id: str) -> bool:
+        """Graceful cancel: request cancellation first, then force-stop after timeout.
+
+        1. Sets ``cancellation_requested: true`` in the job file (worker polls this)
+        2. Sends STOP signal to worker process
+        3. Falls back to force-kill after 30 second timeout
+        4. Handles PENDING jobs: directly mark as CANCELLED
+
+        Returns:
+            True if cancelled successfully or already cancelled.
+        """
+        data = self.poll(job_id)
+        if not data:
+            return False
+
+        status = data.get("status")
+
+        # Already terminal
+        if status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value,
+                      JobStatus.CANCELLED.value, JobStatus.CANCELLING.value,
+                      JobStatus.ORPHANED.value):
+            return True
+
+        # PENDING → directly mark as CANCELLED (no worker process yet)
+        if status == JobStatus.PENDING.value:
+            writer = AtomicJobWriter(job_id)
+            writer.update(
+                status=JobStatus.CANCELLED.value,
+                finished_at=datetime.now().isoformat(),
+                cancellation_requested=True,
+            )
+            return True
+
+        # RUNNING → graceful cancel
+        if status in (JobStatus.RUNNING.value, JobStatus.CANCELLING.value):
+            # Step 1: Write cancellation_requested flag
+            writer = AtomicJobWriter(job_id)
+            writer.update(
+                cancellation_requested=True,
+                status=JobStatus.CANCELLING.value,
+            )
+
+            # Step 2: Send signal to worker process
+            pid = data.get("pid")
+            if not pid:
+                return False
+
+            # Send graceful signal first
+            try:
+                if sys.platform == "win32":
+                    # CTRL_BREAK_EVENT on Windows
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.GenerateConsoleCtrlEvent(
+                            1,  # CTRL_BREAK_EVENT
+                            pid,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    os.kill(pid, signal.SIGINT)
+            except Exception:
+                pass
+
+            # Step 3: Wait 30s for graceful shutdown, then force-kill
+            grace_start = time.time()
+            while time.time() - grace_start < 30:
+                time.sleep(0.5)
+                current = self.poll(job_id)
+                if not current:
+                    return False
+                cur_status = current.get("status")
+                if cur_status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value,
+                                  JobStatus.CANCELLED.value, JobStatus.ORPHANED.value):
+                    return True
+
+            # Step 4: Force kill after timeout
+            self.stop(job_id)
+            writer = AtomicJobWriter(job_id)
+            writer.update(
+                status=JobStatus.CANCELLED.value,
+                finished_at=datetime.now().isoformat(),
+            )
+            return True
+
+        return False
+
     def cleanup(self) -> int:
         ensure_job_dir()
         cutoff = time.time() - _JOB_RETENTION_SECONDS
@@ -377,6 +471,7 @@ def parse_worker_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="pool_update_worker")
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--term", required=True, choices=("short", "medium", "long"))
+    parser.add_argument("--mode", default="full", choices=("full", "partial"))
     return parser.parse_args()
 
 

@@ -152,14 +152,7 @@ def render_quick_list(
     page: int = 0,
     page_size: int = 20,
 ) -> None:
-    """渲染快筛密集列表，分栏布局：名称 | 短线 | 中线 | 长线 | 操作。
-
-    视觉规范：
-    - 名称/三个分数分栏，间距拉开
-    - 分数按高低显示颜色（绿/黄/红）
-    - 选中行蓝色左边框高亮
-    - 无垂直边框，仅有水平分割线
-    """
+    """渲染快筛密集列表，分栏布局：名称 | 打分时间 | 短线 | 中线 | 长线 | 操作。"""
     if not stocks:
         return
 
@@ -173,17 +166,17 @@ def render_quick_list(
         code = s.get("stock_code", "")
         name = s.get("company_name", "")
         scores = s.get("scores", {})
+        last_updated = s.get("last_updated", "")
+        score_date = (last_updated or "")[:10] if last_updated else ""
 
         is_selected = (code == selected_code)
 
-        # 顶部细分割线（第一条之前不加）
         if i > 0:
             st.markdown(
                 '<div style="height:1px;background:#e2e8f0;margin:2px 0 2px 0;"></div>',
                 unsafe_allow_html=True,
             )
 
-        # 选中态：淡蓝背景 + 蓝色左边框
         if is_selected:
             st.markdown(
                 '<div style="'
@@ -203,8 +196,8 @@ def render_quick_list(
                 unsafe_allow_html=True,
             )
 
-        # 分栏：[名称2.2 | 短线0.9 | 中线0.9 | 长线0.9 | 按钮0.6]
-        cols = st.columns([2.2, 0.9, 0.9, 0.9, 0.6])
+        # 分栏：[名称2 | 时间1 | 短线0.9 | 中线0.9 | 长线0.9 | 按钮0.5]
+        cols = st.columns([2, 1, 0.9, 0.9, 0.9, 0.5])
 
         with cols[0]:
             st.markdown(
@@ -216,8 +209,15 @@ def render_quick_list(
                 unsafe_allow_html=True,
             )
 
+        with cols[1]:
+            if score_date:
+                st.markdown(
+                    f'<div style="font-size:0.78em;color:#94a3b8;margin-top:4px;">{score_date}</div>',
+                    unsafe_allow_html=True,
+                )
+
         for idx, (t, label) in enumerate([("short", "短"), ("medium", "中"), ("long", "长")]):
-            with cols[idx + 1]:
+            with cols[idx + 2]:
                 sv = scores.get(t, {}).get("score")
                 if sv is not None:
                     color = score_color(sv)
@@ -238,7 +238,7 @@ def render_quick_list(
                         unsafe_allow_html=True,
                     )
 
-        with cols[4]:
+        with cols[5]:
             btn_label = "✓" if is_selected else "查看"
             btn_type = "primary" if is_selected else "secondary"
             if st.button(btn_label, key=f"qs_sel_{term_key}_{code}",

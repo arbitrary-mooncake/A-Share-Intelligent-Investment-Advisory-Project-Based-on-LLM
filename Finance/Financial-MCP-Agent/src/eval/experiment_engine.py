@@ -120,5 +120,91 @@ class ExperimentEngine:
 
     def run_fidelity_test(self, term: str, scores_fast: List[float],
                            scores_production: List[float]) -> Dict[str, Any]:
-        """保真度测试：快模型 vs 生产模型"""
-        return self.run_consistency_test(term, scores_fast, scores_production)
+        """保真度测试：评测模型(M5) vs 生产模型(M1/M3)的4维度保真度分析。
+
+        使用 FidelityEngine 计算完整的4维保真度指标：
+          - action_flip_rate: 动作翻转率
+          - score_drift: 评分漂移
+          - topK_overlap: Top-K重叠率
+          - rank_drift: 排名漂移 (1.0 - Spearman ρ)
+
+        Args:
+            term: short/medium/long
+            scores_fast: 评测模型(M5)的评分列表
+            scores_production: 生产模型(M1/M3)的评分列表
+
+        Returns:
+            dict: 完整的4维保真度测试结果，可被 loss_engine.compute_L_consistency() 消费
+        """
+        n = min(len(scores_fast), len(scores_production))
+        if n == 0:
+            return {
+                "experiment_type": "fidelity",
+                "term": term,
+                "error": "no data",
+                "sample_size": 0,
+            }
+
+        # Also compute basic consistency metrics (score diff, flip rate, top-K overlap)
+        diffs = [abs(scores_fast[i] - scores_production[i]) for i in range(n)]
+        mean_diff = sum(diffs) / n
+
+        flips = sum(1 for i in range(n)
+                    if (scores_fast[i] >= 50) != (scores_production[i] >= 50))
+        action_flip_rate = flips / n
+
+        k = min(10, n)
+        top_fast = set(sorted(range(n), key=lambda i: scores_fast[i], reverse=True)[:k])
+        top_prod = set(sorted(range(n), key=lambda i: scores_production[i], reverse=True)[:k])
+        top_k_overlap = len(top_fast & top_prod) / k if k > 0 else 1.0
+
+        # Compute rank drift using Spearman correlation
+        from src.eval.loss_engine import spearman_rank_correlation
+        rho = spearman_rank_correlation(scores_fast[:n], scores_production[:n])
+        rank_drift = max(0.0, min(1.0, 1.0 - rho))
+
+        # Build snapshots in FidelityEngine-compatible format for true 4-dim computation
+        try:
+            from src.eval.fidelity_engine import FidelityEngine
+            fe = FidelityEngine(self.config)
+            snapshots = [
+                {
+                    "period": "eval_model",
+                    "symbols": [f"s{i}" for i in range(n)],
+                    "scores": scores_fast[:n],
+                    "actions": ["buy" if s >= 50 else "sell" for s in scores_fast[:n]],
+                },
+                {
+                    "period": "production_model",
+                    "symbols": [f"s{i}" for i in range(n)],
+                    "scores": scores_production[:n],
+                    "actions": ["buy" if s >= 50 else "sell" for s in scores_production[:n]],
+                },
+            ]
+            fidelity_result = fe.compute_fidelity_loss(snapshots)
+        except Exception:
+            fidelity_result = None
+
+        result = {
+            "experiment_type": "fidelity",
+            "term": term,
+            "mean_score_diff": round(mean_diff, 2),
+            "action_flip_rate": round(action_flip_rate, 4),
+            "top_k_overlap": round(top_k_overlap, 4),
+            "rank_drift": round(rank_drift, 4),
+            "spearman_rho": round(rho, 4),
+            "sample_size": n,
+        }
+
+        # Merge in full FidelityEngine result if available
+        if fidelity_result:
+            result.update({
+                "fidelity_loss": fidelity_result.get("fidelity_loss", 0.0),
+                "fidelity_action_flip_rate": fidelity_result.get("action_flip_rate", 0.0),
+                "fidelity_score_drift": fidelity_result.get("score_drift", 0.0),
+                "fidelity_topK_overlap": fidelity_result.get("topK_overlap", 1.0),
+                "fidelity_rank_drift": fidelity_result.get("rank_drift", 0.0),
+                "fidelity_warnings": fidelity_result.get("warnings", []),
+            })
+
+        return result

@@ -6,7 +6,7 @@ import os
 def test_job_status_enum_values():
     from src.eval.job_manager import JobStatus
     assert set(s.value for s in JobStatus) == {
-        "pending", "running", "completed", "failed", "orphaned"
+        "pending", "running", "cancelled", "cancelling", "completed", "failed", "orphaned"
     }
 
 

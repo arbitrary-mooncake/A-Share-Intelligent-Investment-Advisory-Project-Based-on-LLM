@@ -111,16 +111,31 @@ with tab1:
                         f"{emoji_map[h['status']]} **{label}池**: "
                         f"{h.get('suggested_action', '')}"
                     )
-                    if st.button(
-                        f"🔄 全量更新{label}池", key=f"health_full_{term}",
-                        use_container_width=True,
-                    ):
+                    # 两列: 全量 + 部分
+                    btn_cols = st.columns(2)
+                    with btn_cols[0]:
+                        full_clicked = st.button(
+                            f"🔄 全量", key=f"health_full_{term}",
+                            use_container_width=True,
+                        )
+                    with btn_cols[1]:
+                        _reserve = orch.pool_manager.get_reserve(term)
+                        _has_reserve = len(_reserve) > 0
+                        partial_clicked = st.button(
+                            f"🔧 部分", key=f"health_partial_{term}",
+                            use_container_width=True,
+                        )
+                        if not _has_reserve:
+                            st.caption("⚠️ 无候补")
+
+                    if full_clicked:
                         from src.eval.job_manager import JobManager, JobStatus
                         jm = JobManager()
                         progress_bar = st.progress(0, "Layer 0: 硬筛中...")
                         status_col1, status_col2, status_col3 = st.columns(3)
                         eta_display = st.empty()
                         stage_lines = st.empty()
+                        cancel_btn_col, _ = st.columns([1, 4])
 
                         try:
                             existing = jm.find_running(term)
@@ -130,12 +145,24 @@ with tab1:
                             else:
                                 job_id = jm.start_job(term)
 
+                            # ── Gap #23: 取消按钮（放在 while 循环外部）──
+                            cancel_full_key = f"cancel_health_full_{term}"
+                            with cancel_btn_col:
+                                if st.button("⏹ 取消", key=f"cancel_btn_health_full_{term}", use_container_width=True):
+                                    st.session_state[cancel_full_key] = True
+                                    st.rerun()
+
                             while True:
+                                # 检查取消请求（必须在循环顶部）
+                                if st.session_state.get(cancel_full_key):
+                                    jm.cancel(job_id)
+                                    st.session_state[cancel_full_key] = False
+                                    break
                                 job = jm.poll(job_id)
                                 if not job:
                                     st.error("任务信息丢失")
                                     break
-                                status = job.get("status")
+                                job_status = job.get("status")
                                 prog = job.get("progress") or {}
                                 pct = prog.get("overall_pct", 0) / 100.0
                                 eta = prog.get("eta_str", "计算中...")
@@ -161,7 +188,21 @@ with tab1:
                                     f" | 队列: {prog.get('queue_depth', 0)}只"
                                 )
 
-                                if status == JobStatus.COMPLETED.value:
+                                # mtime 检测: refined_pools.json 更新时自动重载内存
+                                try:
+                                    _rp_path = os.path.join(
+                                        os.path.dirname(os.path.dirname(
+                                            os.path.dirname(os.path.abspath(__file__)))),
+                                        "data", "eval", "refined_pools.json"
+                                    )
+                                    _mtime = os.path.getmtime(_rp_path)
+                                    if _mtime > st.session_state.get("pools_mtime", 0):
+                                        orch.pool_manager.pools = orch.pool_manager._load()
+                                        st.session_state["pools_mtime"] = _mtime
+                                except Exception:
+                                    pass
+
+                                if job_status == JobStatus.COMPLETED.value:
                                     progress_bar.progress(1.0, "完成!")
                                     result = prog.get("result") or {}
                                     st.success(
@@ -169,14 +210,175 @@ with tab1:
                                         f" | 耗时 {result.get('stats', {}).get('elapsed_s', 0) // 60}min"
                                     )
                                     st.rerun()
-                                if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value):
-                                    st.error(job.get("error") or f"任务状态: {status}")
+                                if job_status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value, JobStatus.CANCELLED.value):
+                                    if job_status == JobStatus.CANCELLED.value:
+                                        st.warning("更新已被取消。")
+                                        st.rerun()
+                                    st.error(job.get("error") or f"任务状态: {job_status}")
                                     with st.expander("📋 Worker 日志", expanded=False):
                                         st.code(jm.read_log(job_id, tail=200), language="log")
                                     break
                                 time.sleep(1.0)
                         except Exception as e:
                             st.error(f"更新启动失败: {e}")
+
+                    if partial_clicked and not _has_reserve:
+                        st.warning("候补名单为空，请先运行全量更新生成候补名单。")
+
+                    if partial_clicked and _has_reserve:
+                        # Run partial update via worker
+                        from src.eval.job_manager import JobManager, JobStatus
+                        jm = JobManager()
+                        p_progress_bar = st.progress(0, "部分更新: 读取候补...")
+                        p_status = st.empty()
+                        p_cancel_col, _ = st.columns([1, 4])
+
+                        try:
+                            existing = jm.find_running(term)
+                            if existing:
+                                st.info(f"已有正在跑的更新, 自动 attach")
+                                p_job_id = existing["job_id"]
+                            else:
+                                p_job_id = jm.start_job(term, mode="partial")
+
+                            # ── Gap #23: 取消按钮（放在 while 循环外部）──
+                            p_cancel_key = f"cancel_health_partial_{term}"
+                            with p_cancel_col:
+                                if st.button("⏹ 取消", key=f"cancel_btn_health_partial_{term}", use_container_width=True):
+                                    st.session_state[p_cancel_key] = True
+                                    st.rerun()
+
+                            while True:
+                                # 检查取消请求（必须在循环顶部）
+                                if st.session_state.get(p_cancel_key):
+                                    jm.cancel(p_job_id)
+                                    st.session_state[p_cancel_key] = False
+                                    break
+                                job = jm.poll(p_job_id)
+                                if not job:
+                                    st.error("任务信息丢失")
+                                    break
+                                j_status = job.get("status")
+                                prog = job.get("progress") or {}
+                                pct = prog.get("overall_pct", 0) / 100.0
+
+                                p_progress_bar.progress(min(pct, 1.0),
+                                    f"部分更新 {pct*100:.0f}%")
+                                p_status.markdown(
+                                    prog.get("current_stage_msg", "处理中..."))
+
+                                if j_status == JobStatus.COMPLETED.value:
+                                    p_progress_bar.progress(1.0, "完成!")
+                                    result = prog.get("result") or {}
+                                    stats = result.get("stats", {})
+                                    st.success(
+                                        f"部分更新完成！替换{stats.get('removed', 0)}只, "
+                                        f"新增{stats.get('added', 0)}只, "
+                                        f"池大小{result.get('final_pool_size', 0)}只"
+                                    )
+                                    st.rerun()
+                                if j_status in (JobStatus.FAILED.value,
+                                               JobStatus.ORPHANED.value,
+                                               JobStatus.CANCELLED.value):
+                                    if j_status == JobStatus.CANCELLED.value:
+                                        st.warning("部分更新已被取消。")
+                                        st.rerun()
+                                    err = job.get("error", "")
+                                    if err == "reserve_empty":
+                                        st.warning("候补名单为空，请先全量更新")
+                                    else:
+                                        st.error(err or f"状态: {j_status}")
+                                    break
+                                time.sleep(1.0)
+                        except Exception as e:
+                            st.error(f"部分更新启动失败: {e}")
+
+        # 检查精筛池未满的情况 (非健康告警但可部分更新)
+        _underfilled = []
+        for _term, _label, _target in [("short", "短线", 100), ("medium", "中线", 80), ("long", "长线", 60)]:
+            _pool = orch.pool_manager.get_pool_with_scores(_term)
+            _sz = len(_pool) if isinstance(_pool, list) else 0
+            if _sz < _target and _term not in [t for t, _ in problem_terms]:
+                _underfilled.append((_term, _label, _target, _sz))
+
+        if _underfilled:
+            st.markdown("---")
+            st.caption("以下精筛池未满，可进行部分更新补充：")
+            uf_cols = st.columns(len(_underfilled))
+            for _j, (_term, _label, _target, _sz) in enumerate(_underfilled):
+                with uf_cols[_j]:
+                    st.caption(f"**{_label}池**: {_sz}/{_target}只")
+                    _uf_reserve = orch.pool_manager.get_reserve(_term)
+                    _uf_has_reserve = len(_uf_reserve) > 0
+                    uf_partial_clicked = st.button(
+                        f"🔧 部分更新{_label}池", key=f"uf_partial_{_term}",
+                        use_container_width=True,
+                    )
+                    if not _uf_has_reserve:
+                        st.caption("⚠️ 无候补")
+
+                    if uf_partial_clicked and not _uf_has_reserve:
+                        st.warning("候补名单为空，请先运行全量更新生成候补名单。")
+
+                    if uf_partial_clicked and _uf_has_reserve:
+                        from src.eval.job_manager import JobManager, JobStatus
+                        jm = JobManager()
+                        uf_pb = st.progress(0, "部分更新中...")
+                        uf_cancel_col, _ = st.columns([1, 4])
+                        try:
+                            existing = jm.find_running(_term)
+                            if existing:
+                                uf_job_id = existing["job_id"]
+                            else:
+                                uf_job_id = jm.start_job(_term, mode="partial")
+
+                            # ── Gap #23: 取消按钮（放在 while 循环外部）──
+                            uf_cancel_key = f"cancel_uf_partial_{_term}"
+                            with uf_cancel_col:
+                                if st.button("⏹ 取消", key=f"cancel_btn_uf_partial_{_term}", use_container_width=True):
+                                    st.session_state[uf_cancel_key] = True
+                                    st.rerun()
+
+                            while True:
+                                # 检查取消请求（必须在循环顶部）
+                                if st.session_state.get(uf_cancel_key):
+                                    jm.cancel(uf_job_id)
+                                    st.session_state[uf_cancel_key] = False
+                                    break
+                                job = jm.poll(uf_job_id)
+                                if not job:
+                                    st.error("任务信息丢失")
+                                    break
+                                j_status = job.get("status")
+                                prog = job.get("progress") or {}
+                                pct = prog.get("overall_pct", 0) / 100.0
+                                uf_pb.progress(min(pct, 1.0), f"部分更新 {pct*100:.0f}%")
+
+                                if j_status == JobStatus.COMPLETED.value:
+                                    uf_pb.progress(1.0, "完成!")
+                                    result = prog.get("result") or {}
+                                    stats = result.get("stats", {})
+                                    st.success(
+                                        f"部分更新完成！替换{stats.get('removed', 0)}只, "
+                                        f"新增{stats.get('added', 0)}只, "
+                                        f"池大小{result.get('final_pool_size', 0)}只"
+                                    )
+                                    st.rerun()
+                                if j_status in (JobStatus.FAILED.value,
+                                               JobStatus.ORPHANED.value,
+                                               JobStatus.CANCELLED.value):
+                                    if j_status == JobStatus.CANCELLED.value:
+                                        st.warning("部分更新已被取消。")
+                                        st.rerun()
+                                    err = job.get("error", "")
+                                    if err == "reserve_empty":
+                                        st.warning("候补名单为空，请先全量更新")
+                                    else:
+                                        st.error(err or f"状态: {j_status}")
+                                    break
+                                time.sleep(1.0)
+                        except Exception as e:
+                            st.error(f"部分更新启动失败: {e}")
     else:
         st.info("精筛池未初始化，请先运行评测系统。")
 

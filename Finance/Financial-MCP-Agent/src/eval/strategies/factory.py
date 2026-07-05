@@ -42,7 +42,7 @@ def get_strategy(term: str, strategy_type: str = "default",
     if strategy_cls is None:
         raise ValueError(f"Unknown strategy: term={term}, type={strategy_type}")
 
-    return strategy_cls(config)
+    return strategy_cls(config, term=term)
 
 
 def list_strategies() -> Dict:

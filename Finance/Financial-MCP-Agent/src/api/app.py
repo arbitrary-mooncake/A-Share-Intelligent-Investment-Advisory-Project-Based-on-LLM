@@ -800,7 +800,7 @@ def _compute_price_changes(kline_data: List[Dict]) -> Dict[str, str]:
         base_close = closes[idx][1]
         if base_close and base_close != 0:
             pct = (latest_close - base_close) / base_close * 100
-            result[key] = f"{pct:.1f}%"
+            result[key] = f"{pct:.2f}%"
         else:
             result[key] = "N/A"
 

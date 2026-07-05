@@ -203,10 +203,10 @@ class FidelityEngine:
 
     def _compute_action_flip_rate(self, prev: dict, curr: dict) -> float:
         """How often does recommendation flip between consecutive periods."""
-        prev_actions = prev.get("actions", [])
-        curr_actions = curr.get("actions", [])
-        prev_symbols = prev.get("symbols", [])
-        curr_symbols = curr.get("symbols", [])
+        prev_actions = prev.get("actions") or []
+        curr_actions = curr.get("actions") or []
+        prev_symbols = prev.get("symbols") or []
+        curr_symbols = curr.get("symbols") or []
 
         n = min(len(prev_actions), len(curr_actions))
         if n == 0:
@@ -230,8 +230,8 @@ class FidelityEngine:
 
     def _compute_score_drift(self, prev: dict, curr: dict) -> float:
         """Mean absolute difference between consecutive scores."""
-        prev_scores = prev.get("scores", [])
-        curr_scores = curr.get("scores", [])
+        prev_scores = prev.get("scores") or []
+        curr_scores = curr.get("scores") or []
         n = min(len(prev_scores), len(curr_scores))
         if n == 0:
             return 0.0
@@ -241,10 +241,10 @@ class FidelityEngine:
     def _compute_topk_overlap(self, prev: dict, curr: dict) -> float:
         """Jaccard overlap of top-K recommendations between periods."""
         k = self.k_value
-        prev_symbols = prev.get("symbols", [])
-        curr_symbols = curr.get("symbols", [])
-        prev_scores = prev.get("scores", [])
-        curr_scores = curr.get("scores", [])
+        prev_symbols = prev.get("symbols") or []
+        curr_symbols = curr.get("symbols") or []
+        prev_scores = prev.get("scores") or []
+        curr_scores = curr.get("scores") or []
 
         prev_topk = self._get_topk_symbols(prev_symbols, prev_scores, k)
         curr_topk = self._get_topk_symbols(curr_symbols, curr_scores, k)
@@ -272,8 +272,8 @@ class FidelityEngine:
 
         Returns 0.0 when rankings are identical, approaches 1.0 as they diverge.
         """
-        prev_scores = prev.get("scores", [])
-        curr_scores = curr.get("scores", [])
+        prev_scores = prev.get("scores") or []
+        curr_scores = curr.get("scores") or []
         n = min(len(prev_scores), len(curr_scores))
         if n < 2:
             return 0.0
@@ -384,6 +384,71 @@ class FidelityEngine:
             })
 
         return self.compute_fidelity_loss(snapshots)
+
+    def get_fidelity_summary(
+        self,
+        snapshots: Optional[List[dict]] = None,
+        fidelity_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """返回简洁的保真度摘要，适合 loss_engine 消费。
+
+        优先使用已计算的 fidelity_result，否则从 snapshots 自行计算。
+        输出格式精简为 loss_engine 所需的字段，便于在 compute_module_losses() 中直接使用。
+
+        Args:
+            snapshots: 快照列表（与 compute_fidelity_loss 格式相同）
+            fidelity_result: FidelityEngine.compute_fidelity_loss() 的预计算结果
+
+        Returns:
+            dict: {
+                "fidelity_loss": float,       # 0.0-1.0 综合保真度损失
+                "action_flip_rate": float,
+                "score_drift": float,
+                "topK_overlap": float,
+                "rank_drift": float,
+                "warnings": List[str],
+                "period_pairs": int,
+                "computed": bool,              # 是否成功计算
+            }
+        """
+        try:
+            if fidelity_result is None and snapshots:
+                fidelity_result = self.compute_fidelity_loss(snapshots)
+
+            if fidelity_result is None:
+                return {
+                    "fidelity_loss": 0.0,
+                    "action_flip_rate": 0.0,
+                    "score_drift": 0.0,
+                    "topK_overlap": 1.0,
+                    "rank_drift": 0.0,
+                    "warnings": [],
+                    "period_pairs": 0,
+                    "computed": False,
+                }
+
+            return {
+                "fidelity_loss": fidelity_result.get("fidelity_loss", 0.0),
+                "action_flip_rate": fidelity_result.get("action_flip_rate", 0.0),
+                "score_drift": fidelity_result.get("score_drift", 0.0),
+                "topK_overlap": fidelity_result.get("topK_overlap", 1.0),
+                "rank_drift": fidelity_result.get("rank_drift", 0.0),
+                "warnings": fidelity_result.get("warnings", []),
+                "period_pairs": fidelity_result.get("period_pairs_analyzed", 0),
+                "computed": fidelity_result.get("period_pairs_analyzed", 0) > 0,
+            }
+        except Exception as e:
+            logger.warning(f"get_fidelity_summary failed: {e}")
+            return {
+                "fidelity_loss": 0.0,
+                "action_flip_rate": 0.0,
+                "score_drift": 0.0,
+                "topK_overlap": 1.0,
+                "rank_drift": 0.0,
+                "warnings": [f"Error: {str(e)}"],
+                "period_pairs": 0,
+                "computed": False,
+            }
 
 
 # ──────────────────────────── Helpers ────────────────────────────

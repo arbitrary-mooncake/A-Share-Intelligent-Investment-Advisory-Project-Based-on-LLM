@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Callable, Optional
 
@@ -187,9 +188,12 @@ def _is_stock_excluded(stock: Dict[str, Any]) -> bool:
     return False
 
 
-async def hard_screen() -> List[Dict[str, Any]]:
+async def hard_screen(term: str = None) -> List[Dict[str, Any]]:
     """
-    Layer 0: 从Tushare获取全A股 → 硬筛(ST/BJ/B/新股/低成交额) → 返回候选列表。
+    Layer 0: 从Tushare获取全A股 → 硬筛(ST/BJ/B/新股/低成交额/黑名单) → 返回候选列表。
+
+    Args:
+        term: short/medium/long. 提供时仅过滤对应 term 黑名单; None 时过滤所有 term。
 
     Returns:
         [{"ts_code": "603871.SH", "name": "嘉友国际", "industry": "物流", ...}, ...]
@@ -296,7 +300,40 @@ async def hard_screen() -> List[Dict[str, Any]]:
 
     logger.info("  成交量筛选后: %d只 (剔除%d只低成交额)",
                 len(volume_filtered), len(filtered) - len(volume_filtered))
+
+    # ── 阶段C: 黑名单过滤 (查所有 term — 基本面卖出不应进入任何池) ──
+    pm = PoolManager()
+    blacklist_codes: set = set()
+    now = datetime.now()
+    bl = pm.pools.get("blacklist", {})
+    for term_key in ("short", "medium", "long"):
+        entries = bl.get(term_key, []) if isinstance(bl, dict) else []
+        for entry in entries:
+            expires_str = entry.get("expires_at", "")
+            if expires_str:
+                try:
+                    if now <= datetime.fromisoformat(expires_str):
+                        blacklist_codes.add(entry.get("code", ""))
+                except (ValueError, TypeError):
+                    blacklist_codes.add(entry.get("code", ""))
+    if blacklist_codes:
+        before = len(volume_filtered)
+        volume_filtered = [
+            s for s in volume_filtered
+            if _ts_to_internal(s.get("ts_code", "")) not in blacklist_codes
+        ]
+        logger.info("  黑名单过滤: %d → %d只 (剔除%d只黑名单)",
+                    before, len(volume_filtered), before - len(volume_filtered))
     return volume_filtered
+
+
+def _ts_to_internal(ts_code: str) -> str:
+    """Convert Tushare ts_code (603871.SH) to internal code (sh.603871)."""
+    if ts_code.endswith(".SH"):
+        return f"sh.{ts_code[:6]}"
+    elif ts_code.endswith(".SZ"):
+        return f"sz.{ts_code[:6]}"
+    return ts_code
 
 
 # ═══════════════════════════════════════════════════════════
@@ -973,7 +1010,7 @@ async def formal_score_layer3(
                     completed_count += 1
                 return
 
-        engine = ScoringEngine()
+        engine = ScoringEngine(pool_manager=False)  # 禁用 stock_pool.json 写入，保持两个精筛池隔离
         try:
             async with sem:
                 result = await engine.score_stock(code, name)
@@ -1185,6 +1222,28 @@ class PipelineProgress:
             except Exception:
                 pass
 
+    def report_completed_stock(self, stock_info: dict):
+        """Report a completed stock to the progress callback (separate from stage progress)."""
+        if self.on_progress:
+            try:
+                self.on_progress({
+                    "new_completed_stocks": [stock_info],
+                    "overall_pct": round(self.overall_progress_pct * 100, 1),
+                    "elapsed_s": round(self.elapsed_seconds),
+                    "eta_s": round(self.eta_seconds),
+                    "eta_str": self.eta_str,
+                    "queue_depth": self.queue_depth,
+                    "stages": {
+                        k: {"label": v["label"], "pct": round(
+                             min(v["done"] / v["total"] * 100, 100) if v["total"] > 0 else 0, 1),
+                            "done": v["done"], "total": v["total"]}
+                        for k, v in self.stages.items()
+                    },
+                    "stall_s": round(self.stall_seconds),
+                })
+            except Exception:
+                pass
+
     def check_stall(self) -> Optional[str]:
         """检查是否卡死。返回警告消息或 None."""
         stall = self.stall_seconds
@@ -1239,7 +1298,7 @@ async def _layer3_consumer(
     # 并发数 5 (2026-07-02 从 8 回退): 冷启动时 8 并发 × 7 agent ≈ 56 路 MCP stdio
     # 调用会严重阻塞 Tushare/MCP 通道, 实测单只股票 Phase 1 从 13s 涨到 739s,
     # 5 并发 × 7 agent ≈ 35 路更稳健, 与 CLAUDE.md 架构文档对齐。
-    shared_engine = ScoringEngine()
+    shared_engine = ScoringEngine(pool_manager=False)  # 禁用 stock_pool.json 写入，保持两个精筛池隔离
     sem = asyncio.Semaphore(5)
     completed = 0
     total_dispatched = 0
@@ -1248,11 +1307,33 @@ async def _layer3_consumer(
                  "long": "long_term_score"}
     cache_date = datetime.now().strftime("%Y-%m-%d")
 
+    # B2: 预加载黑名单 (per-term)
+    _pm = PoolManager()
+    _blacklist_codes: set = set()
+    _now = datetime.now()
+    _bl = _pm.pools.get("blacklist", {})
+    _bl_entries = _bl.get(term, []) if isinstance(_bl, dict) else []
+    for _e in _bl_entries:
+        _exp = _e.get("expires_at", "")
+        if _exp:
+            try:
+                if _now <= datetime.fromisoformat(_exp):
+                    _blacklist_codes.add(_e.get("code", ""))
+            except (ValueError, TypeError):
+                _blacklist_codes.add(_e.get("code", ""))
+
     async def _score_one(stock: Dict[str, Any]):
         nonlocal completed, last_heartbeat
         from src.utils.cache_utils import read_cache, write_cache
         code = stock.get("code", "")
         name = stock.get("name", code)
+
+        # B2: 黑名单阻断
+        if code in _blacklist_codes:
+            logger.info("[L3] %s 在%s黑名单, 跳过评分", code, term)
+            queue.task_done()
+            return
+
         safe_code = code.replace(".", "_").replace("/", "_")
         entry = {**stock, "final_score": 50, "recommendation": ""}
 
@@ -1287,9 +1368,15 @@ async def _layer3_consumer(
                     if progress:
                         progress.stage_progress("3_formal_score", completed)
                         progress.queue_depth = queue.qsize()
+                        progress.report_completed_stock({
+                            "code": code, "name": name,
+                            "final_score": entry.get("final_score"),
+                            "recommendation": entry.get("recommendation", ""),
+                        })
                 queue.task_done()
                 return
 
+        t_start = time.time()
         try:
             # 共用 engine 实例, 只靠 semaphore 控制并发
             async with sem:
@@ -1297,6 +1384,7 @@ async def _layer3_consumer(
                     shared_engine.score_stock(code, name),
                     timeout=per_task_timeout,
                 )
+            elapsed = time.time() - t_start
             if result and result.get("score_data"):
                 try:
                     write_cache("full_pool_analysis", safe_code, cache_date,
@@ -1312,13 +1400,18 @@ async def _layer3_consumer(
                     actual_score = score
                 rec = sd.get("recommendation", "")
                 entry = {**stock, "final_score": actual_score, "recommendation": rec}
+                logger.info("[L3] %s 完成 (%.0fs) score=%s", code, elapsed, actual_score)
             else:
                 entry = {**stock, "final_score": 50, "recommendation": ""}
+                logger.warning("[L3] %s 无评分数据 (%.0fs)", code, elapsed)
         except asyncio.TimeoutError:
-            logger.warning("  Layer3 超时 %s (%.0fs), 使用默认分数", code, per_task_timeout)
+            elapsed = time.time() - t_start
+            logger.error("[L3] %s 超时 (%.0fs, limit=%.0fs)", code, elapsed, per_task_timeout)
             entry = {**stock, "final_score": 40, "recommendation": "超时"}
         except Exception as e:
-            logger.warning("  Layer3 评分失败 %s: %s", code, e)
+            elapsed = time.time() - t_start
+            exc_type = type(e).__name__
+            logger.error("[L3] %s 失败 (%.0fs, %s): %s", code, elapsed, exc_type, e)
             entry = {**stock, "final_score": 40, "recommendation": ""}
 
         async with lock:
@@ -1332,6 +1425,11 @@ async def _layer3_consumer(
             if progress:
                 progress.stage_progress("3_formal_score", completed)
                 progress.queue_depth = queue.qsize()
+                progress.report_completed_stock({
+                    "code": code, "name": name,
+                    "final_score": entry.get("final_score"),
+                    "recommendation": entry.get("recommendation", ""),
+                })
         queue.task_done()
 
     # 主循环: 从队列拉取任务, 分派到 _score_one
@@ -1376,14 +1474,15 @@ async def _safe_queue_put(queue: asyncio.Queue, item: Any, label: str = "",
     """
     try:
         await asyncio.wait_for(queue.put(item), timeout=timeout)
+        if isinstance(item, dict) and "code" in item:
+            logger.debug("[%s] dispatch %s to L3", label, item["code"])
     except asyncio.TimeoutError:
         if item is None:
             logger.warning("[%s] 毒丸入队超时, 重试...", label)
             await queue.put(item)  # 毒丸必须入队, 无限等待
         else:
-            logger.warning("[%s] 队列满 %.0fs, 丢弃 %s",
-                          label, timeout,
-                          item.get("code", str(item)) if isinstance(item, dict) else str(item))
+            code = item.get("code", str(item)) if isinstance(item, dict) else str(item)
+            logger.warning("[%s] 队列满 %.0fs, 丢弃 %s", label, timeout, code)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1433,7 +1532,7 @@ async def run_pool_update_v3(
     # ── Layer 0: Hard Screen ──
     _stage("0_hard_screen", "从Tushare获取全A股, 硬筛...")
     progress.stage_start("0_hard_screen")
-    ts_stocks = await hard_screen()
+    ts_stocks = await hard_screen(term=term)
     progress.stage_end("0_hard_screen")
     result["stages"]["0_hard_screen"] = f"硬筛后{len(ts_stocks)}只"
     if len(ts_stocks) < target_size:
@@ -1457,9 +1556,39 @@ async def run_pool_update_v3(
     layer2_pending_tasks: List[asyncio.Task] = []
     layer2_task_lock = asyncio.Lock()
 
+    # Checkpoint: 每 5 分钟写一次 refined_pools.json, crash 时最多丢 5 分钟工作
+    CHECKPOINT_INTERVAL = 300  # 5 分钟
+    _last_checkpoint = time.time()
+
+    def _write_checkpoint():
+        """中间 checkpoint: 把当前已完成的 L3 股票按 final_score 排序写入."""
+        if not layer3_results:
+            return
+        sorted_results = sorted(layer3_results,
+                               key=lambda r: r.get("final_score", 0),
+                               reverse=True)
+        pool_checkpoint = sorted_results[:target_size]
+        pm.update_pool(term, pool_checkpoint)
+        pool_data = pm.pools.get(term, {})
+        pool_data["_checkpoint_in_progress"] = True
+        pool_data["_checkpoint_completed_count"] = len(layer3_results)
+        pm._save()
+        logger.info("[V3:%s] Checkpoint: %d/%d L3完成, 写入top-%d到精筛池",
+                   term, len(layer3_results), target_size, len(pool_checkpoint))
+
+    # D4: L3 配额控制
+    L3_DISPATCH_RATIO = 1.5
+    WHITELIST_RATIO = 0.75
+    whitelist_dispatched = 0
+    whitelist_quota = int(target_size * WHITELIST_RATIO)
+    total_l3_quota = int(target_size * L3_DISPATCH_RATIO)
+
     # Layer 2 流式堆 + fallback flag
     def alpha_fn():
-        return calc_alpha(len(whitelist), stream_heap.total, target_size, ratio)
+        heap_slots = total_l3_quota - whitelist_dispatched
+        if heap_slots <= 0 or stream_heap.total == 0:
+            return 0.0
+        return min(1.0, heap_slots / stream_heap.total)
     stream_heap = StreamingTopAlphaHeap(alpha_fn=alpha_fn, epsilon=3.0, stable_batches=3)
     layer2_fallback = False  # 如果 DSV4Pro 失败, 用 Layer 1 兜底
 
@@ -1496,6 +1625,11 @@ async def run_pool_update_v3(
         progress.stage_progress("1_batch_score", layer1_scored)
         progress.emit_progress()
 
+        # Checkpoint 检查
+        if time.time() - _last_checkpoint > CHECKPOINT_INTERVAL:
+            _write_checkpoint()
+            _last_checkpoint = time.time()
+
         new_recommended = []
         for stock in batch:
             code = stock.get("code", "")
@@ -1507,9 +1641,16 @@ async def run_pool_update_v3(
             level = stock.get("layer1_level", "")
 
             if level == "强烈推荐":
-                whitelist.append(stock)
-                layer1_stats["whitelist"] += 1
-                await _safe_queue_put(layer3_queue, stock, "L3-whitelist")
+                if whitelist_dispatched < whitelist_quota:
+                    whitelist.append(stock)
+                    layer1_stats["whitelist"] += 1
+                    await _safe_queue_put(layer3_queue, stock, "L3-whitelist")
+                    whitelist_dispatched += 1
+                else:
+                    new_recommended.append(stock)
+                    layer1_stats["recommended"] += 1
+                    logger.debug("[V3:%s] 白名单配额已满 (%d), %s 改道进 L2",
+                                term, whitelist_quota, code)
             elif level == "推荐":
                 new_recommended.append(stock)
                 layer1_stats["recommended"] += 1
@@ -1597,6 +1738,16 @@ async def run_pool_update_v3(
     progress.stage_end("2_stream_heap")
     progress.queue_depth = layer3_queue.qsize()
 
+    # ── L3 total 修正: 用实际 dispatch 数替换粗略上界 ──
+    actual_l3_dispatch = len(layer3_results) + layer3_queue.qsize()
+    # 如果没有 completed 且 queue 是空的, 用 whitelist + heap 估算
+    if actual_l3_dispatch == 0:
+        actual_l3_dispatch = len(whitelist) + stream_heap.high_size
+    corrected_total = max(actual_l3_dispatch, target_size)
+    progress.stages["3_formal_score"]["total"] = corrected_total
+    logger.info("[V3:%s] L3 total corrected: %d (whitelist=%d, heap_high=%d)",
+               term, corrected_total, len(whitelist), stream_heap.high_size)
+
     # ── Layer 3 收尾 ──
     _stage("3_wait", f"等待 Layer 3 完成 (队列剩余{layer3_queue.qsize()}只)...")
     await asyncio.sleep(2.0)  # 让最后几个入队任务被消费
@@ -1615,17 +1766,57 @@ async def run_pool_update_v3(
     except asyncio.CancelledError:
         pass
 
-    # ── 截断到 target_size ──
+    # ── 截断到 target_size (排除黑名单) ──
+    all_bl_codes = set()
+    for b in blacklist + blacklist_final:
+        code = b.get("code", "")
+        if code:
+            all_bl_codes.add(code)
+    # 也排除已持久化的黑名单
+    _bl = pm.pools.get("blacklist", {})
+    _now = datetime.now()
+    _entries = _bl.get(term, []) if isinstance(_bl, dict) else []
+    for _e in _entries:
+        _exp = _e.get("expires_at", "")
+        if _exp:
+            try:
+                if _now <= datetime.fromisoformat(_exp):
+                    all_bl_codes.add(_e.get("code", ""))
+            except (ValueError, TypeError):
+                all_bl_codes.add(_e.get("code", ""))
+
     async with layer3_lock:
         scored = sorted(layer3_results, key=lambda x: x.get("final_score", 0), reverse=True)
-        pool_final = scored[:target_size]
+        scored_filtered = [s for s in scored if s.get("code", "") not in all_bl_codes]
+        pool_final = scored_filtered[:target_size]
+        n_bl_removed = len(scored) - len(scored_filtered)
+        if n_bl_removed > 0:
+            logger.info("[V3:%s] 截断时排除 %d 只黑名单股票", term, n_bl_removed)
+
+    # ── 提取候补名单 (reserve): 排名在 pool_final 之后的候选 ──
+    reserve_size = target_size // 2
+    pool_codes = {s.get("code", "") for s in pool_final}
+    reserve_candidates = [
+        {
+            "code": s.get("code", ""),
+            "name": s.get("name", ""),
+            "final_score": s.get("final_score", 0),
+            "recommendation": s.get("recommendation", ""),
+        }
+        for s in scored_filtered
+        if s.get("code", "") not in pool_codes
+    ][:reserve_size]
+    logger.info("[V3:%s] 候补名单: %d只 (从%d只候选中提取)",
+               term, len(reserve_candidates), len(scored_filtered) - len(pool_final))
 
     stats = {
         "candidates": len(layer3_results),
         "scored": len(layer3_results),
         "whitelist_final": len(whitelist_final),
         "blacklist_final": len(blacklist_final),
+        "blacklist_removed_from_pool": n_bl_removed,
         "pool_size": len(pool_final),
+        "reserve_size": len(reserve_candidates),
         "layer2_fallback": layer2_fallback,
         "elapsed_s": round(progress.elapsed_seconds),
         "score_range": {
@@ -1636,17 +1827,21 @@ async def run_pool_update_v3(
 
     # ── 持久化 ──
     pm.clean_expired_blacklist()
+    # 最终写入前清除 checkpoint 标记
+    pool_data = pm.pools.get(term, {})
+    pool_data.pop("_checkpoint_in_progress", None)
+    pool_data.pop("_checkpoint_completed_count", None)
     pm.update_pool(term, pool_final)
+    # 候补名单随精筛池一并写入
+    pm.save_reserve(term, reserve_candidates)
 
-    blacklist_expiry = eval_get("blacklist_expiry_days", 120)
     all_blacklist = blacklist + blacklist_final
     for b in all_blacklist:
         code = b.get("code", "")
-        if code and not pm.is_blacklisted(code):
+        if code and not pm.is_blacklisted(code, term):
             pm.add_to_blacklist(
-                code,
+                code, term,
                 b.get("layer1_reason", b.get("recommendation", "批量粗筛判定")),
-                expiry_days=blacklist_expiry,
             )
 
     result["pool"] = pool_final
@@ -1660,6 +1855,175 @@ async def run_pool_update_v3(
            f"(白{layer1_stats['whitelist']}, 推{layer1_stats['recommended']}, "
            f"弃{layer1_stats['neutral_avoid']}, 卖{layer1_stats['sell']})")
     progress.emit_progress()
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# Partial Update (部分更新: 替换底部20%)
+# ═══════════════════════════════════════════════════════════
+
+async def run_pool_update_partial(
+    term: str = "short",
+    on_stage: Optional[Callable] = None,
+    on_progress: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """部分更新: 替换精筛池底部20%的股票，用候补名单中2x数量的候选重新L3打分。
+
+    流程:
+      1. 读取当前精筛池，按 final_score 排序，找出底部 20%
+      2. 读取候补名单，取前 2×replace_count 只候选
+      3. 对候选重新运行 L3 打分 (ScoringEngine)
+      4. 取重新打分后 top replace_count 只替换底部
+      5. 保留池中原有 top 80% 不动
+
+    Args:
+        term: short/medium/long
+        on_stage: 阶段回调
+        on_progress: 进度回调
+
+    Returns:
+        {term, pool, removed, added, stats, final_pool_size}
+    """
+    pm = PoolManager()
+    target_size = {"short": 100, "medium": 80, "long": 60}[term]
+    replace_count = max(1, target_size // 5)  # 20%
+    oversample = replace_count * 2
+
+    def _stage(name, msg):
+        logger.info("[PartialUpdate:%s] %s: %s", term, name, msg)
+        if on_stage:
+            on_stage(name, msg)
+
+    result = {"term": term, "mode": "partial"}
+
+    # ── Step 1: 读取当前池，找出底部 ──
+    _stage("1_read_pool", "读取当前精筛池...")
+    current_pool = pm.get_pool_with_scores(term)
+    if not isinstance(current_pool, list) or len(current_pool) == 0:
+        return {"error": f"精筛池[{term}]为空，请先全量更新"}
+
+    # 按 final_score 升序排序，底部在前
+    sorted_pool = sorted(current_pool, key=lambda s: s.get("final_score", 0))
+    bottom = sorted_pool[:replace_count]
+    top = sorted_pool[replace_count:]
+
+    removed_codes = [s.get("code", "") for s in bottom]
+    _stage("1_done", f"底部{replace_count}只待替换: "
+           f"{', '.join(s.get('name', s.get('code', '?')) for s in bottom[:5])}"
+           f"{'...' if len(bottom) > 5 else ''}")
+
+    # ── Step 2: 读取候补名单 ──
+    _stage("2_read_reserve", "读取候补名单...")
+    reserve = pm.get_reserve(term)
+    if not reserve:
+        return {"error": "reserve_empty", "message": "候补名单为空，请先全量更新"}
+
+    # 排除已在池中的 + 黑名单
+    pool_codes = {s.get("code", "") for s in current_pool}
+    bl_codes = set()
+    _bl = pm.pools.get("blacklist", {})
+    _now = datetime.now()
+    for _term_key in ("short", "medium", "long"):
+        for _e in (_bl.get(_term_key, []) if isinstance(_bl, dict) else []):
+            _exp = _e.get("expires_at", "")
+            if _exp:
+                try:
+                    if _now <= datetime.fromisoformat(_exp):
+                        bl_codes.add(_e.get("code", ""))
+                except (ValueError, TypeError):
+                    pass
+
+    candidates = [
+        r for r in reserve
+        if r.get("code", "") not in pool_codes and r.get("code", "") not in bl_codes
+    ][:oversample]
+
+    if len(candidates) < replace_count:
+        logger.warning("[PartialUpdate:%s] 候补不足: 需要%d只, 仅有%d只",
+                      term, replace_count, len(candidates))
+
+    _stage("2_done", f"候补候选{len(candidates)}只 (从{len(reserve)}只中筛选)")
+
+    if on_progress:
+        on_progress({"overall_pct": 10.0, "stage": "reserve_read",
+                    "candidates": len(candidates)})
+
+    # ── Step 3: 对候选重新 L3 打分 ──
+    _stage("3_rescore", f"对{len(candidates)}只候补重新L3打分...")
+    from src.stock_pool.scoring_engine import ScoringEngine
+
+    shared_engine = ScoringEngine(pool_manager=False)
+    sem = asyncio.Semaphore(5)
+    rescore_lock = asyncio.Lock()
+    rescored: List[Dict[str, Any]] = []
+    completed = 0
+
+    async def _rescore_one(candidate: Dict[str, Any]):
+        nonlocal completed
+        code = candidate.get("code", "")
+        name = candidate.get("name", code)
+
+        try:
+            async with sem:
+                result_data = await asyncio.wait_for(
+                    shared_engine.score_stock(code, name),
+                    timeout=900.0,
+                )
+            if result_data and result_data.get("score_data"):
+                sd = result_data["score_data"]
+                term_key = {"short": "short_term_score", "medium": "medium_term_score",
+                           "long": "long_term_score"}[term]
+                ts = sd.get(term_key, {})
+                actual_score = ts.get("score") if isinstance(ts, dict) else sd.get("score", 50)
+                if actual_score is None:
+                    actual_score = sd.get("score", 50)
+                rec = sd.get("recommendation", "")
+                entry = {**candidate, "final_score": actual_score, "recommendation": rec}
+            else:
+                entry = {**candidate, "final_score": candidate.get("final_score", 50)}
+        except asyncio.TimeoutError:
+            logger.error("[PartialUpdate] %s L3超时 (>900s)", code)
+            entry = {**candidate, "final_score": 40, "recommendation": "超时"}
+        except Exception as e:
+            logger.error("[PartialUpdate] %s L3失败 (%s): %s", code, type(e).__name__, e)
+            entry = {**candidate, "final_score": 40, "recommendation": ""}
+
+        async with rescore_lock:
+            rescored.append(entry)
+            completed += 1
+            if on_progress:
+                pct = 10.0 + 80.0 * (completed / max(len(candidates), 1))
+                on_progress({"overall_pct": round(pct, 1), "stage": "rescoring",
+                           "completed": completed, "total": len(candidates)})
+
+    tasks = [asyncio.create_task(_rescore_one(c)) for c in candidates]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    _stage("3_done", f"L3打分完成: {len(rescored)}只")
+
+    # ── Step 4: 取 top N 替换底部 ──
+    _stage("4_merge", "合并新旧池...")
+    rescored.sort(key=lambda s: s.get("final_score", 0), reverse=True)
+    new_stocks = rescored[:replace_count]
+
+    stats = pm.update_pool_partial(term, new_stocks, removed_codes)
+
+    if on_progress:
+        on_progress({"overall_pct": 100.0, "stage": "done"})
+
+    result["pool"] = pm.get_pool_with_scores(term)
+    result["removed"] = bottom
+    result["added"] = new_stocks
+    result["stats"] = {
+        **stats,
+        "candidates_rescored": len(rescored),
+        "elapsed_s": 0,
+    }
+    result["final_pool_size"] = stats["new_pool_size"]
+
+    _stage("done", f"部分更新完成: 替换{stats['removed']}只, "
+           f"新增{stats['added']}只, 保留{stats['kept']}只, "
+           f"池大小{stats['new_pool_size']}只")
     return result
 
 
@@ -1704,7 +2068,7 @@ async def run_pool_update(
 
     # ── Layer 0: Hard Screen ──
     _stage("0_hard_screen", "从Tushare获取全A股, 硬筛去除ST/新股/BJ/B股/低成交额...")
-    ts_stocks = await hard_screen()
+    ts_stocks = await hard_screen(term=term)
     result["stages"]["0_hard_screen"] = f"硬筛后{len(ts_stocks)}只"
 
     if len(ts_stocks) < target_size:
@@ -1740,15 +2104,13 @@ async def run_pool_update(
     pm.update_pool(term, layer3["pool"])
 
     # 黑名单入库 (Layer1 + Layer3)
-    blacklist_expiry = eval_get("blacklist_expiry_days", 120)
     all_blacklist = layer1["blacklist"] + layer3.get("blacklist", [])
     for b in all_blacklist:
         code = b.get("code", "")
-        if code and not pm.is_blacklisted(code):
+        if code and not pm.is_blacklisted(code, term):
             pm.add_to_blacklist(
-                code,
+                code, term,
                 b.get("layer1_reason", b.get("recommendation", "批量粗筛判定")),
-                expiry_days=blacklist_expiry,
             )
 
     result["stages"]["3_formal_score"] = (

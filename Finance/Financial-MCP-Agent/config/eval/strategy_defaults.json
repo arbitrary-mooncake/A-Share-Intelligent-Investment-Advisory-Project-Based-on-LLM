@@ -1,11 +1,23 @@
 {
   "_comment": "交易策略参数默认值 — 评测系统所有可配置策略参数。",
-  "_note": "这些值覆盖 src/eval/config.py 中的代码默认值，可通过环境变量 EVAL_<KEY> 进一步覆盖。",
+  "_note": "这些值覆盖 src/eval/config.py 中的代码默认值，可通过环境变量 EVAL_<KEY> 进一步覆盖。分组结构仅用于可读性，加载时扁平化为 config.py 的 flat key。",
 
   "strategy_short_ablation": {
     "max_positions_short_ablation": 10,
     "single_weight_limit_short_ablation": 0.10,
-    "score_buy_threshold_short": 60
+    "score_buy_threshold_short": 60,
+    "stop_loss_pct": 0.08,
+    "take_profit_pct": 0.15,
+    "max_hold_days": 20,
+    "max_sector_concentration": 0.40,
+    "turnover_anomaly_threshold": 3.0,
+    "max_daily_turnover_pct": 0.30,
+    "position_scoring_weights": {
+      "score": 0.50,
+      "momentum": 0.20,
+      "liquidity": 0.15,
+      "volatility": 0.15
+    }
   },
 
   "strategy_short_longhold": {
@@ -30,16 +42,37 @@
     "score_buy_threshold_medium": 65,
     "score_sell_hard_medium": 45,
     "max_drawdown_sell_medium": 0.15,
-    "max_hold_days_medium": 60
+    "max_hold_days_medium": 60,
+    "position_building_weeks": 4,
+    "buy_condition_pe_max": 50,
+    "buy_condition_roe_min": 0.08,
+    "buy_condition_ma_period": 60,
+    "buy_more_dip_threshold": 0.10,
+    "buy_more_add_ratio": 0.30,
+    "buy_more_fundamental_check": true,
+    "stop_loss_pct": 0.12,
+    "profit_protection_drawdown_pct": 0.05,
+    "max_sector_concentration": 0.50,
+    "sell_rule_score_drop_threshold": 15,
+    "sell_rule_technical_breakdown": true
   },
 
   "strategy_long_term": {
-    "max_positions_long": 5,
-    "single_weight_limit_long": 0.25,
+    "max_positions_long": 12,
+    "single_weight_limit_long": 0.12,
     "min_cash_ratio_long": 0.20,
     "score_buy_threshold_long": 70,
     "score_sell_hard_long": 35,
-    "max_hold_days_long": 252
+    "max_hold_days_long": 252,
+    "max_drawdown_tolerance": 0.25,
+    "position_building_months": 3,
+    "buy_more_dip_threshold": 0.15,
+    "buy_more_add_ratio": 0.20,
+    "stop_loss_pct": 0.20,
+    "rebalance_frequency_weeks": 4,
+    "max_sector_concentration": 0.60,
+    "sell_rule_fundamental_deterioration": true,
+    "cross_term_synergy_weight": 0.10
   },
 
   "market_simulator": {
@@ -54,6 +87,76 @@
     "max_daily_buy_ratio": 0.10,
     "suspension_force_days": 20,
     "suspension_discount": 0.95,
-    "small_cap_threshold": 5000000000
+    "small_cap_threshold": 5000000000,
+    "limit_up_touch_fill_probability": 0.50,
+    "t_plus_1_enabled": true
+  },
+
+  "scorer_weights": {
+    "short_term": {
+      "technical": 0.25,
+      "volume": 0.20,
+      "capital": 0.20,
+      "event": 0.20,
+      "sentiment": 0.15
+    },
+    "medium_term": {
+      "fundamental": 0.20,
+      "valuation": 0.15,
+      "quality": 0.20,
+      "event": 0.15,
+      "tech": 0.10,
+      "industry": 0.10,
+      "sentiment": 0.10
+    },
+    "long_term": {
+      "returns": 0.25,
+      "quality": 0.20,
+      "valuation": 0.15,
+      "moat": 0.15,
+      "capital": 0.10,
+      "policy": 0.10,
+      "tech": 0.05
+    }
+  },
+
+  "risk_gate": {
+    "audit_risk_cap": 60,
+    "delist_risk_cap": 50,
+    "fraud_penalty_cap": 55,
+    "pledge_concern_cap": 65,
+    "goodwill_concern_cap": 60,
+    "news_only_narrative_cap": 55,
+    "data_quality_abstain_threshold": 0.40,
+    "liquidity_short_term_cap": 50
+  },
+
+  "loss_weights": {
+    "L_total": {
+      "w_effect": 0.60,
+      "w_stability": 0.25,
+      "w_efficiency": 0.15
+    },
+    "L_effect_short": {
+      "w_return": 0.45,
+      "w_risk": 0.35,
+      "w_structure": 0.20
+    },
+    "L_effect_medium": {
+      "w_return": 0.50,
+      "w_risk": 0.35,
+      "w_structure": 0.15
+    },
+    "L_effect_long": {
+      "w_return": 0.55,
+      "w_risk": 0.30,
+      "w_structure": 0.15
+    },
+    "monitoring": {
+      "risk_gate": 0.05,
+      "consistency": 0.05,
+      "fidelity": 0.05,
+      "eval_model_fidelity": 0.05
+    }
   }
 }

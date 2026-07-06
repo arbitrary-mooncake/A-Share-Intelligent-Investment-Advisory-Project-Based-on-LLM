@@ -33,8 +33,9 @@ build/
 
 # ─── 运行时数据 / 缓存 / 报告 ─────────────────────────────
 # 这些目录由程序运行时生成，不应提交到 git
-data/
-reports/
+# 注意：使用完整路径避免误匹配 src/data/ 等源码目录
+Finance/Financial-MCP-Agent/data/
+Finance/Financial-MCP-Agent/reports/
 stock_pool.json
 fund_pool.json
 *.cache

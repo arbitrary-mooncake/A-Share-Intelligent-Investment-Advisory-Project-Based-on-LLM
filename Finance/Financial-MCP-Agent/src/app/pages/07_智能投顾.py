@@ -9,6 +9,9 @@ import requests
 _app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _app_dir not in sys.path:
     sys.path.insert(0, _app_dir)
+_project_root = os.path.normpath(os.path.join(_app_dir, "..", ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 import streamlit as st
 from datetime import datetime, timedelta
@@ -19,6 +22,24 @@ from theme import inject_global_styles
 from components.shared_sidebar import render_sidebar
 inject_global_styles()
 render_sidebar()
+
+# ── Lite 模式功能门控 ──
+from src.utils.mode_manager import is_lite_mode
+if is_lite_mode():
+    st.markdown("""
+    <div style="text-align: center; padding: 80px 20px;">
+        <div style="font-size: 4em;">🔒</div>
+        <h2 style="color: #1e40af; margin-top: 20px;">此功能仅在完整版中可用</h2>
+        <p style="color: #64748b; font-size: 1.1em; max-width: 600px; margin: 20px auto; line-height: 1.8;">
+        「智能投顾」依赖精筛池数据作为前置条件，且涉及多策略回测，<br>
+        需要完整版的完整数据支撑和 6 模型配置。
+        </p>
+        <p style="color: #94a3b8; font-size: 0.95em;">
+        请在侧边栏点击「🔄 切换到完整版」以使用此功能。
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
 
 # ──────────────────────────────────────────────
 # API 配置

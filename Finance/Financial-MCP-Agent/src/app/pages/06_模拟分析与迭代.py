@@ -12,18 +12,42 @@ st.set_page_config(page_title="模拟分析与迭代", page_icon="📈", layout=
 _app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _app_dir not in sys.path:
     sys.path.insert(0, _app_dir)
+_project_root = os.path.normpath(os.path.join(_app_dir, "..", ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from theme import inject_global_styles, page_title
+from components.shared_sidebar import render_sidebar
+
+inject_global_styles()
+render_sidebar()
+
+# ── Lite 模式功能门控 ──
+from src.utils.mode_manager import is_lite_mode
+if is_lite_mode():
+    st.markdown("""
+    <div style="text-align: center; padding: 80px 20px;">
+        <div style="font-size: 4em;">🔒</div>
+        <h2 style="color: #1e40af; margin-top: 20px;">此功能仅在完整版中可用</h2>
+        <p style="color: #64748b; font-size: 1.1em; max-width: 600px; margin: 20px auto; line-height: 1.8;">
+        「模拟分析与迭代」需要完整的 6 模型配置和 Tushare 5000+ 积分支持。<br>
+        精筛池全量更新需要 1.5-2 小时冷启动和大量 LLM 调用，<br>
+        不适合在精简模式的单模型 + AKShare 数据环境下运行。
+        </p>
+        <p style="color: #94a3b8; font-size: 0.95em;">
+        请在侧边栏点击「🔄 切换到完整版」以使用此功能。
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
 from components.eval.pool_health import render_pool_health
 from components.eval.ops_panel import render_ops_panel
 from components.eval.holdings_table import render_holdings_table
 from components.eval.backtest_panel import render_backtest_panel
 from components.eval.contribution import render_contribution_leaderboard, render_optimization_tickets
 from components.eval.trends_charts import render_trends_tabs
-from components.shared_sidebar import render_sidebar
 
-inject_global_styles()
-render_sidebar()
 page_title("📈 模拟分析与迭代")
 st.caption("评分智能体 — 模拟盘评估、消融实验、回测、自动优化。所有结果仅供参考，使用评测模型(MiMo-V2.5)，目的是优化Agent系统。")
 

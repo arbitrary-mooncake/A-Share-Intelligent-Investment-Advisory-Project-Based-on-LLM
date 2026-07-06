@@ -6,7 +6,9 @@ Risk Gate: 轻量分析后处理，对评分结果做风险门控。
   2. 长线仅新闻叙事无事实支撑 → 不能强推荐
   3. 核心agent缺失过多 + data_quality低 → abstain
   4. 短线流动性差 → 不能高分
+  5. (Lite 模式) 数据来源差异 → 置信度微调
 """
+import os
 from typing import List, Optional
 
 from src.utils.analysis_schema import RiskGateResult, SourceLevel, SOURCE_PRIORITY
@@ -40,7 +42,8 @@ def _count_signals_by_source(package, min_source_level: str) -> int:
     return count
 
 
-def apply_risk_gate(package: 'AnalysisPackage', term: str, original_score: int) -> RiskGateResult:
+def apply_risk_gate(package: 'AnalysisPackage', term: str, original_score: int,
+                    data_sources: dict = None) -> RiskGateResult:
     risk_flags = package.global_risk_flags
     missing_agents = package.missing_agents
 
@@ -107,6 +110,19 @@ def apply_risk_gate(package: 'AnalysisPackage', term: str, original_score: int) 
         warnings.append(f"检测到关键风险: {', '.join(found_critical)}")
     if data_quality < 0.5:
         warnings.append(f"数据质量低({data_quality:.0%})")
+
+    # ── Lite 模式数据来源权重调整 ──
+    if data_sources and os.getenv("APP_MODE", "full").strip().lower() == "lite":
+        akshare_count = sum(1 for v in data_sources.values() if v == "akshare")
+        unavailable_count = sum(1 for v in data_sources.values() if v == "unavailable")
+
+        if unavailable_count > 0:
+            found_critical.append(f"partial_data_unavailable ({unavailable_count} fields)")
+            warnings.append(f"部分数据不可用 ({unavailable_count} 个字段)")
+
+        if akshare_count > 3:
+            found_critical.append("akshare_data_source")
+            warnings.append(f"大量数据来自 AKShare ({akshare_count} 个字段)，口径可能与 Wind 不同")
 
     return RiskGateResult(
         risk_level=risk_level,

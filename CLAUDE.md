@@ -161,6 +161,51 @@ The system accesses Tushare data through two distinct layers — important for d
 
 **`_BATCH_PREFETCH_ENABLED`** (`batch_scorer.py:55`): Toggles Tushare bulk pre-fetch before HTTP data fetch in `fetch_batch()`. Disable to isolate HTTP fetch issues from Tushare issues during debugging.
 
+## Dual-Version Architecture (Lite/Full)
+
+The system supports two operating modes controlled by `APP_MODE` in `.env`:
+
+| | Lite (`APP_MODE=lite`) | Full (`APP_MODE=full`, default) |
+|---|---|---|
+| **LLM** | 1 DeepSeek API Key → all agents | 6 specialized models (M1-M6) |
+| **Data** | Free Tushare (120 pts) + AKShare fallback | Tushare 5000+ pts |
+| **Pages** | 5/7 (模拟分析与迭代 + 智能投顾 disabled) | All 7 |
+| **Use case** | Trial, learning, zero-cost entry | Production research |
+
+### Mode Manager
+
+`src/utils/mode_manager.py` provides `is_lite_mode()`, `is_full_mode()`, `is_page_enabled()`, `set_mode()`. Mode is read from `os.getenv("APP_MODE", "full")` at runtime.
+
+### Lite Mode Model Routing
+
+`src/utils/model_config.py` — `get_model_config_for_agent()` checks `APP_MODE` first. In Lite mode, `_get_lite_model_config()` routes all agents to DeepSeek V4 Pro (or Flash for `quick_query`/`quick_screen`). Full mode code path is completely unchanged.
+
+### AKShare Fallback in MCP Server
+
+`tushare_mcp_server.py` — When `_IS_LITE_MODE=True` and a Tushare API call fails, `_call_akshare_fallback()` tries AKShare equivalents. Covers 8 API types: `fina_indicator`, `income`, `balancesheet`, `cashflow`, `moneyflow`, `top10_holders`, `daily`, `daily_basic`. AKShare results are converted to Tushare-compatible `{fields, items}` format via `src/data/data_adapter.py`. **Agents are completely unaware** — they call the same MCP tools in both modes.
+
+### Unified Data Layer
+
+`src/data/unified_data_layer.py` — Higher-level async data access with automatic Tushare→AKShare fallback. Wraps both `tushare_client._call()` and `akshare_client.call_akshare()`. Currently used as a utility; the primary fallback path for agents goes through the MCP server.
+
+### Feature Gating
+
+- `src/app/components/shared_sidebar.py`: Lite mode renders disabled pages as gray text with 🔒 (no `st.page_link`)
+- `src/app/pages/06_模拟分析与迭代.py` and `07_智能投顾.py`: `is_lite_mode()` check at top → locked message + `st.stop()`
+- `src/app/Home.py`: Navigation cards grayed out in Lite mode
+
+### Onboarding
+
+`src/app/onboarding.py`: First-run detection (`.env` missing or contains `your_` template placeholders). Presents version selection → API key wizard → writes `.env` + updates `os.environ` → `st.rerun()`.
+
+### Mode Switch
+
+`src/app/components/mode_panel.py`: Sidebar mode indicator + switch dialog. `set_mode()` in `mode_manager.py` writes `APP_MODE` to `.env` and updates `os.environ`. MCP server subprocess requires app restart to pick up changes.
+
+### Critical Constraint
+
+**Full version must remain completely unchanged.** All Lite logic is inside `if is_lite_mode()` branches. Full mode code paths have been verified to execute identically to the pre-dual-version state. If a Lite design conflicts with Full version behavior, the Lite design must change.
+
 ## Eval/Backtest System (V2 — 2026-06 upgrade)
 
 The eval system (`src/eval/`) is an **evaluation control tower** surrounding the main advisory system. It runs simulation trading (14 lines) and historical backtesting (23 lines) to measure agent contributions via ablation experiments.
@@ -299,6 +344,93 @@ Key bottleneck (V3): Layer 3 的 5 并发 ScoringEngine × 7 agent × MCP stdio 
 - **10-batch minimum for trend charts**: Trend curves only render after ≥10 batches accumulated, otherwise show progress bar.
 - **Progress bars**: All operations >1 second MUST show `st.progress()` + `st.status()` in Streamlit (总纲 §16.1.9).
 
+## Q&A Engine (智能问答子系统)
+
+The Q&A module (`src/qa/`) powers the "智能问答" page — a ChatGPT-style multi-turn conversational interface for ad-hoc stock/market queries. **Distinct from the single-stock analysis pipeline** — uses lightweight models (M5) for fast responses, with runtime upgrade to M1 for complex questions.
+
+### Architecture
+
+```
+process_question() (qa_engine.py)
+  → complexity_analyzer.py (L1~L4 复杂度分级)
+  → task_planner.py (数据域确定 + 标的提取 + 工具选择)
+  → evidence_assembler.py (并行数据拉取 + 证据装配)
+  → answer_generator.py (流式回答生成, SSE)
+```
+
+### Key Modules
+
+| Module | Role |
+|--------|------|
+| `qa_engine.py` | 总编排器，协调复杂度分析→任务规划→证据装配→运行时升级→回答生成 |
+| `complexity_analyzer.py` | L1~L4 复杂度分级，决定是否启用 ReAct 或运行时升级模型 |
+| `task_planner.py` | 数据域确定（基本面/技术面/资金面等）、标的提取（股票代码/行业主题）、工具选择 |
+| `evidence_assembler.py` | 并行调用 MCP 工具拉取数据，装配为 `EvidencePackage` |
+| `answer_generator.py` | 流式回答生成（SSE 格式），支持 `[数据]`/`[判断]` 标签的反幻觉标注 |
+| `session_manager.py` | 多轮对话会话管理，持久化到 `data/qa_sessions/` |
+| `anti_hallucination.py` | Q&A 专用的反幻觉验证层 |
+
+### Complexity Levels & Runtime Upgrade
+
+| Level | Description | Model | ReAct |
+|-------|-------------|-------|-------|
+| L1 | 简单数据查询（单只股票单一指标） | M5 | ❌ |
+| L2 | 中等查询（单只股票多指标对比） | M5 | ❌ |
+| L3 | 复杂分析（多股票对比/行业分析） | M5 → 可升级 M1 | 可选 |
+| L4 | 深度研究（策略讨论/投资组合） | M1 | ✅ |
+
+运行时升级（`try_runtime_upgrade()`）：L3/L4 问题自动切换到 M1（`qa_engine_pro`）以获得更强的推理能力。
+
+### Topic-to-Stock Mapping
+
+`task_planner.py` 内置 `TOPIC_STOCK_MAP`，支持无股票代码时的主题匹配：
+- 黄金 → 黄金ETF (159934, 518880) + 代表性个股（中金黄金、紫金矿业）
+- 半导体 → 半导体ETF + 代表性个股（中芯国际、寒武纪）
+- 白酒、银行、新能源、医药等 15+ 主题
+
+## Advisory System (智能投顾子系统)
+
+The advisory module (`src/advisory/`) powers the "智能投顾" page with portfolio management, strategy execution, and multi-turn advisory sessions. **Distinct from the eval system's strategies** — these are user-facing trading strategies for portfolio construction, not simulation trading rules.
+
+### Architecture
+
+```
+AdvisorySessionManager (多轮对话持久化)
+  ↓
+StrategyEngine (策略信号计算, 纯Python无LLM)
+  ↓
+StrategyRegistry (20+ 内置策略注册)
+  ↓
+PortfolioManager (持仓管理) + BacktestRunner (策略回测)
+  ↓
+SimulationRunner (模拟运行) + ReportGenerator (收益报告)
+```
+
+### Key Components
+
+| Module | Role |
+|--------|------|
+| `strategy_engine.py` | 策略信号计算（静态方法，无LLM），返回 (signal, reason) 元组，signal: 1=买入, -1=卖出, 0=不动 |
+| `strategy_registry.py` | 策略注册表，管理内置策略和用户自定义策略的加载/查询 |
+| `strategies/builtin/*.py` | 20+ 内置策略（ma_cross, macd, rsi, kdj, boll, turtle, adx_macd, triple_ma 等），继承 `TradingStrategy` 基类 |
+| `advisory_session_manager.py` | 多轮对话持久化到 `data/advisory_sessions/sessions.json`，线程安全，历史压缩（超 max_turns 轮早期对话压缩为摘要） |
+| `portfolio_manager.py` | 持仓组合管理（虚拟持仓，非真实交易） |
+| `backtest_runner.py` | 策略历史回测（与 eval 系统的回测线路独立） |
+| `simulation_runner.py` | 策略模拟运行（实盘模拟，非 eval 系统的模拟盘线路） |
+| `report_generator.py` | 收益归因报告生成 |
+| `custom_strategy_loader.py` | 用户自定义策略加载器 |
+
+### Strategy Implementation Pattern
+
+所有内置策略继承 `src/advisory/strategies/strategy_base.py` 的 `TradingStrategy` 基类：
+- 必须实现 `compute_signal(df_daily, params, context) → (signal, reason)`
+- 可选实现 `risk_exit(context)` 用于风控止损逻辑
+- 通过 `StrategyRegistry.register()` 注册后可通过 `StrategyEngine.compute_signal(strategy_name, ...)` 调用
+
+### Dependency on Eval System
+
+智能投顾功能依赖 eval 系统的精筛池数据（`data/eval/` 下的 refined pool JSON）。**使用智能投顾前必须先在"模拟分析与迭代"页面全量更新精筛池**（首次冷启动约 1.5~2 小时/池）。
+
 ## Streamlit Web UI
 
 The web UI is in `src/app/` with `Home.py` as the entry point and 7 pages in `src/app/pages/`:
@@ -314,6 +446,9 @@ The web UI is in `src/app/` with `Home.py` as the entry point and 7 pages in `sr
 | 智能投顾 | `07_智能投顾.py` | Investment advisor dashboard with multi-turn chat, persistent session history, collapsible history sidebar |
 
 **UI components** in `src/app/components/`: reusable Streamlit components (charts, tables, status indicators).
+**Shared sidebar** (`src/app/components/shared_sidebar.py`): custom navigation replacing Streamlit auto-generated sidebar; supports Lite mode feature gating (2 pages grayed out with 🔒).
+**Mode panel** (`src/app/components/mode_panel.py`): sidebar mode indicator (⚡ Lite / 🚀 Full) + switch dialog.
+**Onboarding** (`src/app/onboarding.py`): first-run wizard with version comparison, API key configuration, `.env` writing.
 **API client** (`src/app/api_client.py`): HTTP client for communicating with the FastAPI backend when running in API mode.
 **Theme** (`src/app/theme.py`): centralized color scheme and styling.
 
@@ -407,6 +542,8 @@ python -m pytest tests/test_qa.py -v                # Q&A engine
 Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}`, `OPENAI_COMPATIBLE_MODEL{_N}`.
 `get_thinking_body()` handles DashScope (`enable_thinking`) vs OpenAI-compatible (`thinking.type`) parameter formats.
 
+**Lite mode** adds: `APP_MODE=lite`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` (default `https://api.deepseek.com/v1`), `DEEPSEEK_MODEL_PRO` (default `deepseek-chat`), `DEEPSEEK_MODEL_FLASH` (default `deepseek-chat`). When `APP_MODE=lite`, all agents route to DeepSeek regardless of `OPENAI_COMPATIBLE_*` values.
+
 ## Key Utility Modules
 
 - `src/utils/analysis_schema.py` — Signal, SignalPack, AnalysisPackage, RiskGateResult dataclasses; SourceLevel enum; FALLBACK_SIGNAL_PACK
@@ -422,6 +559,12 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - `src/utils/tushare_client.py` — Tushare API wrappers (stock_info, daily_basic, fina_indicator, PE percentile, etc.)
 - `src/utils/stock_data_cache.py` — Stock data caching layer for frequently accessed market data
 - `src/stock_pool/stock_pool_manager.py` — 5 per-term pools (short/medium/long/quick_screen/fine) in `stock_pool.json`
+- `src/utils/mode_manager.py` — Dual-version mode detection: `is_lite_mode()`, `is_full_mode()`, `is_page_enabled()`, `set_mode()`
+- `src/data/akshare_client.py` — Async AKShare client with rate limiting (2/s), 5-min cache, exception safety
+- `src/data/data_adapter.py` — AKShare→Tushare format conversion (12 adapter functions for financial statements, money flow, daily data, etc.)
+- `src/data/unified_data_layer.py` — Unified async data access with automatic Tushare→AKShare fallback based on Tushare point level
+- `src/app/onboarding.py` — First-run onboarding: version selection, API key wizard, `.env` writing + `os.environ` update
+- `src/app/components/mode_panel.py` — Sidebar mode indicator and switch dialog component
 
 ## Anti-Patterns to Avoid
 
@@ -439,6 +582,9 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - **Do NOT fall back to simulated/estimated data when Tushare is down** — raise `TushareUnavailableError` and stop. 总纲 §20.2 第10条.
 - **Do NOT skip eval cache (_eval suffix)** — all eval agent cache keys must use the `_eval` suffix to prevent cross-contamination with production cache.
 - **Do NOT modify 总纲 without updating CLAUDE.md** — the two documents must stay in sync on architecture, constraints, and design decisions.
+- **Do NOT put Lite mode logic outside `if is_lite_mode()` branches** — Full mode code paths must remain completely untouched. All Lite additions are additive branches, never modifications to existing Full mode logic.
+- **Do NOT skip `os.environ` update after writing `.env`** — `onboarding.py` and `set_mode()` must update `os.environ` directly after writing `.env`, because `load_dotenv()` runs at module import time and `st.rerun()` does not re-import modules.
+- **Do NOT modify agent code for Lite mode** — agents call MCP tools in both modes. AKShare fallback is handled transparently in `tushare_mcp_server.py._call_akshare_fallback()`. Agents should never import `mode_manager` or check `APP_MODE`.
 
 ## Windows-Specific Notes
 

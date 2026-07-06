@@ -1,12 +1,18 @@
 """
 模型配置工具：将各子Agent映射到其分配的LLM模型。
 
-.env 五模型架构：
-  Model 1 (OPENAI_COMPATIBLE):      MiMo-V2.5-Pro  → summary, medium/long scorer, fundamental, value, quality_risk
-  Model 2 (OPENAI_COMPATIBLE_2):    Qwen3.6-Flash  → 快速查询 + 快筛股票池（不动）
-  Model 3 (OPENAI_COMPATIBLE_3):    Qwen3.7-Plus   → technical, news, short scorer, event, moneyflow
-  Model 4 (OPENAI_COMPATIBLE_4):    Kimi K2.6      → (已迁移至 M1，当前无 Agent 分配)
-  Model 5 (OPENAI_COMPATIBLE_5):    MiMo-V2.5       → 智能问答主模型
+双版本架构：
+  Full 模式（默认）：六模型架构
+    Model 1 (OPENAI_COMPATIBLE):      MiMo-V2.5-Pro  → summary, medium/long scorer, fundamental, value, quality_risk
+    Model 2 (OPENAI_COMPATIBLE_2):    Qwen3.6-Flash  → 快速查询 + 快筛股票池（不动）
+    Model 3 (OPENAI_COMPATIBLE_3):    Qwen3.7-Plus   → technical, news, short scorer, event, moneyflow
+    Model 4 (OPENAI_COMPATIBLE_4):    Kimi K2.6      → (已迁移至 M1，当前无 Agent 分配)
+    Model 5 (OPENAI_COMPATIBLE_5):    MiMo-V2.5       → 智能问答主模型
+    Model 6 (OPENAI_COMPATIBLE_6):    DeepSeek V4 Pro → 评测系统运筹调度
+
+  Lite 模式（APP_MODE=lite）：单模型架构
+    所有 Agent → DeepSeek V4 Pro（DEEPSEEK_API_KEY）
+    M2 角色（快速查询）→ DeepSeek Flash
 
 优化调整 (2026-06-02):
   - news_agent: M4(Kimi K2.6) → M3(Qwen3.7-Plus)，新闻摘要无需深度推理，提速 5-10x
@@ -59,6 +65,36 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
 }
 
 
+# ── Lite 模式 DeepSeek 配置 ──
+def _get_deepseek_config_pro() -> Dict[str, str]:
+    """DeepSeek V4 Pro（用于复杂推理任务）"""
+    return {
+        "api_key": os.getenv("DEEPSEEK_API_KEY", os.getenv(f"{BASE_PREFIX}_API_KEY", "")),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+        "model_name": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-chat"),
+    }
+
+
+def _get_deepseek_config_flash() -> Dict[str, str]:
+    """DeepSeek Flash（用于快速查询）"""
+    return {
+        "api_key": os.getenv("DEEPSEEK_API_KEY", os.getenv(f"{BASE_PREFIX}_API_KEY", "")),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+        "model_name": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-chat"),
+    }
+
+
+# Lite 模式下使用 Flash 的 Agent（快速查询角色）
+_LITE_FLASH_AGENTS = {"quick_query", "quick_screen"}
+
+
+def _get_lite_model_config(agent_name: str) -> Dict[str, str]:
+    """Lite 模式：所有 Agent 使用 DeepSeek"""
+    if agent_name in _LITE_FLASH_AGENTS:
+        return _get_deepseek_config_flash()
+    return _get_deepseek_config_pro()
+
+
 def get_thinking_body(base_url: str, enabled: bool = True) -> dict:
     """
     根据 API 提供商返回正确的 thinking 参数格式。
@@ -109,6 +145,10 @@ def get_eval_model_config(profile: str = "eval_analysis") -> Dict[str, str]:
 
     Returns: {"api_key": ..., "base_url": ..., "model_name": ...}
     """
+    # Lite 模式：评测系统也使用 DeepSeek
+    if os.getenv("APP_MODE", "full").strip().lower() == "lite":
+        return _get_deepseek_config_pro()
+
     profile_cfg = EVAL_PROFILES.get(profile, {"suffix": "_5"})
     suffix = profile_cfg.get("suffix", "_5")
 
@@ -138,11 +178,16 @@ def get_model_config_for_agent(
 
     优先级：
     1. state_data 中的覆盖（快筛模式用 Model 2 全量覆盖时生效）
-    2. Agent 在 AGENT_MODEL_SUFFIX 中分配的模型
+    2. Lite 模式：所有 Agent 使用 DeepSeek
+    3. Full 模式：Agent 在 AGENT_MODEL_SUFFIX 中分配的模型
 
     Returns: {"api_key": ..., "base_url": ..., "model_name": ...}
     """
     state_data = state_data or {}
+
+    # Lite 模式：使用 DeepSeek 单一模型
+    if os.getenv("APP_MODE", "full").strip().lower() == "lite":
+        return _get_lite_model_config(agent_name)
 
     # 检查 state 覆盖（快筛模式传入的 model_name / model_api_key / model_base_url）
     override_model = state_data.get("model_name", "")

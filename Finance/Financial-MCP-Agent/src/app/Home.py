@@ -8,6 +8,11 @@ _app_dir = os.path.dirname(os.path.abspath(__file__))
 if _app_dir not in sys.path:
     sys.path.insert(0, _app_dir)
 
+# 确保项目根目录在 sys.path 中（用于 src.utils 等模块导入）
+_project_root = os.path.normpath(os.path.join(_app_dir, "..", ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import streamlit as st
 from components.shared_sidebar import render_sidebar
 
@@ -16,6 +21,12 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
+
+# ── 首次运行导览检查 ──
+from onboarding import check_first_run, show_onboarding
+if check_first_run() and not st.session_state.get("skip_onboarding") and not st.session_state.get("onboarding_done"):
+    show_onboarding()
+    st.stop()
 
 # ── 共享侧边栏（替代 Streamlit 自动生成的多页导航）──
 render_sidebar()
@@ -268,16 +279,31 @@ with r1c1:
                  use_container_width=True, help="单只股票快速查询 + 深度报告生成")
 
 with r1c2:
-    st.markdown("""
-    <div class="nav-card" style="--accent:#059669;">
-        <span class="nav-card-badge badge-hot">HOT</span>
-        <div class="nav-card-icon">🤖</div>
-        <div class="nav-card-title">智能投顾</div>
-        <div class="nav-card-desc">AI 顾问对话、股票推荐、持仓管理、策略回测一站式服务</div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.page_link("pages/07_智能投顾.py", label="进入智能投顾 →",
-                 use_container_width=True, help="AI驱动的一站式投顾服务")
+    # 检查 Lite 模式门控
+    from src.utils.mode_manager import is_lite_mode
+    _advisory_disabled = is_lite_mode()
+
+    if _advisory_disabled:
+        st.markdown("""
+        <div class="nav-card" style="--accent:#9ca3af; opacity:0.5; cursor:not-allowed;">
+            <span class="nav-card-badge" style="background:#f3f4f6;color:#6b7280;">🔒 LITE</span>
+            <div class="nav-card-icon">🤖</div>
+            <div class="nav-card-title">智能投顾</div>
+            <div class="nav-card-desc">需要完整版 — 依赖精筛池数据和 6 模型配置</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption("🔒 此功能仅在完整版中可用")
+    else:
+        st.markdown("""
+        <div class="nav-card" style="--accent:#059669;">
+            <span class="nav-card-badge badge-hot">HOT</span>
+            <div class="nav-card-icon">🤖</div>
+            <div class="nav-card-title">智能投顾</div>
+            <div class="nav-card-desc">AI 顾问对话、股票推荐、持仓管理、策略回测一站式服务</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.page_link("pages/07_智能投顾.py", label="进入智能投顾 →",
+                     use_container_width=True, help="AI驱动的一站式投顾服务")
 
 with r1c3:
     st.markdown("""
@@ -335,17 +361,30 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div class="feature-card">
-    <div class="feature-card-icon">📈</div>
-    <div class="feature-card-body">
-        <div class="feature-card-title">模拟分析与迭代</div>
-        <div class="feature-card-desc">14条实盘模拟 + 回测消融 + Agent贡献归因 + 自动优化 — 系统自我迭代引擎</div>
+if _advisory_disabled:
+    # Lite 模式下灰色显示
+    st.markdown("""
+    <div class="feature-card" style="opacity:0.5; border-color:#d1d5db;">
+        <div class="feature-card-icon" style="background:linear-gradient(135deg, #f3f4f6, #e5e7eb);">📈</div>
+        <div class="feature-card-body">
+            <div class="feature-card-title" style="color:#6b7280;">🔒 模拟分析与迭代</div>
+            <div class="feature-card-desc" style="color:#9ca3af;">需要完整版 — 精筛池全量更新需 1.5-2 小时冷启动和大量 LLM 调用</div>
+        </div>
     </div>
-</div>
-""", unsafe_allow_html=True)
-st.page_link("pages/06_模拟分析与迭代.py", label="进入模拟分析与迭代 →",
-             use_container_width=True, help="模拟盘评估、消融实验、回测、自动优化")
+    """, unsafe_allow_html=True)
+    st.caption("🔒 此功能仅在完整版中可用")
+else:
+    st.markdown("""
+    <div class="feature-card">
+        <div class="feature-card-icon">📈</div>
+        <div class="feature-card-body">
+            <div class="feature-card-title">模拟分析与迭代</div>
+            <div class="feature-card-desc">14条实盘模拟 + 回测消融 + Agent贡献归因 + 自动优化 — 系统自我迭代引擎</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.page_link("pages/06_模拟分析与迭代.py", label="进入模拟分析与迭代 →",
+                 use_container_width=True, help="模拟盘评估、消融实验、回测、自动优化")
 
 # ── 页脚 ──
 st.markdown("""

@@ -25,10 +25,19 @@ try:
 except ImportError:
     pass
 
+# ── 将 Financial-MCP-Agent 加入 sys.path（AKShare fallback 需要导入 src.data 模块）──
+_AGENT_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Financial-MCP-Agent"))
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+
 _TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 _TUSHARE_URL = os.getenv("TUSHARE_URL", "https://api.tushare.pro")
 if not _TUSHARE_TOKEN:
     logging.getLogger("tushare_mcp").warning("TUSHARE_TOKEN 未设置，Tushare API 调用将失败")
+
+# ── 双版本模式检测 ──
+_APP_MODE = os.getenv("APP_MODE", "full").strip().lower()
+_IS_LITE_MODE = (_APP_MODE == "lite")
 _last_call = 0.0
 _rate_lock = _threading.Lock()
 
@@ -85,7 +94,128 @@ def _call(api_name: str, params: dict = None, fields: str = "", max_retries: int
                 _time.sleep(1)
                 continue
     log.warning(f"Tushare API {api_name} 最终失败: {last_error}（已重试{max_retries}次）")
+    # ── Lite 模式 AKShare 回退 ──
+    if _IS_LITE_MODE:
+        return _call_akshare_fallback(api_name, params or {}, fields)
     return None
+
+
+def _call_akshare_fallback(api_name: str, params: dict, fields: str) -> Optional[dict]:
+    """
+    Lite 模式下当 Tushare 失败时，尝试使用 AKShare 获取数据。
+    返回与 Tushare 相同格式的 {fields: [...], items: [[...], ...]}。
+    """
+    log = logging.getLogger("tushare_mcp")
+    try:
+        import akshare as ak
+    except ImportError:
+        log.warning("AKShare not installed, cannot fallback")
+        return None
+
+    ts_code = params.get("ts_code", "")
+    pure_code = ts_code.replace(".SH", "").replace(".SZ", "").replace(".BJ", "")
+
+    try:
+        if api_name == "fina_indicator":
+            df = ak.stock_financial_analysis_indicator(symbol=pure_code)
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_financial_indicators
+                adapted = adapt_financial_indicators(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        elif api_name == "income":
+            df = ak.stock_financial_report_sina(stock=pure_code, symbol="利润表")
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_income
+                adapted = adapt_income(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        elif api_name == "balancesheet":
+            df = ak.stock_financial_report_sina(stock=pure_code, symbol="资产负债表")
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_balance_sheet
+                adapted = adapt_balance_sheet(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        elif api_name == "cashflow":
+            df = ak.stock_financial_report_sina(stock=pure_code, symbol="现金流量表")
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_cashflow
+                adapted = adapt_cashflow(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        elif api_name == "moneyflow":
+            market = "sh" if ts_code.endswith(".SH") else "sz"
+            df = ak.stock_individual_fund_flow(stock=pure_code, market=market)
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_money_flow
+                adapted = adapt_money_flow(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        elif api_name == "top10_holders":
+            df = ak.stock_gdfx_holding_detail_em(symbol=pure_code)
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_top_holders
+                adapted = adapt_top_holders(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        elif api_name == "daily":
+            start_date = params.get("start_date", "")
+            end_date = params.get("end_date", "")
+            df = ak.stock_zh_a_hist(symbol=pure_code, period="daily",
+                                     start_date=start_date, end_date=end_date, adjust="")
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_daily
+                adapted = adapt_daily(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        elif api_name == "daily_basic":
+            df = ak.stock_a_indicator_lg(symbol=pure_code)
+            if df is not None and not df.empty:
+                from src.data.data_adapter import adapt_daily_basic
+                adapted = adapt_daily_basic(df.to_dict(orient="records"))
+                if adapted:
+                    f = list(adapted[0].keys())
+                    items = [list(d.values()) for d in adapted]
+                    log.info(f"AKShare fallback success: {api_name} ({len(items)} rows)")
+                    return {"fields": f, "items": items}
+
+        else:
+            log.info(f"AKShare fallback: no handler for {api_name}")
+
+    except Exception as e:
+        log.warning(f"AKShare fallback failed: {api_name} -> {e}")
+
+    return None
+
 
 def _dicts(result) -> list:
     if not result: return []

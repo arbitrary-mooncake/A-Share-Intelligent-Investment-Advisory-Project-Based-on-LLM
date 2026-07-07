@@ -499,7 +499,7 @@ cp .env.example .env
 ### 启动 Web UI
 
 ```bash
-# Linux / WSL
+# Linux / WSL / macOS
 ./run.sh start
 
 # Windows CMD
@@ -508,6 +508,8 @@ run.bat start
 # Windows PowerShell
 .\run.ps1 start
 ```
+
+> **macOS 用户**：macOS 与 Linux 使用相同的 `run.sh` 启动脚本。首次运行前需确保已安装 Python 3.10+ 和 Git（可通过 `brew install python git` 安装）。如遇到权限问题，请先执行 `chmod +x run.sh`。
 
 启动后在浏览器打开 `http://localhost:8501`。
 

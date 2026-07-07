@@ -238,6 +238,8 @@ run.bat start
 .\run.ps1 start
 ```
 
+> **macOS users**: macOS uses the same `run.sh` script as Linux. Ensure Python 3.10+ and Git are installed (`brew install python git`). If you encounter permission issues, run `chmod +x run.sh` first.
+
 Open `http://localhost:8501` in your browser.
 
 ### Multi-Model Configuration (Full Mode)

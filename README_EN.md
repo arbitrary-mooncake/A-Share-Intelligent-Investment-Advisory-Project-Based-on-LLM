@@ -1,5 +1,7 @@
 # A-Stock Investment Advisor Agent
 
+> **Disclaimer:** This project is for learning and research purposes only and does not constitute any investment advice. Users are solely responsible for any losses incurred from real trading using this system.
+
 <div align="center">
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)](https://www.python.org/)
@@ -260,8 +262,8 @@ This project is an open-source multi-agent analysis platform for **A-share (Chin
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/arbitrary124/A-Stock-Advisor.git
-cd A-Stock-Advisor
+git clone https://github.com/lyd14753-coder/A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM.git
+cd A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM
 
 # 2. Create virtual environment
 python -m venv venv
@@ -311,7 +313,7 @@ This system uses **6 independent LLM models**, assigned by task characteristics 
 ## Project Structure
 
 ```
-A-Stock-Advisor/
+A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM/
 ├── Finance/
 │   ├── a-share-mcp-server/              # MCP Data Service Layer
 │   │   ├── tushare_mcp_server.py        # Tushare MCP Server (primary data source)

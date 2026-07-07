@@ -58,29 +58,46 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
     "fundamental_agent": "",
     "value_agent": "",
 
+    # ── Model 2: Qwen3.6-Flash (快速查询 / 快筛) ──
+    "quick_query": "_2",
+    "quick_screen": "_2",
+
     # ── Model 5: MiMo-V2.5 (智能问答主模型) ──
     "qa_engine": "_5",
     # 复杂问题升级模型 → Model 1 (MiMo-V2.5-Pro)
     "qa_engine_pro": "",
+
+    # ── Model 6: DeepSeek V4 Pro (评测运筹 / 投顾报告) ──
+    "advisory_report_writer": "_6",
 }
 
 
 # ── Lite 模式 DeepSeek 配置 ──
 def _get_deepseek_config_pro() -> Dict[str, str]:
-    """DeepSeek V4 Pro（用于复杂推理任务）"""
+    """DeepSeek V4 Pro（用于复杂推理任务）
+    回退链：DEEPSEEK_API_KEY → M6 Key → M1 Key"""
     return {
-        "api_key": os.getenv("DEEPSEEK_API_KEY", os.getenv(f"{BASE_PREFIX}_API_KEY", "")),
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        "model_name": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-chat"),
+        "api_key": os.getenv("DEEPSEEK_API_KEY")
+                   or os.getenv(f"{BASE_PREFIX}_API_KEY_6")
+                   or os.getenv(f"{BASE_PREFIX}_API_KEY", ""),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL")
+                    or os.getenv(f"{BASE_PREFIX}_BASE_URL_6")
+                    or "https://api.deepseek.com/v1",
+        "model_name": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4-pro"),
     }
 
 
 def _get_deepseek_config_flash() -> Dict[str, str]:
-    """DeepSeek Flash（用于快速查询）"""
+    """DeepSeek V4 Flash（用于快速查询）
+    回退链：DEEPSEEK_API_KEY → M6 Key → M1 Key"""
     return {
-        "api_key": os.getenv("DEEPSEEK_API_KEY", os.getenv(f"{BASE_PREFIX}_API_KEY", "")),
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        "model_name": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-chat"),
+        "api_key": os.getenv("DEEPSEEK_API_KEY")
+                   or os.getenv(f"{BASE_PREFIX}_API_KEY_6")
+                   or os.getenv(f"{BASE_PREFIX}_API_KEY", ""),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL")
+                    or os.getenv(f"{BASE_PREFIX}_BASE_URL_6")
+                    or "https://api.deepseek.com/v1",
+        "model_name": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-v4-flash"),
     }
 
 

@@ -57,6 +57,13 @@ fund_pool.json
 
 # ─── 开发计划文档（不纳入版本控制）─────────────────────────
 两版本开发计划蓝图.md
+docs/superpowers/
+Finance/Financial-MCP-Agent/docs/superpowers/
+Finance/Financial-MCP-Agent/src/BLUEPRINT.md
+
+# ─── 运行时状态文件 ─────────────────────────────────────
+Finance/Financial-MCP-Agent/config/eval/last_settled.json
+Finance/Financial-MCP-Agent/src/data/batch_results.json
 
 # ─── SQLite 数据库 ──────────────────────────────────────
 *.db

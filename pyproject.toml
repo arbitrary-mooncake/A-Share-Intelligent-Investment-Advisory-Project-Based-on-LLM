@@ -53,9 +53,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/arbitrary124/A-Stock-Advisor"
-Repository = "https://github.com/arbitrary124/A-Stock-Advisor"
-Issues = "https://github.com/arbitrary124/A-Stock-Advisor/issues"
+Homepage = "https://github.com/lyd14753-coder/A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM"
+Repository = "https://github.com/lyd14753-coder/A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM"
+Issues = "https://github.com/lyd14753-coder/A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM/issues"
 
 [tool.setuptools.packages.find]
 where = ["Finance/Financial-MCP-Agent"]

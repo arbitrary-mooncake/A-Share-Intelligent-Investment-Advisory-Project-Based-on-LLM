@@ -1,5 +1,7 @@
 # A股智能投顾Agent助手
 
+> **免责声明：** 本项目仅供学习研究使用，不构成任何投资建议。使用本系统进行真实交易所造成的一切损失由用户自行承担。
+
 <div align="center">
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)](https://www.python.org/)

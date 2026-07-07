@@ -6,6 +6,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A stock investment advisor agent system for A-share (Chinese stock market) and fund/ETF analysis. Uses LangGraph for multi-agent workflow orchestration, MCP (Model Context Protocol) for data access, and LLMs for analysis/scoring. Runs on Linux/WSL and Windows.
 
+## Quick Start for Developers
+
+```bash
+# 1. Install dependencies
+cd Finance
+pip install -r requirements.txt
+
+# 2. Configure environment
+cd Financial-MCP-Agent
+cp .env.example .env
+# Edit .env with API keys (see "Environment Variables" section)
+
+# 3. Start web UI
+./run.sh start                    # Linux/WSL
+.\run.ps1 start                   # Windows PowerShell
+# Open http://localhost:8501
+
+# 4. Run a single test
+python -m pytest tests/test_analysis_package.py -v
+
+# 5. Run single-stock analysis via CLI
+python -m src.main --command "分析 603871"
+```
+
+## Feature Maturity
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **股票查询 (Stock Query)** | ★ Stable | Most mature feature - 7-agent parallel analysis + 9-section reports |
+| **股票池 (Stock Pool)** | ★ Stable | Pool management + 3-term scoring |
+| **批量打分 (Batch Scoring)** | Stable | Excel upload + batch scoring |
+| **智能问答 (Q&A)** | Stable | Multi-turn chat, L1-L4 complexity levels |
+| **基金专区 (Fund Analysis)** | Stable | 7-agent fund pipeline + 6-dimension scoring |
+| **模拟分析与迭代 (Eval)** | ⚠ In Development | 14 sim lines + 23 backtest lines - some statistical tests need ≥10 batches |
+| **智能投顾 (Advisory)** | ⚠ In Development | Requires pool update first (~1.5-2h cold start per pool) |
+
 ## Architecture
 
 ### Two-Layer Architecture
@@ -478,52 +514,122 @@ The web UI is in `src/app/` with `Home.py` as the entry point and 7 pages in `sr
 
 All commands run from `Finance/Financial-MCP-Agent/`.
 
-### Setup
-**Windows first time**: `setup.bat`
-**Linux/WSL**: `cd Finance && pip install -r requirements.txt && cd Financial-MCP-Agent && cp .env.example .env`
+### Development Workflow
 
-### Web UI
 ```bash
-./run.sh start|stop|status|restart   # Linux/WSL
-.\run.ps1 start|stop|status|restart  # Windows PowerShell
-run.bat start|stop|status|restart    # Windows CMD
+# Initial setup
+cd Finance && pip install -r requirements.txt
+cd Financial-MCP-Agent && cp .env.example .env
+# Edit .env with API keys
+
+# Start development server
+./run.sh start                    # Linux/WSL
+.\run.ps1 start                   # Windows PowerShell
+run.bat start                     # Windows CMD
+
+# Stop server
+./run.sh stop
+
+# Check server status
+./run.sh status
+
+# Restart after code changes
+./run.sh restart
 ```
 
-### CLI
-```bash
-python -m src.main --command "分析嘉友国际"     # Single-stock analysis
-python -m src.main_pool add 603871 嘉友国际    # Add to pool (default: medium)
-python -m src.main_pool score 603871          # Score (all 3 terms)
-python -m src.main_pool report 603871         # View score details
-python -m src.fund_main --command "分析华夏上证50ETF"  # Fund analysis
+### Running Tests
 
-# Eval system
-python -m src.eval check              # One-click daily check (rebalance + settlement)
-python -m src.eval status             # View all line status
-python -m src.eval pool status --term short  # View refined pool
-python -m src.eval pool update --term short --mode full  # Full pool update (4-layer pipeline)
-python -m src.eval backtest --term medium --start 2024-01-01 --end 2025-12-31  # Run backtest
-python -m src.eval report --latest    # View latest evaluation report
-python -m src.eval trends --metric score --term medium --days 90  # View trends
-python -m src.eval agent-contribution --term medium --source backtest  # Agent contribution data
-python -m src.eval optimize --analyze  # Generate optimization suggestions
-```
-
-### Testing
 ```bash
-python -m pytest tests/ -v                          # All tests
-python -m pytest tests/test_analysis_package.py -v  # Schema + builder
-python -m pytest tests/test_risk_gate.py -v         # Risk gate rules
-python -m pytest tests/test_market_simulator.py -v  # Trade execution logic
-python -m pytest tests/test_loss_engine.py -v       # Multi-dim loss calculation
-python -m pytest tests/test_contribution.py -v      # Agent ablation + Bootstrap CI
-python -m pytest tests/test_orchestrator.py -v      # Eval scheduler
+# Run all tests
+python -m pytest tests/ -v
+
+# Run single test file
+python -m pytest tests/test_analysis_package.py -v
+
+# Run single test function
+python -m pytest tests/test_risk_gate.py::test_critical_risk_cap -v
+
+# Run tests matching pattern
+python -m pytest tests/ -v -k "cache"
+
+# Run with coverage (if pytest-cov installed)
+python -m pytest tests/ --cov=src --cov-report=term-missing
+
+# Key test files by component:
+python -m pytest tests/test_analysis_package.py -v  # Signal pack schema + builder
+python -m pytest tests/test_risk_gate.py -v         # A-stock risk gate (4 rules)
+python -m pytest tests/test_fund_risk_gate.py -v    # Fund risk gate (10 rules)
+python -m pytest tests/test_eval_cache.py -v        # Cache isolation (production vs eval)
 python -m pytest tests/test_pool_screening.py -v    # 4-layer screening pipeline
-python -m pytest tests/test_eval_cache.py -v        # Eval cache isolation
-python -m pytest tests/test_job_manager.py -v       # Pool update job lifecycle
+python -m pytest tests/test_contribution.py -v      # Agent ablation + Bootstrap CI
+python -m pytest tests/test_market_simulator.py -v  # Trade execution logic
 python -m pytest tests/test_backtest.py -v          # Replay backtest engine
-python -m pytest tests/test_settlement.py -v        # Daily settlement logic
 python -m pytest tests/test_qa.py -v                # Q&A engine
+```
+
+### CLI Operations
+
+**Single-Stock Analysis:**
+```bash
+python -m src.main --command "分析嘉友国际"     # By name
+python -m src.main --command "分析 603871"      # By code
+```
+
+**Stock Pool Management:**
+```bash
+python -m src.main_pool add 603871 嘉友国际              # Add to medium pool (default)
+python -m src.main_pool add 603871 嘉友国际 --term short # Add to short pool
+python -m src.main_pool score 603871                     # Score all 3 terms
+python -m src.main_pool report 603871                    # View score details
+python -m src.main_pool list --term medium               # List pool contents
+```
+
+**Fund Analysis:**
+```bash
+python -m src.fund_main --command "分析华夏上证50ETF"
+python -m src.fund_main --command "分析 510050"
+```
+
+**Eval System (Simulation & Backtest):**
+```bash
+# Daily operations
+python -m src.eval check                                    # One-click: rebalance + settlement
+python -m src.eval status                                   # View all 14 sim + 23 backtest lines
+
+# Pool management
+python -m src.eval pool status --term short                 # View refined pool status
+python -m src.eval pool update --term short --mode full     # Full 4-layer pool update (~1.5h)
+python -m src.eval pool update --term short --mode quick    # Quick update (Layer 2 only)
+
+# Backtesting
+python -m src.eval backtest --term medium --start 2024-01-01 --end 2025-12-31
+python -m src.eval backtest --term short --start 2025-01-01 --regime-slicing  # With regime analysis
+
+# Analysis & reporting
+python -m src.eval report --latest                          # View latest evaluation report
+python -m src.eval trends --metric score --term medium --days 90
+python -m src.eval agent-contribution --term medium --source backtest
+python -m src.eval optimize --analyze                       # Generate optimization suggestions
+```
+
+### Maintenance
+
+```bash
+# Clear production cache (M1/M3 results)
+rm -rf data/intermediate_cache/*
+
+# Clear eval cache (M5 results)
+rm -rf data/eval/cache/*
+
+# View pool update job logs
+ls -lt data/pool_update_jobs/
+cat data/pool_update_jobs/{job_id}.log
+
+# Check eval database
+sqlite3 data/eval/eval.db "SELECT COUNT(*) FROM settlements;"
+
+# View cache statistics
+python -c "from src.utils.cache_utils import get_cache_stats; print(get_cache_stats())"
 ```
 
 ## Environment Variables
@@ -542,7 +648,7 @@ python -m pytest tests/test_qa.py -v                # Q&A engine
 Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}`, `OPENAI_COMPATIBLE_MODEL{_N}`.
 `get_thinking_body()` handles DashScope (`enable_thinking`) vs OpenAI-compatible (`thinking.type`) parameter formats.
 
-**Lite mode** adds: `APP_MODE=lite`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` (default `https://api.deepseek.com/v1`), `DEEPSEEK_MODEL_PRO` (default `deepseek-chat`), `DEEPSEEK_MODEL_FLASH` (default `deepseek-chat`). When `APP_MODE=lite`, all agents route to DeepSeek regardless of `OPENAI_COMPATIBLE_*` values.
+**Lite mode** adds: `APP_MODE=lite`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` (default `https://api.deepseek.com/v1`), `DEEPSEEK_MODEL_PRO` (default `deepseek-v4-pro`), `DEEPSEEK_MODEL_FLASH` (default `deepseek-v4-flash`). When `APP_MODE=lite`, all agents route to DeepSeek regardless of `OPENAI_COMPATIBLE_*` values.
 
 ## Key Utility Modules
 
@@ -565,6 +671,117 @@ Env var naming: `OPENAI_COMPATIBLE_API_KEY{_N}`, `OPENAI_COMPATIBLE_BASE_URL{_N}
 - `src/data/unified_data_layer.py` — Unified async data access with automatic Tushare→AKShare fallback based on Tushare point level
 - `src/app/onboarding.py` — First-run onboarding: version selection, API key wizard, `.env` writing + `os.environ` update
 - `src/app/components/mode_panel.py` — Sidebar mode indicator and switch dialog component
+
+## Adding New Components
+
+### Adding a New Analysis Agent
+
+1. Create agent file in `src/agents/` following the pattern of existing agents (e.g., `fundamental_agent.py`)
+2. **Must output `<SIGNAL_PACK>` JSON** in LLM prompt with structure:
+   ```json
+   {
+     "bias": "bullish|bearish|neutral",
+     "confidence": 0.0-1.0,
+     "signals": [{"factor": "name", "direction": "up|down|flat", "strength": 1-5, "source_level": "official_like|structured|news|derived|proxy"}],
+     "risk_flags": ["flag1", "flag2"],
+     "missing_data": ["field1", "field2"]
+   }
+   ```
+3. Use `_call_tool_safe()` with tool_cache for all MCP tool calls
+4. Add agent to LangGraph workflow in `src/main.py` (A-stock) or `src/fund_main.py` (fund)
+5. Register in `src/utils/model_config.py` with appropriate model (M1/M2/M3)
+6. Add cache TTL to `src/utils/cache_utils.py` TTL table
+
+### Adding a New Trading Strategy (Advisory System)
+
+1. Create strategy file in `src/advisory/strategies/builtin/`
+2. Inherit from `TradingStrategy` base class (`src/advisory/strategies/strategy_base.py`)
+3. Implement `compute_signal(df_daily, params, context) → (signal, reason)`:
+   - `signal`: 1 (buy), -1 (sell), 0 (hold)
+   - `reason`: human-readable explanation
+4. Optionally implement `risk_exit(context)` for stop-loss logic
+5. Register via `StrategyRegistry.register()` in strategy file's module-level code
+6. Strategy becomes available via `StrategyEngine.compute_signal(strategy_name, ...)`
+
+### Adding a New Eval Line
+
+1. Define line ID in `src/eval/line_manager.py` (follow naming: S-L#, M-L#, L-L# for sim; SB-L#, MB-L#, LB-L# for backtest)
+2. Specify which agents to include/exclude (ablation design)
+3. Choose strategy from `src/eval/strategies/` or create new one inheriting from base
+4. Register in `LINE_CONFIGS` dict in `line_manager.py`
+5. If backtest line, add to `replay_backtest_engine.py` line iteration
+6. Update `评分智能体开发总纲.md` if changing ablation structure (keep CLAUDE.md in sync)
+
+## Debugging Common Issues
+
+### Cache-Related Issues
+
+**Symptom**: Agent analysis returns stale data or doesn't reflect new market data
+
+**Solution**:
+```bash
+# Clear production cache (M1/M3 results)
+rm -rf data/intermediate_cache/*
+
+# Clear eval cache (M5 results)
+rm -rf data/eval/cache/*
+
+# Clear specific agent cache
+rm -f data/intermediate_cache/fundamental_analysis_603871.json
+```
+
+**Verify cache behavior**: Check `cache_utils.read_signal_pack_cache()` logs or add debug prints in agent files.
+
+### MCP Server Not Responding
+
+**Symptom**: Tool calls timeout or hang indefinitely
+
+**Solution**:
+1. Check MCP server process: `ps aux | grep mcp_server` (Linux) or Task Manager (Windows)
+2. Restart web UI: `./run.sh restart` or `.\run.ps1 restart`
+3. Check stderr logs in terminal where Streamlit was started
+4. Verify `src/tools/mcp_config.py` uses `sys.executable` (not hardcoded `python`)
+
+### Tushare API Errors
+
+**Symptom**: `TushareUnavailableError` or rate limit errors
+
+**Solutions**:
+- Check Tushare token points (need ≥2000 for most APIs)
+- Verify rate limiting in `tushare_client.py` (200 calls/min, 0.35s interval)
+- For batch operations, check `_BATCH_PREFETCH_ENABLED` flag in `batch_scorer.py:55`
+- If API is down, system will raise `TushareUnavailableError` by design (no fallback to estimated data)
+
+### Model API Errors
+
+**Symptom**: LLM calls fail or return malformed JSON
+
+**Solutions**:
+- Verify `.env` has correct `OPENAI_COMPATIBLE_API_KEY{_N}` and `BASE_URL`
+- Check model availability with provider (MiMo/Qwen/DeepSeek)
+- For malformed JSON, check signal_pack extraction in agent files (3-layer fallback: tag→regex→text)
+- Add `print()` statements in `_extract_signal_pack()` to debug extraction
+
+### Eval System Issues
+
+**Symptom**: Pool update hangs or worker crashes
+
+**Solutions**:
+- Check job state: `ls data/pool_update_jobs/` for job status files
+- View worker logs: `cat data/pool_update_jobs/{job_id}.log`
+- Cold start takes ~1.5-2h per pool (Layer 3 bottleneck: 5 concurrent ScoringEngine × 7 agents)
+- If worker dies, check for orphaned processes: `ps aux | grep pool_update_worker`
+- Job state persists across Streamlit restart (detached subprocess design)
+
+### Cache Contamination
+
+**Symptom**: Eval results (M5) appear in production cache or vice versa
+
+**Solution**:
+- Verify `cache_utils.set_cache_namespace("eval")` is called before eval operations
+- Check cache keys: production has no suffix, eval has `_eval` suffix
+- `finish_batch()` auto-resets namespace to None - ensure it's called
+- Never manually call agent analysis with wrong namespace
 
 ## Anti-Patterns to Avoid
 

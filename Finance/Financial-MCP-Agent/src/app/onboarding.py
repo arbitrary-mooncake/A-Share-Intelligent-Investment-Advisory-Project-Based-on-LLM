@@ -182,7 +182,7 @@ def _show_full_config():
 
         m6_key = st.text_input("M6 (DeepSeek V4 Pro) API Key", type="password", key="full_m6_key")
         m6_url = st.text_input("M6 Base URL", value="https://api.deepseek.com/v1", key="full_m6_url")
-        m6_model = st.text_input("M6 Model Name", value="deepseek-chat", key="full_m6_model")
+        m6_model = st.text_input("M6 Model Name", value="deepseek-v4-pro", key="full_m6_model")
 
         st.markdown("#### Tushare")
         tushare_token = st.text_input("Tushare Token（需要 5000+ 积分）", type="password", key="full_tushare_token")
@@ -207,8 +207,8 @@ APP_MODE=lite
 # ─── DeepSeek API（唯一需要的 LLM Key）────────────────────
 DEEPSEEK_API_KEY={deepseek_key}
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DEEPSEEK_MODEL_PRO=deepseek-chat
-DEEPSEEK_MODEL_FLASH=deepseek-chat
+DEEPSEEK_MODEL_PRO=deepseek-v4-pro
+DEEPSEEK_MODEL_FLASH=deepseek-v4-flash
 
 # ─── Tushare API（免费 120 积分）──────────────────────────
 TUSHARE_TOKEN={tushare_token or ''}
@@ -241,8 +241,8 @@ USE_LOCAL_MODEL=api
     os.environ["APP_MODE"] = "lite"
     os.environ["DEEPSEEK_API_KEY"] = deepseek_key
     os.environ["DEEPSEEK_BASE_URL"] = "https://api.deepseek.com/v1"
-    os.environ["DEEPSEEK_MODEL_PRO"] = "deepseek-chat"
-    os.environ["DEEPSEEK_MODEL_FLASH"] = "deepseek-chat"
+    os.environ["DEEPSEEK_MODEL_PRO"] = "deepseek-v4-pro"
+    os.environ["DEEPSEEK_MODEL_FLASH"] = "deepseek-v4-flash"
     if tushare_token:
         os.environ["TUSHARE_TOKEN"] = tushare_token
     os.environ["TUSHARE_URL"] = "https://api.tushare.pro"
@@ -299,8 +299,8 @@ USE_LOCAL_MODEL=api
 # ─── DeepSeek API（Lite 模式使用）─────────────────────────
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DEEPSEEK_MODEL_PRO=deepseek-chat
-DEEPSEEK_MODEL_FLASH=deepseek-chat
+DEEPSEEK_MODEL_PRO=deepseek-v4-pro
+DEEPSEEK_MODEL_FLASH=deepseek-v4-flash
 """
     os.makedirs(os.path.dirname(env_path), exist_ok=True)
     with open(env_path, "w", encoding="utf-8") as f:

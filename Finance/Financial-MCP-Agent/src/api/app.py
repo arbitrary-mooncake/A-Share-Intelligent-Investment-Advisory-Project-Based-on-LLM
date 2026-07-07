@@ -52,7 +52,7 @@ load_dotenv(override=True)
 # ──────────────────────────────────────────────
 from src.utils.state_definition import AgentState
 from src.utils.llm_clients import LLMClientFactory, OpenAICompatibleClient
-from src.utils.model_config import get_thinking_body
+from src.utils.model_config import get_thinking_body, get_model_config_for_agent
 from src.stock_pool.stock_pool_manager import StockPoolManager
 from src.stock_pool.scoring_engine import ScoringEngine
 from src.tools.mcp_client import get_mcp_tools
@@ -1091,12 +1091,14 @@ async def fetch_stock_data(stock_code: str) -> Dict:
 
 async def quick_analysis_llm(stock_code: str, company_name: str, stock_data: Dict) -> Dict:
     """使用 LLM 对真实股票数据进行快速分析。
-    核心原则：LLM 只做解读和判断，绝不编造/修改数据字段。使用 qwen3.6-flash 高速模型。"""
-    _base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_2")
+    核心原则：LLM 只做解读和判断，绝不编造/修改数据字段。
+    Full 模式使用 M2 (qwen3.6-flash)，Lite 模式使用 DeepSeek。"""
+    _cfg = get_model_config_for_agent("quick_query")
+    _base_url = _cfg["base_url"]
     llm = OpenAICompatibleClient(
-        api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_2"),
+        api_key=_cfg["api_key"],
         base_url=_base_url,
-        model=os.getenv("OPENAI_COMPATIBLE_MODEL_2", "qwen3.6-flash"),
+        model=_cfg["model_name"],
         env_prefix="",  # 使用显式参数，不从环境变量自动读取
         extra_body=get_thinking_body(_base_url, False),
     )
@@ -2032,11 +2034,12 @@ async def _direct_llm_score(
     term: str, stock_code: str, company_name: str, stock_data: Dict
 ) -> Dict[str, Any]:
     """绕过 MCP ReAct，直接 HTTP 数据 + LLM 打分（快筛专用）"""
-    _base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_2")
+    _cfg = get_model_config_for_agent("quick_screen")
+    _base_url = _cfg["base_url"]
     llm = OpenAICompatibleClient(
-        api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_2"),
+        api_key=_cfg["api_key"],
         base_url=_base_url,
-        model=os.getenv("OPENAI_COMPATIBLE_MODEL_2", "qwen3.6-flash"),
+        model=_cfg["model_name"],
         env_prefix="",
         extra_body=get_thinking_body(_base_url, True),
     )
@@ -2436,10 +2439,11 @@ async def batch_score_upload(
         stocks = lookup_names(stocks)
 
         # 3. 验证 LLM 配置
-        if not os.getenv("OPENAI_COMPATIBLE_API_KEY_2"):
+        _batch_cfg = get_model_config_for_agent("quick_screen")
+        if not _batch_cfg.get("api_key"):
             raise HTTPException(
                 status_code=500,
-                detail="批量打分需要配置 OPENAI_COMPATIBLE_API_KEY_2 环境变量"
+                detail="批量打分需要配置 LLM API Key（Full 模式需 OPENAI_COMPATIBLE_API_KEY_2，Lite 模式需 DEEPSEEK_API_KEY）"
             )
 
         # 4. 创建任务
@@ -3069,13 +3073,13 @@ def _stddev(data: list) -> float:
 
 
 async def _fund_quick_llm(fund_code: str, fund_name: str, metrics: dict, benchmark: dict, raw: dict) -> dict:
-    """使用轻量模型(Qwen3.6-Flash)做文字解读。只生成文字字段，数值全由代码预填。"""
-    import os as _os
-    base_url = _os.getenv("OPENAI_COMPATIBLE_BASE_URL_2")
+    """使用轻量模型做文字解读。只生成文字字段，数值全由代码预填。"""
+    _cfg = get_model_config_for_agent("quick_query")
+    base_url = _cfg["base_url"]
     llm = OpenAICompatibleClient(
-        api_key=_os.getenv("OPENAI_COMPATIBLE_API_KEY_2"),
+        api_key=_cfg["api_key"],
         base_url=base_url,
-        model=_os.getenv("OPENAI_COMPATIBLE_MODEL_2", "qwen3.6-flash"),
+        model=_cfg["model_name"],
         env_prefix="",
         extra_body=get_thinking_body(base_url, False),
     )
@@ -3472,11 +3476,12 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
                     f"- 精筛池已有质量保障，你只需要做语义匹配筛选"
                 )
 
-                base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_3", os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""))
+                _cfg3 = get_model_config_for_agent("news_agent")
+                base_url = _cfg3["base_url"]
                 client = OpenAICompatibleClient(
-                    api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_3", os.getenv("OPENAI_COMPATIBLE_API_KEY", "")),
+                    api_key=_cfg3["api_key"],
                     base_url=base_url,
-                    model=os.getenv("OPENAI_COMPATIBLE_MODEL_3", "qwen3.7-plus"),
+                    model=_cfg3["model_name"],
                     env_prefix="",
                     extra_body=get_thinking_body(base_url, True),
                     http_timeout=60,
@@ -3543,11 +3548,12 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
                         f"返回 JSON 数组：[\"code1\", ..., \"code5\"]"
                     )
 
-                    base_url3 = os.getenv("OPENAI_COMPATIBLE_BASE_URL_3", os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""))
+                    _cfg3b = get_model_config_for_agent("news_agent")
+                    base_url3 = _cfg3b["base_url"]
                     client3 = OpenAICompatibleClient(
-                        api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_3", os.getenv("OPENAI_COMPATIBLE_API_KEY", "")),
+                        api_key=_cfg3b["api_key"],
                         base_url=base_url3,
-                        model=os.getenv("OPENAI_COMPATIBLE_MODEL_3", "qwen3.7-plus"),
+                        model=_cfg3b["model_name"],
                         env_prefix="",
                         extra_body=get_thinking_body(base_url3, True),
                         http_timeout=60,
@@ -4499,12 +4505,12 @@ async def advisory_report(request: ReportRequest):
 
         # 调用 LLM 生成报告
         try:
-            from src.utils.model_config import get_thinking_body
-            base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL_6", os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""))
+            _cfg6 = get_model_config_for_agent("advisory_report_writer")
+            base_url = _cfg6["base_url"]
             llm_client = OpenAICompatibleClient(
-                api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY_6", os.getenv("OPENAI_COMPATIBLE_API_KEY", "")),
+                api_key=_cfg6["api_key"],
                 base_url=base_url,
-                model=os.getenv("OPENAI_COMPATIBLE_MODEL_6", "deepseek-v4-pro"),
+                model=_cfg6["model_name"],
                 env_prefix="",
                 extra_body=get_thinking_body(base_url, True),
             )

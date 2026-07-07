@@ -1,4 +1,5 @@
 """Tests for backtest and experiment engines"""
+import os
 import pytest
 from src.eval.replay_backtest_engine import (
     ReplayBacktestEngine,
@@ -7,6 +8,12 @@ from src.eval.replay_backtest_engine import (
     ACTIVE_BACKTEST_LINES,
 )
 from src.eval.experiment_engine import ExperimentEngine
+
+_HAS_REAL_API = (
+    os.getenv("OPENAI_COMPATIBLE_API_KEY", "") not in ("", "test_key")
+    and os.getenv("TUSHARE_TOKEN", "") not in ("", "test_token")
+)
+requires_api = pytest.mark.skipif(not _HAS_REAL_API, reason="Requires real API keys")
 
 
 def test_backtest_config_defaults():
@@ -47,6 +54,7 @@ def test_train_val_test_split():
 
 # ── Fix 1: Real PIT scoring replaces hash-based mock ──
 
+@requires_api
 @pytest.mark.asyncio
 async def test_score_stock_pit_full():
     """Test _score_stock_pit with full agent (no ablation)."""
@@ -62,6 +70,7 @@ async def test_score_stock_pit_full():
     assert 10 <= s2 <= 98
 
 
+@requires_api
 @pytest.mark.asyncio
 async def test_score_stock_pit_ablation_different():
     """Test that ablation lines produce different scores from full line."""
@@ -76,6 +85,7 @@ async def test_score_stock_pit_ablation_different():
     assert s_full != s_abl
 
 
+@requires_api
 @pytest.mark.asyncio
 async def test_score_stock_pit_deterministic():
     """Test that scoring is deterministic (no random/hash variation).
@@ -91,6 +101,7 @@ async def test_score_stock_pit_deterministic():
     assert s1 == s2
 
 
+@requires_api
 @pytest.mark.asyncio
 async def test_score_stock_pit_different_stocks():
     """Different stocks on the same date should have different scores."""
@@ -210,6 +221,7 @@ def test_slice_anchors_by_regime():
 
 # ── Fix 4: Quarterly Calibration ──
 
+@requires_api
 @pytest.mark.asyncio
 async def test_screen_pool_at_date_no_data():
     """_screen_pool_at_date should return empty list when Tushare unavailable."""
@@ -220,6 +232,7 @@ async def test_screen_pool_at_date_no_data():
 
 # ── Core backtest tests (updated for v2) ──
 
+@requires_api
 @pytest.mark.asyncio
 async def test_run_single_anchor():
     cfg = BacktestConfig(term="medium", holding_days=5)
@@ -280,6 +293,7 @@ def test_convert_to_ts_code():
 
 # ── Add: Fallback scoring (no Tushare) ──
 
+@requires_api
 @pytest.mark.asyncio
 async def test_score_stock_pit_fallback_consistent():
     """Fallback scoring should be deterministic, not random."""

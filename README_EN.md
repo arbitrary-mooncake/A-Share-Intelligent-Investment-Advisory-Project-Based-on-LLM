@@ -15,7 +15,7 @@
 
 </div>
 
-> **Professional Multi-Agent Investment Research Platform** — LangGraph-based 7-agent parallel analysis + short/medium/long-term triple scoring + 14 simulation lines + 23 backtest lines + ablation experiment contribution evaluation system. Covers A-share stocks and funds/ETFs.
+> **Professional Multi-Agent Investment Research Platform** — LangGraph-based 7-agent parallel analysis + short/medium/long-term triple scoring + 14 simulation lines + 23 backtest lines + ablation experiment contribution evaluation system. Covers A-share stocks and funds/ETFs. Dual-version architecture: Lite (single API key, zero-cost trial) and Full (6 specialized models).
 
 ---
 
@@ -31,6 +31,7 @@ This project is an open-source multi-agent analysis platform for **A-share (Chin
 - Built-in anti-hallucination design, strictly distinguishing data facts from model inferences
 - Complete evaluation control tower (14 simulation lines + 23 backtest lines) with ablation experiments
 - Dual-cache architecture, skipping LLM calls on cache hits
+- **Dual-version architecture**: Lite mode requires only 1 DeepSeek API key + free Tushare for zero-cost trial; Full mode supports 6 specialized models + Tushare 5000+ points
 
 ---
 
@@ -44,205 +45,145 @@ This project is an open-source multi-agent analysis platform for **A-share (Chin
 
 ---
 
+## Dual-Version Architecture
+
+The system supports two operating modes:
+
+| | Lite | Full (default) |
+|---|---|---|
+| **LLM** | 1 DeepSeek API Key → all agents | 6 specialized models (M1–M6) |
+| **Data** | Free Tushare (120 pts) + AKShare fallback | Tushare 5000+ pts |
+| **Pages** | 5/7 (Eval + Advisory locked) | All 7 pages |
+| **Use case** | Trial, learning, zero-cost entry | Production research |
+
+**Transparent degradation in Lite mode**:
+- The MCP Server layer automatically falls back Tushare API calls to AKShare equivalents (covering 8 API types)
+- **Agents are completely unaware** — the same 7 agents call the same MCP tools in both modes
+- First-run onboarding wizard guides users through version selection and API key configuration
+
+---
+
 ## Architecture Overview
 
 ### Two-Layer Architecture
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│                    Web UI (Streamlit, 7 Pages)                   │
-│  Stock Query | Stock Pool | Batch Score | Q&A | Fund | Sim | Advisor │
-├────────────────────────────────────────────────────────────────┤
-│                    FastAPI Backend (API Layer)                   │
-├────────────────────────────┬───────────────────────────────────┤
-│     A-Stock Pipeline       │          Fund Pipeline            │
-│  ┌────────────────────┐   │   ┌────────────────────┐          │
-│  │  7 Parallel Agents  │   │   │  7 Parallel Agents  │          │
-│  │  · Fundamental (M1) │   │   │  · Product Doc (M3) │          │
-│  │  · Technical (M3)   │   │   │  · Perf/Risk (M1)   │          │
-│  │  · Value (M1)       │   │   │  · Holdings (M1)    │          │
-│  │  · News (M3)        │   │   │  · Manager (M3)     │          │
-│  │  · Event (M3)       │   │   │  · Benchmark (M3)   │          │
-│  │  · Quality (M1)     │   │   │  · Fee (M3)         │          │
-│  │  · Money Flow (M3)  │   │   │  · Fund Event (M3)  │          │
-│  └────────┬───────────┘   │   └────────┬───────────┘          │
-│           ↓               │            ↓                       │
-│  ┌────────────────────┐   │   ┌────────────────────┐          │
-│  │ Signal Pack Merge   │   │   │ Merge Node          │          │
-│  │ + Conflict Detection│   │   │ + Conflict Detection│          │
-│  │ S/M/L Scoring       │   │   │ 6-Dim Scoring       │          │
-│  │ + 4 Risk Gates      │   │   │ + 10 Fund Risk Gates│          │
-│  └────────┬───────────┘   │   └────────────────────┘          │
-│           ↓               │                                    │
-│  Markdown + PDF Report    │                                    │
-├────────────────────────────┴───────────────────────────────────┤
-│                    Evaluation Control Tower                      │
-│  · 14 Simulation Lines (S-L0~L-L1)  · 23 Backtest Lines        │
-│  · Multi-dim Loss Calculation  · Ablation Contribution (Bootstrap CI) │
-│  · Long-term Trend Storage  · Streamlit Trend Panel             │
-├────────────────────────────────────────────────────────────────┤
-│                    MCP Data Service Layer (FastMCP stdio)        │
-│  Tushare MCP  |  AKShare MCP  |  WebSearch MCP  |  YFinance MCP │
-└────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph ui["Web UI · Streamlit · 7 Pages"]
+        direction LR
+        P1["Stock Query"] ~~~ P2["Stock Pool"] ~~~ P3["Batch Score"] ~~~ P4["Q&A"] ~~~ P5["Fund"] ~~~ P6["Eval"] ~~~ P7["Advisor"]
+    end
+
+    subgraph backend["FastAPI Backend"]
+        direction LR
+        subgraph astock["A-Stock Pipeline"]
+            direction TB
+            SA["7 Parallel Agents<br/>Fundamental · Technical · Value · News<br/>Event · Quality Risk · Money Flow"] --> SB["Signal Pack Merge + Conflict Detection<br/>S/M/L Triple Scoring + 4 Risk Gates"] --> SC["Markdown + PDF Report"]
+        end
+        subgraph fund["Fund Pipeline"]
+            direction TB
+            FA["7 Parallel Agents<br/>Product Doc · Perf/Risk · Holdings · Manager<br/>Benchmark · Fee · Fund Event"] --> FB["Merge Node + Conflict Detection<br/>6-Dim Scoring + 10 Fund Risk Gates"]
+        end
+    end
+
+    subgraph eval["Evaluation Control Tower"]
+        direction LR
+        E1["14 Simulation Lines"] ~~~ E2["23 Backtest Lines"] ~~~ E3["Multi-dim Loss"] ~~~ E4["Ablation Contribution<br/>Bootstrap CI"]
+    end
+
+    subgraph mcp["MCP Data Service Layer · FastMCP stdio"]
+        direction LR
+        D1["Tushare MCP"] ~~~ D2["AKShare MCP"] ~~~ D3["WebSearch MCP"] ~~~ D4["YFinance MCP"]
+    end
+
+    ui --> backend --> eval --> mcp
 ```
 
 ### Single-Stock Deep Analysis Pipeline
 
-```
-                    User Input: Stock Code/Name
-                            │
-                            ↓
-                    ┌──────────────┐
-                    │  start_node   │
-                    │  (MCP init)   │
-                    └──────┬───────┘
-                           │
-            ┌──────────────┼──────────────┐
-            │              │              │
-    ┌───────┴──┐  ┌───────┴──┐  ┌───────┴──┐
-    │Fundamental│  │Technical │  │  Value   │    ... 7 Agents in parallel
-    │   (M1)   │  │   (M3)   │  │   (M1)   │
-    └───────┬──┘  └───────┬──┘  └───────┬──┘
-            │              │              │
-            └──────────────┼──────────────┘
-                           │ Each Agent outputs:
-                           │ · Text analysis ({agent}_analysis)
-                           │ · Structured signal pack ({agent}_signal_pack)
-                           ↓
-                  ┌────────────────┐
-                  │ Signal Pack     │
-                  │ Merger          │
-                  │ · Conflict det. │
-                  │ · Source priority│
-                  │ · Compact ctx   │
-                  └───────┬────────┘
-                          │
-              ┌───────────┼───────────┐
-              ↓           ↓           ↓
-        ┌──────────┐┌──────────┐┌──────────┐
-        │Short-term││Mid-term  ││Long-term │
-        │Scorer    ││Scorer    ││Scorer    │
-        │(4 Agent) ││(7 Agent) ││(7 Agent) │
-        └────┬─────┘└────┬─────┘└────┬─────┘
-             │           │           │
-             └───────────┼───────────┘
-                         ↓
-                  ┌──────────────┐
-                  │ Risk Gate     │
-                  │ · Critical risk│
-                  │ · Narrative   │
-                  │ · Missing data│
-                  │ · Liquidity   │
-                  └──────┬───────┘
-                         ↓
-                  ┌──────────────┐
-                  │ Summary Agent │
-                  │ → 9-section   │
-                  │   report      │
-                  │ → Markdown    │
-                  │ → PDF         │
-                  └──────────────┘
+```mermaid
+flowchart TB
+    INPUT["User Input: Stock Code / Name"] --> START["start_node · MCP Init"]
+
+    START --> FUNDAMENTAL["Fundamental · M1"]
+    START --> TECHNICAL["Technical · M3"]
+    START --> VALUE["Value · M1"]
+    START --> NEWS["News · M3"]
+    START --> EVENT["Event · M3"]
+    START --> QUALITY["Quality Risk · M1"]
+    START --> MONEYFLOW["Money Flow · M3"]
+
+    FUNDAMENTAL & TECHNICAL & VALUE & NEWS & EVENT & QUALITY & MONEYFLOW --> MERGER["Signal Pack Merger<br/>Conflict Detection · Source Priority · Compact Context"]
+
+    MERGER --> SHORT["Short-term Scorer<br/>4 Agent deps"]
+    MERGER --> MID["Mid-term Scorer<br/>7 Agent full"]
+    MERGER --> LONG["Long-term Scorer<br/>7 Agent full"]
+
+    SHORT & MID & LONG --> GATE["Risk Gate<br/>Critical Risk · Narrative-only · Missing Data · Liquidity"]
+    GATE --> SUMMARY["Summary Agent → 9-Section Report<br/>Markdown + PDF"]
 ```
 
 ### Four-Layer Stock Screening Pipeline
 
-```
-    Full Market ~5000 A-Share Stocks
-            │
-            ↓
-    ┌───────────────────────────────────────────┐
-    │  Layer 0: Hard Screen (Rule Filter)         │
-    │  Remove: ST stocks / Listed <60 days /      │
-    │          Daily turnover <20M RMB            │
-    │  Output: ~4500 stocks                       │
-    │  Time: ~2 minutes                           │
-    └───────────────┬───────────────────────────┘
-                    ↓
-    ┌───────────────────────────────────────────┐
-    │  Layer 1: Batch Scoring (M1 + M3 models)    │
-    │  ~900 batches × 5 stocks/batch              │
-    │  HTTP parallel (semaphore=24)               │
-    │  Output: All stocks S/M/L initial scores    │
-    │  Time: ~20-30 minutes                       │
-    └───────────────┬───────────────────────────┘
-                    ↓
-    ┌───────────────────────────────────────────┐
-    │  Layer 2: Quick Screen (M2 + DeepSeek)      │
-    │  Reuse L1 raw data, dual-heap Top-α filter  │
-    │  Output: ~100 candidates                    │
-    │  Time: ~3-5 minutes                         │
-    └───────────────┬───────────────────────────┘
-                    ↓
-    ┌───────────────────────────────────────────┐
-    │  Layer 3: Formal Scoring (Full 7-Agent)     │
-    │  ~100 stocks × complete analysis            │
-    │  5 concurrent async queue                   │
-    │  Output: Final pool constituents            │
-    │          (Short 100 / Mid 80 / Long 60)     │
-    │  Time: ~30-60 minutes                       │
-    └───────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    MARKET["Full Market ~5000 A-Share Stocks"] --> L0
 
-    Cold Start Total: ~1.0-1.5 hours/pool
-    Hot Cache Update: Much faster (cached Agents skip LLM)
+    L0["Layer 0 · Hard Screen (Rule Filter)<br/>Remove ST / Listed < 60 days / Daily turnover < 20M RMB<br/>Output ~4500 stocks · ~2 min"]
+    L0 --> L1
+
+    L1["Layer 1 · Batch Scoring (M1 + M3)<br/>~900 batches × 5 stocks/batch · HTTP parallel semaphore=24<br/>Output all stocks S/M/L initial scores · ~20-30 min"]
+    L1 --> L2
+
+    L2["Layer 2 · Quick Screen (M2 + DeepSeek)<br/>Reuse L1 raw data · Dual-heap Top-α filter<br/>Output ~100 candidates · ~3-5 min"]
+    L2 --> L3
+
+    L3["Layer 3 · Formal Scoring (Full 7-Agent)<br/>~100 stocks × complete analysis · 5 concurrent async queue<br/>Output pool constituents (Short 100 / Mid 80 / Long 60) · ~30-60 min"]
+
+    L3 --> OUTPUT["Cold Start Total ~1.0-1.5 hours/pool<br/>Hot Cache Update much faster"]
 ```
 
 ### Evaluation Control Tower Architecture
 
-```
-    ┌─────────────────────────────────────────────────────────┐
-    │                   Evaluation Tower                        │
-    │                                                         │
-    │  ┌───────────────────────────────────────────────┐      │
-    │  │          14 Simulation Lines                    │      │
-    │  │  Short: S-L0(baseline) → S-L7(ablation)        │      │
-    │  │         + S-L8(longhold) + S-L9(LLM Free)      │      │
-    │  │  Mid:   M-L0(full) + M-L1(LLM Free)            │      │
-    │  │  Long:  L-L0(full) + L-L1(LLM Free)            │      │
-    │  └───────────────────┬───────────────────────────┘      │
-    │                      │                                   │
-    │  ┌───────────────────────────────────────────────┐      │
-    │  │          23 Backtest Lines                      │      │
-    │  │  SB-L0~L6(7) + MB-L0~L7(8) + LB-L0~L7(8)      │      │
-    │  └───────────────────┬───────────────────────────┘      │
-    │                      │                                   │
-    │                      ↓                                   │
-    │  ┌────────────────────────────────────────────┐         │
-    │  │  Multi-dimensional Loss Calculation         │         │
-    │  │  L = w₁×EffectLoss + w₂×StabilityLoss       │         │
-    │  │    + w₃×EfficiencyLoss                      │         │
-    │  └──────────────────┬─────────────────────────┘         │
-    │                     │                                    │
-    │                     ↓                                    │
-    │  ┌────────────────────────────────────────────┐         │
-    │  │  Ablation Contribution Attribution          │         │
-    │  │  ΔLoss + Bootstrap CI + Permutation Test    │         │
-    │  │  → Quantify each Agent's real contribution  │         │
-    │  └────────────────────────────────────────────┘         │
-    └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph sim["14 Simulation Lines"]
+        direction TB
+        SS["Short S-L0 baseline → S-L7 ablation + S-L8 longhold + S-L9 LLM Free"]
+        MS["Mid M-L0 full + M-L1 LLM Free"]
+        LS["Long L-L0 full + L-L1 LLM Free"]
+    end
+
+    subgraph bt["23 Backtest Lines"]
+        direction LR
+        SB["SB-L0~L6 x7"] ~~~ MB["MB-L0~L7 x8"] ~~~ LB["LB-L0~L7 x8"]
+    end
+
+    sim & bt --> LOSS["Multi-dim Loss Calculation<br/>L = w1 EffectLoss + w2 StabilityLoss + w3 EfficiencyLoss"]
+    LOSS --> CONTRIB["Ablation Contribution Attribution<br/>DeltaLoss + Bootstrap CI + Permutation Test<br/>Quantify each Agent real contribution"]
 ```
 
 ### Cache Isolation Architecture
 
-```
-    ┌─────────────────────────────────────────────────────────┐
-    │                    Dual-Cache Architecture                │
-    │                                                         │
-    │  ┌─────────────────────┐  ┌──────────────────────┐      │
-    │  │  Production Cache    │  │  Evaluation Cache     │      │
-    │  │  data/intermediate_  │  │  data/eval/cache/     │      │
-    │  │  cache/              │  │                       │      │
-    │  │                      │  │                       │      │
-    │  │  Models: M1 / M3    │  │  Models: M5           │      │
-    │  │  Suffix: (none)      │  │  Suffix: _eval        │      │
-    │  │                      │  │                       │      │
-    │  │  Usage:              │  │  Usage:               │      │
-    │  │  · Stock analysis    │  │  · Daily simulation   │      │
-    │  │  · Pool screening    │  │  · Backtesting        │      │
-    │  │  · Pool scoring      │  │  · Ablation exp.      │      │
-    │  │                      │  │                       │      │
-    │  │  ← Physically isolated, no cross-contamination →│      │
-    │  └─────────────────────┘  └──────────────────────┘      │
-    └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph PROD["Production Cache data/intermediate_cache/"]
+        direction TB
+        PM["Models M1 / M3"] --> PU["Usage"]
+        PU --> P1["Stock analysis"]
+        PU --> P2["Pool screening L1/L3"]
+        PU --> P3["Pool scoring"]
+    end
+
+    subgraph EVAL["Evaluation Cache data/eval/cache/"]
+        direction TB
+        EM["Model M5"] --> EU["Usage"]
+        EU --> E1["Daily simulation"]
+        EU --> E2["Backtesting"]
+        EU --> E3["Ablation experiments"]
+    end
+
+    PROD ~~~ |"Physically isolated · No cross-contamination"| EVAL
 ```
 
 ---
@@ -251,12 +192,12 @@ This project is an open-source multi-agent analysis platform for **A-share (Chin
 
 ### Prerequisites
 
-| Dependency | Description |
-|------------|-------------|
-| Python 3.10+ | Recommended 3.11 |
-| Tushare Pro Token | [Register to obtain](https://tushare.pro/) (requires ≥ 2000 points) |
-| LLM API Keys | MiMo / DeepSeek / Qwen (see model configuration below) |
-| Git | Clone repository |
+| Dependency | Lite | Full |
+|------------|------|------|
+| Python 3.10+ | Recommended 3.11 | Recommended 3.11 |
+| Tushare Pro Token | [Free registration](https://tushare.pro/) (120 pts sufficient) | [Register](https://tushare.pro/) (requires ≥ 2000 pts) |
+| LLM API Keys | Only 1 DeepSeek key | MiMo / DeepSeek / Qwen — 6 keys total |
+| Git | Clone repository | Clone repository |
 
 ### Installation Steps
 
@@ -277,8 +218,12 @@ pip install -r requirements.txt
 # 4. Configure environment variables
 cd Financial-MCP-Agent
 cp .env.example .env
-# Edit .env, fill in API Keys and Base URLs for each model
+# Edit .env:
+#   Lite: set APP_MODE=lite + DEEPSEEK_API_KEY
+#   Full: set APP_MODE=full + 6 model API Keys
 ```
+
+> **First run**: The system automatically launches an onboarding wizard that guides you through version selection and API key configuration — no manual `.env` editing needed.
 
 ### Start Web UI
 
@@ -295,9 +240,9 @@ run.bat start
 
 Open `http://localhost:8501` in your browser.
 
-### Multi-Model Configuration
+### Multi-Model Configuration (Full Mode)
 
-This system uses **6 independent LLM models**, assigned by task characteristics to balance quality and cost:
+Full mode uses **6 independent LLM models**, assigned by task characteristics:
 
 | Code | Default Model | Roles |
 |------|---------------|-------|
@@ -308,6 +253,8 @@ This system uses **6 independent LLM models**, assigned by task characteristics 
 | **M5** | MiMo-V2.5 | Evaluation system Agent analysis (cost optimization), Q&A |
 | **M6** | DeepSeek V4 Pro | Evaluation orchestration, attribution diagnosis, report writing, LLM Free strategies |
 
+Lite mode routes all agents to DeepSeek V4 Pro (complex tasks) or DeepSeek V4 Flash (quick tasks) automatically.
+
 ---
 
 ## Project Structure
@@ -316,20 +263,22 @@ This system uses **6 independent LLM models**, assigned by task characteristics 
 A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM/
 ├── Finance/
 │   ├── a-share-mcp-server/              # MCP Data Service Layer
-│   │   ├── tushare_mcp_server.py        # Tushare MCP Server (primary data source)
+│   │   ├── tushare_mcp_server.py        # Tushare MCP Server (primary + Lite AKShare fallback)
 │   │   ├── mcp_server.py                # AKShare MCP Server (supplementary)
 │   │   ├── web_search_mcp_server.py     # Web Search MCP Server
 │   │   └── yfinance_mcp_server.py       # Yahoo Finance MCP Server
 │   └── Financial-MCP-Agent/             # Main Application
 │       ├── src/
 │       │   ├── agents/                  # 7 A-Stock Agents + 7 Fund Agents + Scoring Agents
+│       │   ├── advisory/                # Advisory subsystem (strategy engine + portfolio + backtest)
 │       │   ├── stock_pool/              # Stock pool & 4-layer screening pipeline
 │       │   ├── qa/                      # Q&A engine
 │       │   ├── eval/                    # Evaluation tower (simulation, backtest, ablation)
+│       │   ├── data/                    # Unified data layer (Tushare + AKShare auto-fallback)
 │       │   ├── tools/                   # MCP client & tool cache
-│       │   ├── utils/                   # Cache, model config, industry knowledge, risk gates
+│       │   ├── utils/                   # Cache, model config, industry knowledge, risk gates, mode manager
 │       │   ├── api/                     # FastAPI backend
-│       │   ├── app/                     # Streamlit Web UI (7 pages)
+│       │   ├── app/                     # Streamlit Web UI (7 pages + onboarding)
 │       │   ├── fund_pool/               # Fund pool management
 │       │   ├── main.py                  # Single-stock analysis entry
 │       │   ├── main_pool.py             # Stock pool CLI entry
@@ -347,6 +296,18 @@ A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM/
 
 ---
 
+## Known Limitations
+
+1. **High cold-start cost**: First-time pool screening takes ~1.5–2 hours/pool and consumes significant LLM API quota.
+2. **Eval and Advisory features still maturing**: Some ablation experiment lines lack sufficient statistical samples; Advisory sub-features have limited implementation depth.
+3. **Data source dependency**: A-share data primarily relies on Tushare Pro — Full mode cannot operate when Tushare is unavailable. Lite mode partially mitigates this via AKShare auto-fallback, but coverage is narrower.
+4. **External model API dependency**: Full mode uses 6 models from 3 vendors (Xiaomi/Alibaba/DeepSeek) — any vendor's API change or outage may affect corresponding features. Lite mode depends solely on DeepSeek, reducing vendor sprawl but creating a single point of dependency.
+5. **Backtest limitations**: Results are based on historical data and do not represent future performance. Strategy implementations are pure-code rules that do not fully account for real-world liquidity shocks or trading suspensions.
+
+We welcome community contributions to address these limitations.
+
+---
+
 ## Contributing
 
 This project is actively developed. We welcome Issues and Pull Requests.
@@ -356,6 +317,7 @@ Before submitting a PR, please ensure:
 - New Agents must output `<SIGNAL_PACK>` structured JSON
 - Do not hardcode model names, use `model_config.py` configuration mapping
 - Evaluation system changes must not pollute production cache (use `cache_namespace="eval"`)
+- Lite mode logic must be inside `if is_lite_mode()` branches — Full mode code paths must remain untouched
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed contribution guidelines.
 
@@ -376,7 +338,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed contribution guidelines.
 > | Data Source | Purpose | Service Agreement | Notes |
 > |-------------|---------|-------------------|-------|
 > | [Tushare Pro](https://tushare.pro/) | A-share market, financial, capital flow data | [Tushare Agreement](https://tushare.pro/document/2?doc_id=108) | Requires Token (≥ 2000 points), non-commercial only |
-> | [AKShare](https://akshare.akfamily.xyz/) | International/macro/commodity supplementary data | [AKShare Terms](https://akshare.akfamily.xyz/data/others/others.html) | Open source, cite data source |
+> | [AKShare](https://akshare.akfamily.xyz/) | International/macro/commodity + Lite A-share fallback | [AKShare Terms](https://akshare.akfamily.xyz/data/others/others.html) | Open source, cite data source |
 > | [Yahoo Finance](https://finance.yahoo.com/) | International markets/exchange rates/commodities | [Yahoo ToS](https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html) | Personal non-commercial only |
 
 ---

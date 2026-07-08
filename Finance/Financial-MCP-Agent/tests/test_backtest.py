@@ -9,9 +9,14 @@ from src.eval.replay_backtest_engine import (
 )
 from src.eval.experiment_engine import ExperimentEngine
 
+_api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "").lower()
+_tushare = os.getenv("TUSHARE_TOKEN", "").lower()
+_PLACEHOLDERS = ("test_key", "test_token", "your_", "xxx", "placeholder", "dummy", "fake", "sk-xxxx")
 _HAS_REAL_API = (
-    os.getenv("OPENAI_COMPATIBLE_API_KEY", "") not in ("", "test_key")
-    and os.getenv("TUSHARE_TOKEN", "") not in ("", "test_token")
+    len(_api_key) > 10
+    and not any(p in _api_key for p in _PLACEHOLDERS)
+    and len(_tushare) > 5
+    and not any(p in _tushare for p in _PLACEHOLDERS)
 )
 requires_api = pytest.mark.skipif(not _HAS_REAL_API, reason="Requires real API keys")
 

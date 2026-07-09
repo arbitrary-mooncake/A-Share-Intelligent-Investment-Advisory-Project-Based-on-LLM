@@ -76,6 +76,8 @@ class ManualPackageBuilder:
             return ["修改相关agent的system prompt", "在回测环境验证prompt变更", "对比新旧prompt输出质量"]
         elif ticket_type == "LOGIC_FIX":
             return ["定位具体代码逻辑问题", "编写修复代码", "补充分单元测试", "运行回归验证"]
+        elif ticket_type == "ARCH_CHANGE":
+            return ["评估架构变更影响面", "制定渐进式迁移方案", "回测验证新架构", "分阶段灰度推广"]
         else:
             return ["深入分析问题根因", "设计改进方案", "在验证环境测试", "逐步推广到生产"]
 

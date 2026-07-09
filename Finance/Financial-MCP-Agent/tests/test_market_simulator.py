@@ -38,7 +38,8 @@ def test_sell_order_normal():
 def test_limit_up_rejected():
     sim = MarketSimulator()
     order = Order(stock_code="sh.603871", direction="buy", target_value=100000)
-    md = make_market(is_limit_up=True)
+    # 收盘封涨停 (close == limit_up_price) → 一定拒绝
+    md = make_market(pre_close=10.0, close=11.0, high=11.0, is_limit_up=True)
     result = sim.execute_order(order, md)
     assert result.status == OrderStatus.REJECTED.value
     assert result.reject_reason == RejectReason.LIMIT_UP.value
@@ -47,7 +48,8 @@ def test_limit_up_rejected():
 def test_limit_down_rejected():
     sim = MarketSimulator()
     order = Order(stock_code="sh.603871", direction="sell", target_value=100000)
-    md = make_market(is_limit_down=True)
+    # 收盘封跌停 (close == limit_down_price) → 一定拒绝
+    md = make_market(pre_close=10.0, close=9.0, low=9.0, is_limit_down=True)
     result = sim.execute_order(order, md)
     assert result.status == OrderStatus.REJECTED.value
     assert result.reject_reason == RejectReason.LIMIT_DOWN.value

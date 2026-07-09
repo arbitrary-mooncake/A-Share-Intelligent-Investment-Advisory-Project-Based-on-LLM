@@ -633,12 +633,7 @@ A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM/
 │       ├── data/                        # 缓存 & 持久化数据（不纳入版本控制）
 │       ├── tests/                       # 单元测试 (25+ 测试文件)
 │       └── run.sh / run.bat / run.ps1   # 启动脚本
-├── CLAUDE.md                            # 开发者指南
-├── CONTRIBUTING.md                      # 贡献指南
-├── CODE_OF_CONDUCT.md                   # 行为准则
-├── SECURITY.md                          # 安全政策
-├── pyproject.toml                       # Python 包配置
-└── README.md / README_EN.md
+├── README.md / README_EN.md
 ```
 
 ---

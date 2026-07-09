@@ -75,5 +75,5 @@ register_international_tools(app)
 if __name__ == "__main__":
     logger.info(
         f"Starting A-Share MCP Server via stdio... Today is {current_date}")
-    # Run the server using stdio transport, suitable for MCP Hosts like Claude Desktop
+    # Run the server using stdio transport, suitable for MCP Hosts
     app.run(transport='stdio')

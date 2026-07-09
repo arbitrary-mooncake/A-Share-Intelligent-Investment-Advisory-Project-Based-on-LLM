@@ -1297,7 +1297,7 @@ async def _layer3_consumer(
     # 共用单个 ScoringEngine: 避免 N 并发各自初始化 MCP client 导致 TaskGroup 崩溃
     # 并发数 5 (2026-07-02 从 8 回退): 冷启动时 8 并发 × 7 agent ≈ 56 路 MCP stdio
     # 调用会严重阻塞 Tushare/MCP 通道, 实测单只股票 Phase 1 从 13s 涨到 739s,
-    # 5 并发 × 7 agent ≈ 35 路更稳健, 与 CLAUDE.md 架构文档对齐。
+    # 5 并发 × 7 agent ≈ 35 路更稳健，与架构文档对齐。
     shared_engine = ScoringEngine(pool_manager=False)  # 禁用 stock_pool.json 写入，保持两个精筛池隔离
     sem = asyncio.Semaphore(5)
     completed = 0

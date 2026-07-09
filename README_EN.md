@@ -288,12 +288,7 @@ A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM/
 │       ├── data/                        # Cache & persistent data (not tracked in git)
 │       ├── tests/                       # Unit tests (25+ test files)
 │       └── run.sh / run.bat / run.ps1   # Startup scripts
-├── CLAUDE.md                            # Developer Guide
-├── CONTRIBUTING.md                      # Contribution Guide
-├── CODE_OF_CONDUCT.md                   # Code of Conduct
-├── SECURITY.md                          # Security Policy
-├── pyproject.toml                       # Python package configuration
-└── README.md / README_EN.md
+├── README.md / README_EN.md
 ```
 
 ---

@@ -136,16 +136,16 @@ def test_all_anchors_processed_no_cap():
 # ── Fix 3: 22 Named Backtest Lines ──
 
 def test_backtest_line_definitions_count():
-    """Verify we have exactly 22 named backtest lines."""
-    assert len(BACKTEST_LINE_DEFINITIONS) == 22
+    """Verify we have exactly 23 named backtest lines (7 short + 8 medium + 8 long)."""
+    assert len(BACKTEST_LINE_DEFINITIONS) == 23
 
 
 def test_backtest_line_short_count():
-    """Verify 6 short backtest lines (SB-L0 ~ SB-L5)."""
+    """Verify 7 short backtest lines (SB-L0 ~ SB-L6)."""
     short_lines = [k for k, v in BACKTEST_LINE_DEFINITIONS.items()
                    if v["term"] == "short"]
-    assert len(short_lines) == 6
-    for i in range(6):
+    assert len(short_lines) == 7
+    for i in range(7):
         assert f"SB-L{i}" in BACKTEST_LINE_DEFINITIONS
 
 

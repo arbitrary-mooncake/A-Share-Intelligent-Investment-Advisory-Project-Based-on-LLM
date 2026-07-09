@@ -5,7 +5,7 @@
 v2升级（2026-06）:
   - 用真实PIT数据评分替代MD5哈希模拟
   - 移除5锚点上限，处理全部anchor dates
-  - 定义22条命名回测线 (SB-L0~L5, MB-L0~L7, LB-L0~L7)
+  - 定义23条命名回测线 (SB-L0~L6, MB-L0~L7, LB-L0~L7)
   - 季度校准(方案B): 每锚点动态重筛池，消除存活偏差
   - 市场环境切片: 牛/熊/震荡市分别回测
 
@@ -148,10 +148,10 @@ BACKTEST_LINE_DEFINITIONS = {
               "degenerate": True},
 }
 
-# 按期限组织的活跃回测线 (排除退化线)
+# 按期限组织的活跃回测线 (排除退化线和参考线)
 ACTIVE_BACKTEST_LINES = {
     "short": [k for k, v in BACKTEST_LINE_DEFINITIONS.items()
-              if v["term"] == "short"],
+              if v["term"] == "short" and not v.get("is_reference")],
     "medium": [k for k, v in BACKTEST_LINE_DEFINITIONS.items()
                if v["term"] == "medium" and not v.get("degenerate")],
     "long": [k for k, v in BACKTEST_LINE_DEFINITIONS.items()

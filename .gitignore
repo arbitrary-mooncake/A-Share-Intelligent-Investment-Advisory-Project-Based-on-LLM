@@ -51,6 +51,7 @@ fund_pool.json
 # ─── Claude Code / Superpowers 本地状态 ───────────────────
 .claude/
 .superpowers/
+CLAUDE.md
 
 # ─── 已完成的过程性文件 ──────────────────────────────────
 已经完成的过程性文件/

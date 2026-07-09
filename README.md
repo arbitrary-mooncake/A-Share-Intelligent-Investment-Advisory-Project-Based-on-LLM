@@ -643,6 +643,12 @@ A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM/
 
 ---
 
+## 致谢
+
+本项目的基础架构设计参考了博主**居丽叶**的"居丽叶简历项目3：股票投资顾问Agent"，并经过允许后复用了部分代码；本项目的策略架构设计参考了社区方案如 [fin-agent](https://github.com/YUHAI0/fin-agent)。在此向以上项目和开发者表示诚挚的感谢。
+
+---
+
 ## 贡献
 
 本项目正在积极开发中，欢迎提交 Issue 和 Pull Request。

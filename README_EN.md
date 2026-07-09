@@ -310,6 +310,12 @@ We welcome community contributions to address these limitations.
 
 ---
 
+## Acknowledgments
+
+The foundational architecture of this project was inspired by blogger **居丽叶 (Julie)**'s "居丽叶简历项目3：股票投资顾问Agent" (Julie's Resume Project 3: Stock Investment Advisor Agent), with portions of code reused under permission. The strategy architecture design was inspired by community projects such as [fin-agent](https://github.com/YUHAI0/fin-agent). Sincere thanks to the above projects and their developers.
+
+---
+
 ## Contributing
 
 This project is actively developed. We welcome Issues and Pull Requests.

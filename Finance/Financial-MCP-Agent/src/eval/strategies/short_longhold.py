@@ -177,6 +177,7 @@ class ShortLongHoldStrategy(BaseStrategy):
         orders = []
 
         # ── 新开仓：分2天建仓（T日50%，T+1日50%）──
+        new_day1_codes = set()  # 追踪本次新创建的Day1条目，避免被清理
         for code, score, _ in candidates[:self.max_positions]:
             # 检查是否在 pending_builds 中（第2天补仓）
             pending = self._pending_builds.get(code)
@@ -195,6 +196,7 @@ class ShortLongHoldStrategy(BaseStrategy):
                     "target_value": 0,  # will be filled by size_positions
                     "day": 1,
                 }
+                new_day1_codes.add(code)
                 orders.append(order)
 
         # ── 加仓/补仓 ──
@@ -214,7 +216,10 @@ class ShortLongHoldStrategy(BaseStrategy):
                 self._add_cooldown[code] += 1
 
         # ── 清理不在池子中的 pending 和未成交的 Day1 残留 ──
+        # 跳过本次调用中新创建的 Day1 条目（target_value=0 待 size_positions 填充）
         for code in list(self._pending_builds.keys()):
+            if code in new_day1_codes:
+                continue
             if code not in pool:
                 del self._pending_builds[code]
             elif self._pending_builds[code].get("target_value", 0) <= 0:

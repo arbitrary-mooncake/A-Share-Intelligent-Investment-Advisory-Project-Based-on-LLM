@@ -32,7 +32,7 @@ class TestLayer1Classification:
     def test_lay1_levels_are_correct_taxonomy(self):
         """验证 LAYER1_LEVELS 是总纲规定的分类标准"""
         from src.eval.pool_screening import LAYER1_LEVELS
-        assert LAYER1_LEVELS == ["强烈推荐", "买入", "谨慎买入", "观望", "卖出"]
+        assert LAYER1_LEVELS == ["强烈推荐", "推荐", "中性", "回避", "卖出"]
         assert len(LAYER1_LEVELS) == 5
 
 

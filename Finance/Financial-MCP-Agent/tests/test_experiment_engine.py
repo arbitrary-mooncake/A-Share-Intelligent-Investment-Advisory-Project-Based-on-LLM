@@ -183,8 +183,8 @@ def test_run_consistency_test_all_different():
     """两次运行输出完全不同"""
     engine = ExperimentEngine()
     # 使用 20 个元素确保 top-10 集合不同且行动翻转 (n > k, 跨50阈值)
-    run1 = list(range(90, 45, -5)) + list(range(45, -5, -5))  # 20 elements, 9 above 50
-    run2 = list(range(-5, 95, 5))  # 20 elements, 9 above 50 (different indices)
+    run1 = list(range(90, 40, -5)) + list(range(40, -10, -5))  # 20 elements: 90..45 + 40..-5
+    run2 = list(range(-5, 95, 5))  # 20 elements: -5..90
 
     report = engine.run_consistency_test("short", run1, run2)
     assert report["mean_score_diff"] > 0

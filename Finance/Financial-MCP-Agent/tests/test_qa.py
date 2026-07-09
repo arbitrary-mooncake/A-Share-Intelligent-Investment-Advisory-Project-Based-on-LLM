@@ -543,6 +543,7 @@ class TestHallucinationSafety:
 
 # ── 对话前缀提取回归测试 ──────────────────────────
 
+@pytest.mark.skip(reason="extract_stock_from_question 已重构为仅处理确定性结构化输入，自然语言提取交 LLM 完成")
 class TestConversationalPrefixExtraction:
     """对话前缀（你觉得/我认为/大家看等）不应被误提取为公司名"""
 

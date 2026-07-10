@@ -7,8 +7,8 @@
 ### 1. Fork 和 Clone
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/A-Stock-Advisor.git
-cd A-Stock-Advisor
+git clone https://github.com/YOUR_USERNAME/A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM.git
+cd A-Share-Intelligent-Investment-Advisory-Project-Based-on-LLM
 ```
 
 ### 2. 环境搭建

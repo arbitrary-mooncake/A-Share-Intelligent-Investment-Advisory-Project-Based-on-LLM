@@ -48,8 +48,8 @@ def _get_cached(cache_key: str) -> Optional[Any]:
     if cache_key not in _cache:
         return None
     if time.time() - _cache_timestamps.get(cache_key, 0) > _CACHE_TTL:
-        del _cache[cache_key]
-        del _cache_timestamps[cache_key]
+        _cache.pop(cache_key, None)
+        _cache_timestamps.pop(cache_key, None)
         return None
     return _cache[cache_key]
 
@@ -98,7 +98,7 @@ async def call_akshare(func_name: str, **kwargs) -> Optional[Any]:
                 logger.warning(f"AKShare function not found: {func_name}")
                 return None
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None, lambda: func(**kwargs)
             )
@@ -124,10 +124,10 @@ def dataframe_to_dicts(df) -> list:
     return []
 
 
-def dataframe_to_tushare_format(df) -> list:
+def dataframe_to_tushare_format(df) -> Optional[dict]:
     """将 pandas DataFrame 转换为 Tushare {fields, items} 兼容格式"""
     if df is None or not hasattr(df, "columns"):
-        return []
+        return None
     fields = list(df.columns)
     items = df.values.tolist()
     return {"fields": fields, "items": items}

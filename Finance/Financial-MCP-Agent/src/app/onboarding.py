@@ -198,6 +198,9 @@ def _show_full_config():
 
 def _write_env_lite(deepseek_key: str, tushare_token: str):
     """写入精简版 .env 并立即更新 os.environ"""
+    # 清理 key 值：去除首尾空白和换行符，防止 .env 注入
+    deepseek_key = (deepseek_key or "").strip().replace("\n", "").replace("\r", "")
+    tushare_token = (tushare_token or "").strip().replace("\n", "").replace("\r", "")
     env_path = _get_env_path()
     content = f"""# ============================================================
 # A股智能投顾Agent助手 — 环境变量配置（精简版）

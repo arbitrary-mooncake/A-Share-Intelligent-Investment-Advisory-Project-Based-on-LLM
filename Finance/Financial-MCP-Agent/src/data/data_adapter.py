@@ -6,7 +6,7 @@ AKShare -> Tushare 格式适配器。
 字段名和数据结构与 Tushare 返回完全一致。
 """
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -243,14 +243,18 @@ def adapt_block_trade(akshare_data: list) -> list:
 def adapt_limit_stats(zt_data: list, dt_data: list, stock_code: str) -> list:
     """
     AKShare stock_zt_pool_em + stock_dt_pool_em -> Tushare stk_limit 格式
+
+    AKShare 返回的是全市场涨/跌停股票池，这里按 stock_code 过滤，
+    返回该个股当日是否处于涨停/跌停状态（zt_count/dt_count: 1=是, 0=否）。
     """
-    zt_count = len(zt_data) if zt_data else 0
-    dt_count = len(dt_data) if dt_data else 0
+    ak_code = stock_code.replace(".SH", "").replace(".SZ", "").replace(".BJ", "")
+    is_zt = any(_safe_str(row.get("代码", "")) == ak_code for row in (zt_data or []))
+    is_dt = any(_safe_str(row.get("代码", "")) == ak_code for row in (dt_data or []))
 
     return [{
         "ts_code": stock_code,
-        "zt_count": zt_count,
-        "dt_count": dt_count,
+        "zt_count": 1 if is_zt else 0,
+        "dt_count": 1 if is_dt else 0,
         "_source": "akshare",
     }]
 

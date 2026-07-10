@@ -12,7 +12,7 @@ Lite 模式下自动检测积分并回退 AKShare。
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from src.data.akshare_client import call_akshare, dataframe_to_dicts
 from src.data import data_adapter
@@ -49,7 +49,7 @@ def _to_akshare_code(tushare_code: str) -> str:
 def _to_tushare_code(code: str) -> str:
     """AKShare 代码 -> Tushare 代码"""
     c = code.strip()
-    if c.startswith(("6", "688", "5")):
+    if c.startswith(("6", "5")):
         return f"{c}.SH"
     elif c.startswith(("0", "3", "1")):
         return f"{c}.SZ"
@@ -75,18 +75,20 @@ class UnifiedDataLayer:
         """
         self._tushare_call = tushare_call_func
         self._tushare_points = tushare_points
-        self._points_detected = False
 
     def _has_access(self, required_points: int) -> bool:
         """检查是否有权限访问某个 Tushare 接口"""
         return self._tushare_points >= required_points
 
     async def _call_tushare(self, api_name: str, params: dict = None, fields: str = "") -> Optional[list]:
-        """调用 Tushare API"""
+        """调用 Tushare API（在线程池中执行同步调用，避免阻塞事件循环）"""
         if self._tushare_call is None:
             return None
         try:
-            result = self._tushare_call(api_name, params or {}, fields)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, self._tushare_call, api_name, params or {}, fields
+            )
             if result is None:
                 return None
             if isinstance(result, dict):
@@ -224,7 +226,8 @@ class UnifiedDataLayer:
             return result
 
         ak_code = _to_akshare_code(stock_code)
-        raw = await call_akshare("stock_individual_fund_flow", stock=ak_code, market="sh" if ts_code.endswith(".SH") else "sz")
+        market = "bj" if ts_code.endswith(".BJ") else ("sh" if ts_code.endswith(".SH") else "sz")
+        raw = await call_akshare("stock_individual_fund_flow", stock=ak_code, market=market)
         if raw is not None:
             dicts = dataframe_to_dicts(raw)
             return data_adapter.adapt_money_flow(dicts)
@@ -243,11 +246,16 @@ class UnifiedDataLayer:
         if result:
             return result
 
+        if ts_code.endswith(".BJ"):
+            return None  # 北交所无融资融券数据
         exchange = "szse" if ts_code.endswith(".SZ") else "sse"
         raw = await call_akshare(f"stock_margin_detail_{exchange}")
         if raw is not None:
             dicts = dataframe_to_dicts(raw)
-            return data_adapter.adapt_margin(dicts)
+            adapted = data_adapter.adapt_margin(dicts)
+            # AKShare 返回全市场数据，按个股代码过滤
+            ak_code = _to_akshare_code(stock_code)
+            return [r for r in adapted if r.get("ts_code") == ak_code]
         return None
 
     async def get_block_trade(self, stock_code: str) -> Optional[list]:

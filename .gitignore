@@ -48,7 +48,7 @@ fund_pool.json
 # ─── Streamlit 本地密钥 ───────────────────────────────────
 .streamlit/secrets.toml
 
-# ─── Claude Code / Superpowers 本地状态 ───────────────────
+# ─── AI 辅助开发工具本地配置 ─────────────────────────────
 .claude/
 .superpowers/
 CLAUDE.md
@@ -76,4 +76,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# ─── 开发用临时脚本(本地保留,不纳入版本控制)────────────────
+Finance/Financial-MCP-Agent/test_extraction.py
 

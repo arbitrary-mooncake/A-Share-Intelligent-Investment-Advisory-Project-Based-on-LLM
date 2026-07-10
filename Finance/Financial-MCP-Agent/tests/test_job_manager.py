@@ -206,8 +206,8 @@ def test_jobmanager_start_creates_running_job(tmp_path, monkeypatch):
     _orig_spawn = jm._spawn_worker
     monkeypatch.setattr(
         jm, "_spawn_worker",
-        lambda job_id, term, log_path, worker_module_override=None:
-            _orig_spawn(job_id, term, log_path, worker_module_override=str(fake))
+        lambda job_id, term, log_path, mode="full", worker_module_override=None:
+            _orig_spawn(job_id, term, log_path, mode=mode, worker_module_override=str(fake))
     )
 
     mgr = jm.JobManager()

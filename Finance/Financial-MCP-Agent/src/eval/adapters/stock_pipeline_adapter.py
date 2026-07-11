@@ -22,6 +22,7 @@ async def run_stock_analysis(
     skip_cache: bool = False,
     thinking_enabled: bool = True,
     model_override: Optional[Dict[str, str]] = None,
+    scoring_engine: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     对单只股票运行分析+打分管线（适配版）。
@@ -34,6 +35,9 @@ async def run_stock_analysis(
         skip_cache: 是否跳过中间产物缓存
         thinking_enabled: scorer是否启用thinking
         model_override: 模型覆盖 {"model_name", "model_api_key", "model_base_url"}
+        scoring_engine: 可选的复用 ScoringEngine 实例。并发场景下传入共享实例,
+            避免每只股票重复编译 LangGraph workflow（与 pool_screening Layer 3
+            的 shared engine 模式对齐）；None 则新建（向后兼容单次调用）。
 
     Returns:
         {
@@ -73,7 +77,9 @@ async def run_stock_analysis(
     start_time = datetime.now()
 
     try:
-        engine = ScoringEngine(pool_manager=False)  # eval 系统不应写入 stock_pool.json
+        # 复用外部传入的 ScoringEngine（并发场景共享实例, 避免重复编译 workflow）；
+        # 未传入时新建（向后兼容单次调用）
+        engine = scoring_engine if scoring_engine is not None else ScoringEngine(pool_manager=False)  # eval 系统不应写入 stock_pool.json
 
         # 运行完整评分管线
         # 注意: 标准 score_stock() 不接受 model_config / as_of_date，

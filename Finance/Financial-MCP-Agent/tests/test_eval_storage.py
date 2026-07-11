@@ -18,24 +18,50 @@ def setup_module():
     """初始化数据库并创建测试用的基准批次"""
     init_db()
     # 清理可能存在的旧测试数据，避免UNIQUE冲突
+    # 按外键依赖顺序删除（先删子表 realized_label → prediction_snapshot →
+    # 其余子表 → eval_batch）。database.py 开启了 PRAGMA foreign_keys=ON,
+    # 若顺序颠倒, 删 prediction_snapshot 时会因 realized_label 的外键引用而失败,
+    # 此前用 except: pass 吞掉异常导致 eval_batch 未清理 → test_batch_001 残留 →
+    # create_batch 触发 UNIQUE 冲突（本地 eval.db 有残留时复现, CI 干净 db 不触发）。
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM optimization_ticket WHERE batch_id LIKE 'test_%'")
-        conn.execute("DELETE FROM agent_contribution WHERE batch_id LIKE 'test_%'")
-        conn.execute("DELETE FROM module_loss WHERE batch_id LIKE 'test_%'")
-        conn.execute("DELETE FROM experiment_run WHERE batch_id LIKE 'test_%'")
+        # realized_label 引用 prediction_snapshot, 必须先删（含引用 test_ 批次快照的行）
+        conn.execute(
+            "DELETE FROM realized_label WHERE snapshot_id LIKE 'snap_test_%' "
+            "OR snapshot_id IN (SELECT snapshot_id FROM prediction_snapshot "
+            "WHERE batch_id LIKE 'test_%')"
+        )
         conn.execute("DELETE FROM prediction_snapshot WHERE batch_id LIKE 'test_%'")
-        conn.execute("DELETE FROM realized_label WHERE snapshot_id LIKE 'snap_test_%'")
+        for tbl in ("optimization_ticket", "agent_contribution",
+                    "module_loss", "experiment_run"):
+            conn.execute(f"DELETE FROM {tbl} WHERE batch_id LIKE 'test_%'")
         conn.execute("DELETE FROM eval_batch WHERE batch_id LIKE 'test_%'")
         conn.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        import warnings
+        warnings.warn(f"setup_module cleanup failed: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     finally:
         conn.close()
     # 创建一个固定batch_id的基准批次，供后续依赖外键的测试使用
     from src.eval.repositories import create_batch
     batch = EvalBatch(batch_id="test_batch_001", status="completed", trigger_source="test")
-    create_batch(batch)
+    try:
+        create_batch(batch)
+    except Exception:
+        # 清理未完全时 test_batch_001 可能已存在; UPDATE 确保状态一致, 避免阻塞后续测试
+        conn2 = get_connection()
+        try:
+            conn2.execute(
+                "UPDATE eval_batch SET status='completed', trigger_source='test' "
+                "WHERE batch_id='test_batch_001'"
+            )
+            conn2.commit()
+        finally:
+            conn2.close()
 
 
 def test_create_and_get_batch():

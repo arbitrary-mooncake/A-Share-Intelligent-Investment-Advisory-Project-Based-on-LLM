@@ -2,6 +2,7 @@
 编排器 — 评测系统的中央调度引擎。
 连接分析→评分→策略→仿真→结算→Loss的完整主循环。
 """
+import asyncio
 import json
 import logging
 import os
@@ -784,6 +785,7 @@ class EvalOrchestrator:
             read_cache, write_cache, read_signal_pack_cache, write_signal_pack_cache
         )
         from src.eval.adapters.stock_pipeline_adapter import run_stock_analysis
+        from src.stock_pool.scoring_engine import ScoringEngine
         import json
 
         scores = {}
@@ -802,34 +804,69 @@ class EvalOrchestrator:
             ("moneyflow", 1),
         ]
 
-        for code in pool:
-            try:
-                # ── Step 1: 检查每个agent的独立缓存 ──
-                all_fresh = True
-                cached_signal_packs = {}
-                for agent_name, ttl_days in _ALL_AGENTS:
-                    sp = read_signal_pack_cache(agent_name, code, as_of_date)
-                    if sp:
-                        cached_signal_packs[agent_name] = sp
-                    else:
-                        all_fresh = False
+        # 共用单个 ScoringEngine: 避免每只股票重复编译 LangGraph workflow,
+        # 且与 pool_screening Layer 3 的验证模式对齐 (shared engine + Semaphore(5))。
+        # MCP client 本身已是模块级单例 (_mcp_init_lock 保护), 此处共享 engine
+        # 主要省去重复的 workflow 编译开销。
+        shared_engine = ScoringEngine(pool_manager=False)
+        sem = asyncio.Semaphore(5)
 
-                # ── Step 2: 缓存全命中 → 直接用缓存运行 + 运行scorer ──
-                if all_fresh and cached_signal_packs:
-                    logger.debug("All %d agent caches hit for %s @ %s, running scorers from cache",
-                                len(cached_signal_packs), code, as_of_date)
-                    # 从独立缓存组装结果 + 运行scorer
-                    result = await self._assemble_from_agent_caches(
-                        code, as_of_date, cached_signal_packs, term
-                    )
-                    # 如果scorer失败，回退到完整管线
-                    if result.get("_scorer_failed"):
-                        logger.warning(
-                            "Scorer from cache failed for %s, falling back to pipeline",
-                            code, as_of_date
+        async def _score_one(code: str):
+            """处理单只股票评分（信号量限流 5 并发）"""
+            async with sem:
+                try:
+                    # ── Step 1: 检查每个agent的独立缓存 ──
+                    all_fresh = True
+                    cached_signal_packs = {}
+                    for agent_name, ttl_days in _ALL_AGENTS:
+                        sp = read_signal_pack_cache(agent_name, code, as_of_date)
+                        if sp:
+                            cached_signal_packs[agent_name] = sp
+                        else:
+                            all_fresh = False
+
+                    # ── Step 2: 缓存全命中 → 直接用缓存 + 运行scorer ──
+                    if all_fresh and cached_signal_packs:
+                        logger.debug("All %d agent caches hit for %s @ %s, running scorers from cache",
+                                    len(cached_signal_packs), code, as_of_date)
+                        result = await self._assemble_from_agent_caches(
+                            code, as_of_date, cached_signal_packs, term
                         )
-                        result = await run_stock_analysis(code, "", as_of_date, eval_mode=True)
+                        if result.get("_scorer_failed"):
+                            logger.warning(
+                                "Scorer from cache failed for %s, falling back to pipeline",
+                                code, as_of_date
+                            )
+                            result = await run_stock_analysis(code, "", as_of_date, eval_mode=True, scoring_engine=shared_engine)
+                            if not result.get("error"):
+                                signal_packs = result.get("signal_packs", {})
+                                analysis_texts = result.get("analysis_texts", {})
+                                for agent_name, _ in _ALL_AGENTS:
+                                    sp = signal_packs.get(agent_name)
+                                    if sp and isinstance(sp, dict):
+                                        write_signal_pack_cache(
+                                            agent_name, code, as_of_date, sp
+                                        )
+                                    txt = analysis_texts.get(agent_name, "")
+                                    if txt:
+                                        write_cache(agent_name, code, as_of_date, txt)
+                    else:
+                        # ── Step 3: 有缓存未命中 → 运行完整管线 ──
+                        stale_agents = [
+                            a for a, _ in _ALL_AGENTS
+                            if a not in cached_signal_packs
+                        ]
+                        logger.info("Agent cache miss for %s @ %s (%d/%d fresh, stale: %s), "
+                                    "running pipeline...",
+                                    code, as_of_date, len(cached_signal_packs),
+                                    len(_ALL_AGENTS), ','.join(stale_agents))
+
+                        result = await run_stock_analysis(
+                            code, "", as_of_date, eval_mode=True, scoring_engine=shared_engine
+                        )
+
                         if not result.get("error"):
+                            # ── Step 4: 分解管线结果，写每个agent的独立缓存 ──
                             signal_packs = result.get("signal_packs", {})
                             analysis_texts = result.get("analysis_texts", {})
                             for agent_name, _ in _ALL_AGENTS:
@@ -841,66 +878,41 @@ class EvalOrchestrator:
                                 txt = analysis_texts.get(agent_name, "")
                                 if txt:
                                     write_cache(agent_name, code, as_of_date, txt)
-                else:
-                    # ── Step 3: 有缓存未命中 → 运行完整管线 ──
-                    stale_agents = [
-                        a for a, _ in _ALL_AGENTS
-                        if a not in cached_signal_packs
-                    ]
-                    logger.info("Agent cache miss for %s @ %s (%d/%d fresh, stale: %s), "
-                                "running pipeline...",
-                                code, as_of_date, len(cached_signal_packs),
-                                len(_ALL_AGENTS), ','.join(stale_agents))
 
-                    result = await run_stock_analysis(
-                        code, "", as_of_date, eval_mode=True
-                    )
+                            write_cache("full_analysis", code, as_of_date,
+                                       json.dumps(result, ensure_ascii=False, default=str))
 
-                    if not result.get("error"):
-                        # ── Step 4: 分解管线结果，写每个agent的独立缓存 ──
-                        signal_packs = result.get("signal_packs", {})
-                        analysis_texts = result.get("analysis_texts", {})
-                        for agent_name, _ in _ALL_AGENTS:
-                            sp = signal_packs.get(agent_name)
-                            if sp and isinstance(sp, dict):
-                                write_signal_pack_cache(
-                                    agent_name, code, as_of_date, sp
-                                )
-                            # 同时写文本分析缓存
-                            txt = analysis_texts.get(agent_name, "")
-                            if txt:
-                                write_cache(agent_name, code, as_of_date, txt)
+                    # ── Step 5: 提取评分 ──
+                    term_key = f"{term}_term_score"
+                    term_score = result.get(term_key, {})
+                    if isinstance(term_score, dict):
+                        base_score = float(term_score.get("score", 50))
+                    else:
+                        base_score = 50.0
 
-                        # 写完整结果缓存（1天TTL，作为快速回退）
-                        write_cache("full_analysis", code, as_of_date,
-                                   json.dumps(result, ensure_ascii=False, default=str))
+                    # ── Step 6: 消融线调整 ──
+                    if ablated_agent and ablated_agent in ABLATION_AGENTS:
+                        signal_packs = result.get("signal_packs", cached_signal_packs)
+                        adjusted = self._adjust_score_for_ablation(
+                            base_score, signal_packs, ablated_agent, term
+                        )
+                        return (code, round(adjusted, 2))
+                    else:
+                        return (code, round(base_score, 2))
 
-                # ── Step 5: 提取评分 ──
-                term_key = f"{term}_term_score"
-                term_score = result.get(term_key, {})
-                if isinstance(term_score, dict):
-                    base_score = float(term_score.get("score", 50))
-                else:
-                    base_score = 50.0
+                except Exception as e:
+                    logger.warning("Failed to get real score for %s: %s", code, str(e))
+                    if "Tushare" in str(e) or "token" in str(e).lower():
+                        raise RuntimeError(
+                            f"Tushare不可用且缓存中无 {code}@{as_of_date} 的数据，"
+                            f"无法继续。请检查Tushare配置或网络连接。错误: {e}"
+                        ) from e
+                    return (code, 50.0)
 
-                # ── Step 6: 消融线调整 ──
-                if ablated_agent and ablated_agent in ABLATION_AGENTS:
-                    signal_packs = result.get("signal_packs", cached_signal_packs)
-                    adjusted = self._adjust_score_for_ablation(
-                        base_score, signal_packs, ablated_agent, term
-                    )
-                    scores[code] = round(adjusted, 2)
-                else:
-                    scores[code] = round(base_score, 2)
+        results = await asyncio.gather(*[_score_one(c) for c in pool])
 
-            except Exception as e:
-                logger.warning("Failed to get real score for %s: %s", code, str(e))
-                if "Tushare" in str(e) or "token" in str(e).lower():
-                    raise RuntimeError(
-                        f"Tushare不可用且缓存中无 {code}@{as_of_date} 的数据，"
-                        f"无法继续。请检查Tushare配置或网络连接。错误: {e}"
-                    ) from e
-                scores[code] = 50.0
+        for code, score_val in results:
+            scores[code] = score_val
 
         return scores
 

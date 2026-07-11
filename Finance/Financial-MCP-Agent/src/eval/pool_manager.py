@@ -368,7 +368,13 @@ class PoolManager:
                 break
         return count
 
-    def check_blacklist_fundamental_improvements(self) -> List[Dict[str, Any]]:
+    # ── 黑名单基本面改善检查的静态缓存 ──
+    _BL_IMPROVEMENT_CACHE: Dict[str, tuple] = {}  # code → (timestamp, result_dict)
+    _BL_IMPROVEMENT_CACHE_TTL = 86400  # 24小时
+
+    def check_blacklist_fundamental_improvements(
+        self, max_entries: int = 20, per_entry_timeout: float = 5.0
+    ) -> List[Dict[str, Any]]:
         """
         检查黑名单中的股票是否有基本面显著改善，值得提前解除黑名单。
 
@@ -378,6 +384,10 @@ class PoolManager:
           3. 营收增速转正（or_yoy > 0）
 
         3项全部满足 → 标记为"建议提前解除黑名单"。
+
+        Args:
+            max_entries: 最多检查的条目数（避免页面加载时大量API调用）
+            per_entry_timeout: 单条检查超时（秒）
 
         Returns:
             [{code, term, reason（入黑原因）, improvements: [描述, ...]}, ...]
@@ -413,14 +423,23 @@ class PoolManager:
         if not active_entries:
             return []
 
-        # 去重
+        # 去重 + 跳过测试代码
+        _TEST_CODE_PREFIXES = ("sh.999999", "sz.999999", "sh.000000", "sz.000000")
         seen_codes = set()
         unique_entries = []
         for entry in active_entries:
             code = entry.get("code", "")
-            if code not in seen_codes:
-                seen_codes.add(code)
-                unique_entries.append(entry)
+            if code in seen_codes:
+                continue
+            if any(code.startswith(p) for p in _TEST_CODE_PREFIXES):
+                continue
+            seen_codes.add(code)
+            unique_entries.append(entry)
+
+        # 限制检查数量，优先检查短期限（short > medium > long）
+        term_priority = {"short": 0, "medium": 1, "long": 2}
+        unique_entries.sort(key=lambda e: term_priority.get(e.get("term", "long"), 99))
+        unique_entries = unique_entries[:max_entries]
 
         candidates = []
 
@@ -437,94 +456,162 @@ class PoolManager:
             else:
                 ts_code = code
 
+            # ── 缓存检查 ──
+            cache_key = f"bl_improve_{ts_code}"
+            if cache_key in self._BL_IMPROVEMENT_CACHE:
+                cache_ts, cached_result = self._BL_IMPROVEMENT_CACHE[cache_key]
+                if now.timestamp() - cache_ts < self._BL_IMPROVEMENT_CACHE_TTL:
+                    # 与首次检查阈值一致: imp_count >= 3 才加入 candidates。
+                    # 此前误用 "improvements 非空" 判断, 导致仅 1-2 项改善的股票
+                    # 在缓存命中时被错误标记为"建议解除黑名单"。
+                    if cached_result and cached_result.get("imp_count", 0) >= 3:
+                        candidates.append({
+                            "code": cached_result.get("code", code),
+                            "term": cached_result.get("term", entry.get("term", "")),
+                            "reason": cached_result.get("reason", entry.get("reason", "未知原因")),
+                            "improvements": cached_result.get("improvements", []),
+                        })
+                    continue
+
             try:
-                from src.utils.tushare_client import _call as tushare_call
-                from src.utils.industry_knowledge import get_industry_info
-                from src.utils.tushare_client import get_stock_info
+                import concurrent.futures
 
-                improvements = []
+                def _fetch_data():
+                    from src.utils.tushare_client import _call as tushare_call
+                    from src.utils.industry_knowledge import get_industry_info
+                    from src.utils.tushare_client import get_stock_info
 
-                # ── 指标1: PE检查（daily_basic） ──
-                from src.eval.data_fetcher import fetch_latest_trading_day
-                trade_date = fetch_latest_trading_day().replace("-", "")
-                pe_basic = tushare_call("daily_basic", {
-                    "ts_code": ts_code,
-                    "trade_date": trade_date,
-                }, fields="pe_ttm")
-                pe = None
-                if pe_basic and pe_basic.get("items"):
-                    field_names = pe_basic["fields"]
-                    row = dict(zip(field_names, pe_basic["items"][0]))
-                    pe_val = row.get("pe_ttm")
-                    if pe_val is not None:
-                        pe = float(pe_val)
+                    improvements = []
 
-                # ── 指标2 & 3: ROE和营收增速（fina_indicator） ──
-                fina = tushare_call("fina_indicator", {
-                    "ts_code": ts_code,
-                    "start_date": f"{now.year - 1}0101",
-                    "end_date": now.strftime("%Y1231"),
-                }, fields="roe,or_yoy,end_date")
-                roe = None
-                rev_growth = None
-                if fina and fina.get("items"):
-                    field_names = fina["fields"]
-                    # 取最新一期（end_date最大）
-                    latest = None
-                    for row_data in fina["items"]:
-                        row = dict(zip(field_names, row_data))
-                        if latest is None or row.get("end_date", "") > latest.get("end_date", ""):
-                            latest = row
-                    if latest:
-                        roe_val = latest.get("roe")
-                        if roe_val is not None:
-                            roe = float(roe_val)
-                        rg_val = latest.get("or_yoy")
-                        if rg_val is not None:
-                            rev_growth = float(rg_val)
+                    # ── 指标1: PE检查（daily_basic） ──
+                    from src.eval.data_fetcher import fetch_latest_trading_day
+                    trade_date = fetch_latest_trading_day().replace("-", "")
+                    pe_basic = tushare_call("daily_basic", {
+                        "ts_code": ts_code,
+                        "trade_date": trade_date,
+                    }, fields="pe_ttm")
+                    pe = None
+                    if pe_basic and pe_basic.get("items"):
+                        field_names = pe_basic["fields"]
+                        row = dict(zip(field_names, pe_basic["items"][0]))
+                        pe_val = row.get("pe_ttm")
+                        if pe_val is not None:
+                            pe = float(pe_val)
 
-                # ── 获取行业基准 ──
-                stock_info = None
-                try:
-                    stock_info = get_stock_info(ts_code)
-                except Exception:
-                    pass
-                industry = stock_info.get("industry", "") if stock_info else ""
-                benchmark = get_industry_info(industry) if industry else None
+                    # ── 指标2 & 3: ROE和营收增速（fina_indicator） ──
+                    fina = tushare_call("fina_indicator", {
+                        "ts_code": ts_code,
+                        "start_date": f"{now.year - 1}0101",
+                        "end_date": now.strftime("%Y1231"),
+                    }, fields="roe,or_yoy,end_date")
+                    roe = None
+                    rev_growth = None
+                    if fina and fina.get("items"):
+                        field_names = fina["fields"]
+                        latest = None
+                        for row_data in fina["items"]:
+                            row = dict(zip(field_names, row_data))
+                            if latest is None or row.get("end_date", "") > latest.get("end_date", ""):
+                                latest = row
+                        if latest:
+                            roe_val = latest.get("roe")
+                            if roe_val is not None:
+                                roe = float(roe_val)
+                            rg_val = latest.get("or_yoy")
+                            if rg_val is not None:
+                                rev_growth = float(rg_val)
 
-                # ── 检查3项条件 ──
-                if pe is not None and benchmark:
-                    pe_cheap = benchmark.get("pe_cheap_threshold", 0)
-                    pe_expensive = benchmark.get("pe_expensive_threshold", float("inf"))
-                    if pe_cheap <= pe <= pe_expensive:
-                        improvements.append(
-                            f"PE={pe:.1f}回到行业合理区间({pe_cheap}-{pe_expensive})"
-                        )
-                elif pe is not None:
-                    # 无行业信息时，PE>0且<200视为基本合理
-                    if 0 < pe < 200:
-                        improvements.append(f"PE={pe:.1f}在基本合理范围")
+                    # ── 获取行业基准 ──
+                    stock_info = None
+                    try:
+                        stock_info = get_stock_info(ts_code)
+                    except Exception:
+                        pass
+                    industry = stock_info.get("industry", "") if stock_info else ""
+                    benchmark = get_industry_info(industry) if industry else None
 
-                if roe is not None and roe > 0:
-                    improvements.append(f"ROE转正={roe:.1f}%")
+                    # ── 检查3项条件 ──
+                    if pe is not None and benchmark:
+                        pe_cheap = benchmark.get("pe_cheap_threshold", 0)
+                        pe_expensive = benchmark.get("pe_expensive_threshold", float("inf"))
+                        if pe_cheap <= pe <= pe_expensive:
+                            improvements.append(
+                                f"PE={pe:.1f}回到行业合理区间({pe_cheap}-{pe_expensive})"
+                            )
+                    elif pe is not None:
+                        if 0 < pe < 200:
+                            improvements.append(f"PE={pe:.1f}在基本合理范围")
 
-                if rev_growth is not None and rev_growth > 0:
-                    improvements.append(f"营收增速转正={rev_growth:.1f}%")
+                    if roe is not None and roe > 0:
+                        improvements.append(f"ROE转正={roe:.1f}%")
 
-                if len(improvements) >= 3:
-                    candidates.append({
+                    if rev_growth is not None and rev_growth > 0:
+                        improvements.append(f"营收增速转正={rev_growth:.1f}%")
+
+                    return {
                         "code": code,
                         "term": entry.get("term", ""),
                         "reason": entry.get("reason", "未知原因"),
                         "improvements": improvements,
-                        "added_at": entry.get("added_at", ""),
-                        "expires_at": entry.get("expires_at", ""),
+                        "imp_count": len(improvements),
+                    }
+
+                # 带超时的执行（防止单条 Tushare 调用卡死页面）
+                # 不用 with 语句: ThreadPoolExecutor.__exit__ 调 shutdown(wait=True),
+                # 会阻塞到底层线程完成, 使 per_entry_timeout 失效（Tushare 卡死时页面仍卡）。
+                # 手动管理, 超时/异常后 shutdown(wait=False, cancel_futures=True) 立即返回。
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(_fetch_data)
+                try:
+                    result = future.result(timeout=per_entry_timeout)
+                except concurrent.futures.TimeoutError:
+                    logger.warning(
+                        "[PoolManager] 黑名单改善检查超时 %s (%.1fs)", code, per_entry_timeout
+                    )
+                    # 缓存超时结果（避免重复尝试）
+                    self._BL_IMPROVEMENT_CACHE[cache_key] = (
+                        now.timestamp(),
+                        {"code": code, "improvements": [], "imp_count": 0},
+                    )
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    continue
+                except Exception as e:
+                    logger.warning(
+                        "[PoolManager] 黑名单改善检查失败 %s: %s", code, e
+                    )
+                    # 缓存失败结果（避免重复尝试浪费 API 配额）
+                    self._BL_IMPROVEMENT_CACHE[cache_key] = (
+                        now.timestamp(),
+                        {"code": code, "improvements": [], "imp_count": 0},
+                    )
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    continue
+                # 正常完成: future 已结束, wait=True 可安全清理线程资源
+                executor.shutdown(wait=True)
+
+                # ── 缓存结果 ──
+                self._BL_IMPROVEMENT_CACHE[cache_key] = (now.timestamp(), result)
+
+                if result and result.get("imp_count", 0) >= 3:
+                    candidates.append({
+                        "code": result["code"],
+                        "term": result["term"],
+                        "reason": result["reason"],
+                        "improvements": result["improvements"],
                     })
 
             except Exception as e:
                 logger.warning(
                     "[PoolManager] 检查黑名单基本面改善失败 %s: %s", code, e
                 )
+                # 缓存失败结果（避免重复尝试）
+                try:
+                    self._BL_IMPROVEMENT_CACHE[cache_key] = (
+                        now.timestamp(),
+                        {"code": code, "improvements": [], "imp_count": 0},
+                    )
+                except Exception:
+                    pass
                 continue
 
         # 按改善项数量降序
@@ -547,7 +634,8 @@ class PoolManager:
         return candidates
 
     def get_pool_health(self,
-                        lines_status: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                        lines_status: Optional[List[Dict[str, Any]]] = None,
+                        quick: bool = True) -> Dict[str, Any]:
         """
         检查各期限精筛池的健康状态，返回红/黄/绿状态及触发原因。
 
@@ -559,9 +647,7 @@ class PoolManager:
 
         Args:
             lines_status: 可选，来自LineManager.get_all_status()的线路状态列表。
-                          提供后可检查持仓覆盖率与LLM自主线对比；
-                          不提供则仅基于精筛池自身数据判断。
-
+            quick: True=跳过Tushare API调用（页面加载用），False=完整检查含黑名单改善分析。
         Returns:
             {term: {status, triggers, last_update, days_since_update,
                     suggested_action, details}}
@@ -640,17 +726,14 @@ class PoolManager:
                 not_held = [c for c in pool_codes if c not in held_stocks_set]
                 not_held_pct = len(not_held) / max(len(pool_codes), 1) * 100
 
-            # 黑名单检查 (查所有 term, 捕捉跨期限污染)
+            # 黑名单检查 (仅查当前期限，短线/中线/长线独立隔离)
             active_blacklist_codes: set = set()
             now = datetime.now()
             bl = self.pools.get("blacklist", {})
-            all_bl_entries = []
             if isinstance(bl, dict):
-                for t in ("short", "medium", "long"):
-                    all_bl_entries.extend(bl.get(t, []))
+                term_entries = bl.get(term, [])
             else:
-                all_bl_entries = bl
-            term_entries = all_bl_entries
+                term_entries = bl
             for entry in term_entries:
                 expires_str = entry.get("expires_at", "")
                 if expires_str:
@@ -713,23 +796,25 @@ class PoolManager:
                 status = "red"
 
                 # ── 检查黑名单股是否有基本面改善（Gap #3）──
-                try:
-                    improved = self.suggest_blacklist_removal(term)
-                    pool_improved = [
-                        c for c in improved
-                        if c.get("code", "") in blacklist_in_pool
-                    ]
-                    if pool_improved:
-                        for c in pool_improved[:3]:
-                            triggers.append(
-                                f"黑名单股{c['code']}基本面已改善"
-                                f"（{'; '.join(c['improvements'][:2])}），"
-                                f"建议提前解除黑名单"
-                            )
-                except Exception as e:
-                    logger.warning(
-                        "[PoolManager] 黑名单改善检查失败: %s", e
-                    )
+                # quick 模式下跳过（避免 Tushare API 调用拖慢页面加载）
+                if not quick:
+                    try:
+                        improved = self.suggest_blacklist_removal(term)
+                        pool_improved = [
+                            c for c in improved
+                            if c.get("code", "") in blacklist_in_pool
+                        ]
+                        if pool_improved:
+                            for c in pool_improved[:3]:
+                                triggers.append(
+                                    f"黑名单股{c['code']}基本面已改善"
+                                    f"（{'; '.join(c['improvements'][:2])}），"
+                                    f"建议提前解除黑名单"
+                                )
+                    except Exception as e:
+                        logger.warning(
+                            "[PoolManager] 黑名单改善检查失败: %s", e
+                        )
 
             # ── 欠填充检测（当前池容量显著低于目标） ──
             min_size = DEFAULT_POOL_CONFIG[term]["min_size"]

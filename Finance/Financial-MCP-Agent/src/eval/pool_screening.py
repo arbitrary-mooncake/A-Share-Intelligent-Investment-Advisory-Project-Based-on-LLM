@@ -345,12 +345,14 @@ def _ts_to_internal(ts_code: str) -> str:
 # 否则 parse_batch_response 的 normalization 会静默改写 LLM 输出。
 LAYER1_LEVELS = ["强烈推荐", "推荐", "中性", "回避", "卖出"]
 
-# 总纲5级 → 3档 映射 (只有"卖出"进黑名单, "中性"/"回避"丢弃)
+# 总纲5级 → 4档 映射 (只有"卖出"进黑名单, "中性"/"回避"直接丢弃不进入L2)
+# 实验验证(2026-07-12): 4696只全A股L1粗筛, 仅1只"中性"走到L3最终池,
+# 证明"中性"/"回避"进入L2/L3是浪费token, 应在L1直接丢弃。
 LEVEL_TO_TIER = {
     "强烈推荐": "whitelist",
     "推荐": "initial_pool",
-    "中性": "initial_pool",
-    "回避": "initial_pool",
+    "中性": "discard",
+    "回避": "discard",
     "卖出": "blacklist",
 }
 
@@ -433,6 +435,7 @@ async def batch_score_layer1(
 
     # Step D: 分档
     whitelist, initial_pool, blacklist = [], [], []
+    discarded = 0
     for s in scored:
         score_data = s.get("score", {})
         if isinstance(score_data, dict):
@@ -449,12 +452,14 @@ async def batch_score_layer1(
                 whitelist.append(entry)
             elif tier == "initial_pool":
                 initial_pool.append(entry)
-            else:
+            elif tier == "blacklist":
                 blacklist.append(entry)
+            else:  # discard: 中性/回避, 直接丢弃不进入L2
+                discarded += 1
 
     logger.info(
-        "[Layer 1] 分档完成: 白名单%d只, 初筛池%d只, 黑名单%d只",
-        len(whitelist), len(initial_pool), len(blacklist)
+        "[Layer 1] 分档完成: 白名单%d只, 初筛池%d只, 黑名单%d只, 丢弃%d只",
+        len(whitelist), len(initial_pool), len(blacklist), discarded
     )
 
     if on_progress:

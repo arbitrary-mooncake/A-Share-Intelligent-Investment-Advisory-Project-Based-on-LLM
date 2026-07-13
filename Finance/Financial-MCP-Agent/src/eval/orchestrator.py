@@ -824,14 +824,14 @@ class EvalOrchestrator:
         ]
 
         # 共用单个 ScoringEngine: 避免每只股票重复编译 LangGraph workflow,
-        # 且与 pool_screening Layer 3 的验证模式对齐 (shared engine + Semaphore(5))。
+        # 且与 pool_screening Layer 3 的验证模式对齐 (shared engine + Semaphore(2))。
         # MCP client 本身已是模块级单例 (_mcp_init_lock 保护), 此处共享 engine
         # 主要省去重复的 workflow 编译开销。
         shared_engine = ScoringEngine(pool_manager=False)
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(2)
 
         async def _score_one(code: str):
-            """处理单只股票评分（信号量限流 5 并发）"""
+            """处理单只股票评分（信号量限流 2 并发）"""
             async with sem:
                 try:
                     # ── Step 1: 检查每个agent的独立缓存 ──
@@ -1392,7 +1392,7 @@ class EvalOrchestrator:
             → 中性/回避 → 放弃
             → 卖出 → blacklist
           Layer 2: DSV4Pro 流式排序, τ 收敛后 dispatch top-α 到 Layer 3
-          Layer 3: 5并发异步队列, 7Agent+3Scorer → 分数截断 → 精筛池
+          Layer 3: 2并发异步队列, 7Agent+3Scorer → 分数截断 → 精筛池
 
         Args:
             term: short/medium/long

@@ -179,7 +179,7 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
             "**Layer 0 硬筛**: 去ST/新股/BJ/B股/近20日日均成交额<2000万 → ~4500只\n"
             "**Layer 1 批量粗筛**: M1/M3生产模型5只/批打分, 分4档 (raw_data 同步累积)\n"
             "**Layer 2 快筛**: DSV4Pro 流式双堆 top-α, 复用 L1 raw_data (省 10-20min)\n"
-            "**Layer 3 精筛**: 白名单+推荐1:1.2差额 → 正式7Agent+3Scorer (5并发) → LLM动态阈值\n\n"
+            "**Layer 3 精筛**: 白名单+推荐1:1.2差额 → 正式7Agent+3Scorer (2并发) → LLM动态阈值\n\n"
             "⏱ 冷启动耗时: 短线/中线 ≈1-1.5h, 长线 ≈0.8-1h (热缓存 <30min)"
         )
 

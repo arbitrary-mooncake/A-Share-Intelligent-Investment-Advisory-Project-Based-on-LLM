@@ -1306,11 +1306,11 @@ async def _layer3_consumer(
     from src.stock_pool.scoring_engine import ScoringEngine
 
     # 共用单个 ScoringEngine: 避免 N 并发各自初始化 MCP client 导致 TaskGroup 崩溃
-    # 并发数 5 (2026-07-02 从 8 回退): 冷启动时 8 并发 × 7 agent ≈ 56 路 MCP stdio
-    # 调用会严重阻塞 Tushare/MCP 通道, 实测单只股票 Phase 1 从 13s 涨到 739s,
-    # 5 并发 × 7 agent ≈ 35 路更稳健，与架构文档对齐。
+    # 并发数 2 (2026-07-14 从 5 回退): MCP stdio 服务器单线程, 5 并发 × 7 agent ≈ 35 路
+    # 并发调用会死锁 (2026-07-12 实测一键检查 26min 无输出). 2 并发 × 7 agent ≈ 14 路
+    # 更稳健, 实测有效吞吐量最优 (1并发15只/h, 2并发24只/h, 5并发死锁).
     shared_engine = ScoringEngine(pool_manager=False)  # 禁用 stock_pool.json 写入，保持两个精筛池隔离
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(2)
     completed = 0
     total_dispatched = 0
     last_heartbeat = datetime.now()
@@ -1516,7 +1516,7 @@ async def run_pool_update_v3(
         → 卖出     → blacklist
       Layer 2: DSV4Pro 流式双堆 top-α, **复用 Layer 1 raw_data 跳过 fetch_batch**
               (省 10-20min/cold-start). τ 收敛后 dispatch top-α 到 Layer 3.
-      Layer 3: 5 并发异步队列消费者, 7Agent+3Scorer 正式评分
+      Layer 3: 2 并发异步队列消费者, 7Agent+3Scorer 正式评分
       截断: target_size × 1.2 进, target_size 出
 
     预估冷启动耗时: short ~1.0-1.5h, medium ~1.0-1.5h, long ~0.8-1.0h.
@@ -1613,7 +1613,7 @@ async def run_pool_update_v3(
     layer2_fallback = False  # 如果 DSV4Pro 失败, 用 Layer 1 兜底
 
     # Layer 3 消费者
-    _stage("3_start", "启动 Layer 3 消费者 (5并发, 15min超时)...")
+    _stage("3_start", "启动 Layer 3 消费者 (2并发, 15min超时)...")
     progress.stage_start("3_formal_score", total=target_size * 2)
     l3_task = asyncio.create_task(
         _layer3_consumer(
@@ -2005,7 +2005,7 @@ async def run_pool_update_partial(
     from src.stock_pool.scoring_engine import ScoringEngine
 
     shared_engine = ScoringEngine(pool_manager=False)
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(2)
     rescore_lock = asyncio.Lock()
     rescored: List[Dict[str, Any]] = []
     completed = 0

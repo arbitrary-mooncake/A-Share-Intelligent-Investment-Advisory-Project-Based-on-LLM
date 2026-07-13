@@ -565,7 +565,26 @@ class EvalOrchestrator:
         """
         pool = self.pool_manager.get_pool(term)
         if not pool:
-            return {"status": "skipped", "reason": f"{term}精筛池为空"}
+            # 即使精筛池为空，也返回与正常调仓一致的结果结构。
+            # 调用方需要按期限读取 term/lines，不能因为无可交易标的
+            # 而退化成另一种返回协议；每条线明确标记为 skipped，且
+            # 不产生评分、订单或持仓变更。
+            lines = self.line_manager.get_lines_by_term(term)
+            reason = f"{term}精筛池为空"
+            return {
+                "status": "skipped",
+                "term": term,
+                "reason": reason,
+                "lines": {
+                    line.line_id: {
+                        "status": "skipped",
+                        "reason": reason,
+                        "holdings_count": len(line.holdings),
+                        "cash": line.cash,
+                    }
+                    for line in lines
+                },
+            }
 
         lines = self.line_manager.get_lines_by_term(term)
         results = {}

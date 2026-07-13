@@ -176,9 +176,9 @@ def _show_full_config():
         m3_url = st.text_input("M3 Base URL", value="https://dashscope.aliyuncs.com/compatible-mode/v1", key="full_m3_url")
         m3_model = st.text_input("M3 Model Name", value="qwen3.7-plus", key="full_m3_model")
 
-        m5_key = st.text_input("M5 (MiMo-V2.5) API Key", type="password", key="full_m5_key")
-        m5_url = st.text_input("M5 Base URL", value="https://api.xiaomimimo.com/v1", key="full_m5_url")
-        m5_model = st.text_input("M5 Model Name", value="mimo-v2.5", key="full_m5_model")
+        m5_key = st.text_input("M5 (DeepSeek V4 Flash) API Key", type="password", key="full_m5_key")
+        m5_url = st.text_input("M5 Base URL", value="https://api.deepseek.com/v1", key="full_m5_url")
+        m5_model = st.text_input("M5 Model Name", value="deepseek-v4-flash", key="full_m5_model")
 
         m6_key = st.text_input("M6 (DeepSeek V4 Pro) API Key", type="password", key="full_m6_key")
         m6_url = st.text_input("M6 Base URL", value="https://api.deepseek.com/v1", key="full_m6_url")
@@ -282,7 +282,7 @@ OPENAI_COMPATIBLE_API_KEY_4=
 OPENAI_COMPATIBLE_BASE_URL_4=
 OPENAI_COMPATIBLE_MODEL_4=
 
-# ─── Model 5: MiMo-V2.5 ──────────────────────────────────
+# ─── Model 5: DeepSeek V4 Flash ──────────────────────────
 OPENAI_COMPATIBLE_API_KEY_5={m5_key}
 OPENAI_COMPATIBLE_BASE_URL_5={m5_url}
 OPENAI_COMPATIBLE_MODEL_5={m5_model}

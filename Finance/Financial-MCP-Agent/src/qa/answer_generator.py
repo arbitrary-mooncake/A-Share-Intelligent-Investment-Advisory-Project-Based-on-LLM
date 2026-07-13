@@ -13,7 +13,7 @@ import httpx
 
 from src.qa.complexity_analyzer import ComplexityResult
 from src.qa.evidence_assembler import EvidencePackage
-from src.utils.model_config import get_model_config_for_agent
+from src.utils.model_config import get_model_config_for_agent, get_qa_model_name, get_thinking_body
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 
 logger = setup_logger(__name__)
@@ -277,8 +277,10 @@ async def generate_answer_stream(
     base_url = model_cfg["base_url"]
     model_name = model_cfg["model_name"]
 
-    # 复杂问题升级模型 → Model 1 (MiMo-V2.5-Pro)
-    if complexity.recommended_model == "mimo-v2.5-pro":
+    # 复杂问题升级模型 → Model 1（具体模型名由配置决定）
+    # 保留旧名称判断，兼容升级前已持久化的复杂度结果。
+    pro_model_name = get_qa_model_name(pro=True)
+    if complexity.recommended_model in {pro_model_name, "mimo-v2.5-pro"}:
         pro_cfg = get_model_config_for_agent("qa_engine_pro")
         if all([pro_cfg["api_key"], pro_cfg["base_url"], pro_cfg["model_name"]]):
             api_key = pro_cfg["api_key"]
@@ -306,7 +308,7 @@ async def generate_answer_stream(
         max_retries=1,
     )
 
-    extra_body = {"thinking": {"type": "enabled" if complexity.recommended_thinking else "disabled"}}
+    extra_body = get_thinking_body(base_url, complexity.recommended_thinking)
 
     logger.info(
         f"{WAIT_ICON} QA Answer: 调用LLM (model={model_name}, "

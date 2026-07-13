@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from src.utils.model_config import get_qa_model_name
+
 
 @dataclass
 class ComplexityResult:
@@ -18,7 +20,7 @@ class ComplexityResult:
     triggers: List[str]   # 触发的规则列表
     score_detail: dict    # 各维度得分明细
     need_clarify: bool    # 是否需要澄清
-    recommended_model: str  # "mimo-v2.5" | "mimo-v2.5-pro"
+    recommended_model: str  # 当前配置的普通问答模型或 Pro 升级模型
     recommended_thinking: bool
     recommended_react: bool
     recommended_template: str    # "quick" | "standard" | "deep"
@@ -243,7 +245,7 @@ def _score_question(question: str) -> ComplexityResult:
         triggers=[f"评分={score}"],
         score_detail=detail,
         need_clarify=(detail.get("歧义程度", 0) >= 8),
-        recommended_model="mimo-v2.5-pro" if level in ("L2", "L3", "L4") else "mimo-v2.5",
+        recommended_model=get_qa_model_name(pro=level in ("L2", "L3", "L4")),
         recommended_thinking=(level in ("L3", "L4")),
         recommended_react=(level in ("L3", "L4")),
         recommended_template="quick" if level == "L1" else ("standard" if level == "L2" else "deep"),
@@ -270,7 +272,7 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
             triggers=["L0: 无需数据"],
             score_detail={"L0检测": "常识/闲聊问题"},
             need_clarify=False,
-            recommended_model="mimo-v2.5",
+            recommended_model=get_qa_model_name(),
             recommended_thinking=False,
             recommended_react=False,
             recommended_template="l0",
@@ -283,7 +285,7 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
             triggers=["需要澄清: 投资决策需指定标的"],
             score_detail={"澄清": "请提供股票代码或名称"},
             need_clarify=True,
-            recommended_model="mimo-v2.5",
+            recommended_model=get_qa_model_name(),
             recommended_thinking=False,
             recommended_react=False,
             recommended_template="quick",
@@ -310,7 +312,7 @@ def analyze_complexity(question: str, history_depth: int = 0) -> ComplexityResul
             triggers=triggers,
             score_detail={"硬触发": hard_level},
             need_clarify=False,
-            recommended_model="mimo-v2.5-pro" if hard_level in ("L3", "L4") else "mimo-v2.5",
+            recommended_model=get_qa_model_name(pro=hard_level in ("L3", "L4")),
             recommended_thinking=(hard_level in ("L3", "L4")),
             recommended_react=(hard_level in ("L3", "L4")),
             recommended_template="deep",
@@ -407,11 +409,11 @@ def try_runtime_upgrade(
         if current_idx < 2:
             result.level = "L3"
             result.triggers.append("运行时升级: 工具成功率过低 → L3")
-        result.recommended_model = "mimo-v2.5-pro"
+        result.recommended_model = get_qa_model_name(pro=True)
 
     # 触发2: 证据矛盾 → 升级到 Pro + reasoning
     if contradictory_signals:
-        result.recommended_model = "mimo-v2.5-pro"
+        result.recommended_model = get_qa_model_name(pro=True)
         result.recommended_thinking = True
         if current_idx < 2:
             result.level = "L3"
@@ -421,7 +423,7 @@ def try_runtime_upgrade(
     warranted = "L4" if actual_domain_count >= 5 else ("L3" if actual_domain_count >= 4 else None)
     if warranted and level_idx.get(warranted, 0) > current_idx:
         result.level = warranted
-        result.recommended_model = "mimo-v2.5-pro"
+        result.recommended_model = get_qa_model_name(pro=True)
         result.recommended_thinking = (warranted in ("L3", "L4"))
         result.recommended_react = (warranted in ("L3", "L4"))
         result.triggers.append(f"运行时升级: 实际{actual_domain_count}个数据域 → {warranted}")
@@ -442,9 +444,8 @@ def try_runtime_upgrade(
         result.triggers.append("运行时修正: L4必须启用ReAct")
 
     # 触发7: Pro被推荐但model未升级 → 修正
-    if result.recommended_model == "mimo-v2.5-pro" and current_idx >= 2:
+    if result.recommended_model in {get_qa_model_name(pro=True), "mimo-v2.5-pro"} and current_idx >= 2:
         if not result.recommended_thinking and result.level == "L4":
             result.recommended_thinking = True
 
     return result
-

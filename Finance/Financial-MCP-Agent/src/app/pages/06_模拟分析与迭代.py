@@ -49,7 +49,7 @@ from components.eval.contribution import render_contribution_leaderboard, render
 from components.eval.trends_charts import render_trends_tabs
 
 page_title("📈 模拟分析与迭代")
-st.caption("评分智能体 — 模拟盘评估、消融实验、回测、自动优化。所有结果仅供参考，使用评测模型(MiMo-V2.5)，目的是优化Agent系统。")
+st.caption("评分智能体 — 模拟盘评估、消融实验、回测、自动优化。所有结果仅供参考，使用评测模型(DeepSeek V4 Flash)，目的是优化Agent系统。")
 
 
 def _run_async(coro):
@@ -532,7 +532,7 @@ with tab1:
 
     # Tab 1 底部声明
     st.markdown("---")
-    st.warning("⚠️ **重要提示**：本页面所有数据基于评测模型（MiMo-V2.5），仅供参考，目的是优化Agent系统而非追求极限投资收益。不构成任何投资建议。市场有风险，投资需谨慎。")
+    st.warning("⚠️ **重要提示**：本页面所有数据基于评测模型（DeepSeek V4 Flash），仅供参考，目的是优化Agent系统而非追求极限投资收益。不构成任何投资建议。市场有风险，投资需谨慎。")
 
 with tab2:
     if eval_ready:
@@ -544,7 +544,7 @@ with tab2:
 
     # Tab 2 底部声明
     st.markdown("---")
-    st.warning("⚠️ **重要提示**：本页面所有数据基于评测模型（MiMo-V2.5），仅供参考。不构成任何投资建议。市场有风险，投资需谨慎。")
+    st.warning("⚠️ **重要提示**：本页面所有数据基于评测模型（DeepSeek V4 Flash），仅供参考。不构成任何投资建议。市场有风险，投资需谨慎。")
 
 with tab3:
     if eval_ready:
@@ -556,4 +556,4 @@ with tab3:
 
     # Tab 3 底部声明
     st.markdown("---")
-    st.warning("⚠️ **重要提示**：本页面所有数据基于评测模型（MiMo-V2.5），仅供参考。不构成任何投资建议。市场有风险，投资需谨慎。")
+    st.warning("⚠️ **重要提示**：本页面所有数据基于评测模型（DeepSeek V4 Flash），仅供参考。不构成任何投资建议。市场有风险，投资需谨慎。")

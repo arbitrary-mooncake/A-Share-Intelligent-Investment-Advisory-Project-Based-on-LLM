@@ -10,7 +10,7 @@ import pytest
 import src.qa.session_manager as sm
 from src.qa.session_manager import SessionManager, QASession, QAMessage
 from src.qa.complexity_analyzer import (
-    analyze_complexity, try_runtime_upgrade, ComplexityResult,
+    analyze_complexity, try_runtime_upgrade, ComplexityResult, get_qa_model_name,
 )
 from src.qa.task_planner import plan_task, extract_stock_from_question
 from src.qa.answer_generator import MAX_TOKENS_BY_LEVEL
@@ -172,12 +172,12 @@ class TestComplexityAnalyzer:
     def test_l4_recommend_react(self):
         result = analyze_complexity("全面深度分析一下茅台的估值、财务、行业地位和未来前景")
         assert result.recommended_react is True
-        assert result.recommended_model == "mimo-v2.5-pro"
+        assert result.recommended_model == get_qa_model_name(pro=True)
 
     def test_l1_recommend_no_react(self):
         result = analyze_complexity("茅台PE多少")
         assert result.recommended_react is False
-        assert result.recommended_model == "mimo-v2.5"
+        assert result.recommended_model == get_qa_model_name()
 
     def test_history_depth_bump(self):
         result = analyze_complexity("茅台PE多少", history_depth=4)
@@ -205,47 +205,63 @@ class TestComplexityAnalyzer:
 class TestComplexityConfiguration:
     """验证复杂度配置表（L0-L4 模型/thinking/template/max_tokens 映射）"""
 
+    def test_model_name_follows_current_environment(self, monkeypatch):
+        """M5 更换后，普通问答路由应读取当前配置而非旧模型字面量"""
+        monkeypatch.setenv("APP_MODE", "full")
+        monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY_5", "m5-key")
+        monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL_5", "https://api.deepseek.com")
+        monkeypatch.setenv("OPENAI_COMPATIBLE_MODEL_5", "deepseek-v4-flash")
+        monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "m1-key")
+        monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "https://api.xiaomimimo.com/v1")
+        monkeypatch.setenv("OPENAI_COMPATIBLE_MODEL", "mimo-v2.5-pro")
+
+        simple = analyze_complexity("茅台PE多少")
+        complex_result = analyze_complexity("全面深度分析一下茅台的估值、财务、行业地位和未来前景")
+
+        assert simple.recommended_model == "deepseek-v4-flash"
+        assert complex_result.recommended_model == "mimo-v2.5-pro"
+
     def test_l0_config(self):
-        """L0: mimo-v2.5, thinking=False, template=l0, max_tokens=512"""
+        """L0: 普通问答模型, thinking=False, template=l0, max_tokens=512"""
         result = analyze_complexity("你好")
         assert result.level == "L0"
-        assert result.recommended_model == "mimo-v2.5"
+        assert result.recommended_model == get_qa_model_name()
         assert result.recommended_thinking is False
         assert result.recommended_template == "l0"
         assert MAX_TOKENS_BY_LEVEL["L0"] == 512
 
     def test_l1_config(self):
-        """L1: mimo-v2.5, thinking=False, template=quick, max_tokens=4096"""
+        """L1: 普通问答模型, thinking=False, template=quick, max_tokens=4096"""
         result = analyze_complexity("茅台PE多少")
         assert result.level == "L1"
-        assert result.recommended_model == "mimo-v2.5"
+        assert result.recommended_model == get_qa_model_name()
         assert result.recommended_thinking is False
         assert result.recommended_template == "quick"
         assert MAX_TOKENS_BY_LEVEL["L1"] == 4096
 
     def test_l2_config(self):
-        """L2: mimo-v2.5-pro, thinking=False, template=standard, max_tokens=6144"""
+        """L2: Pro模型, thinking=False, template=standard, max_tokens=6144"""
         result = analyze_complexity("茅台最近的估值、走势、成交量和财务数据")
         assert result.level == "L2"
-        assert result.recommended_model == "mimo-v2.5-pro"
+        assert result.recommended_model == get_qa_model_name(pro=True)
         assert result.recommended_thinking is False
         assert result.recommended_template == "standard"
         assert MAX_TOKENS_BY_LEVEL["L2"] == 6144
 
     def test_l3_config(self):
-        """L3: mimo-v2.5-pro, thinking=True, template=deep, max_tokens=8192"""
+        """L3: Pro模型, thinking=True, template=deep, max_tokens=8192"""
         result = analyze_complexity("茅台估值合理吗")
         assert result.level == "L3"
-        assert result.recommended_model == "mimo-v2.5-pro"
+        assert result.recommended_model == get_qa_model_name(pro=True)
         assert result.recommended_thinking is True
         assert result.recommended_template == "deep"
         assert MAX_TOKENS_BY_LEVEL["L3"] == 8192
 
     def test_l4_config(self):
-        """L4: mimo-v2.5-pro, thinking=True, template=deep, max_tokens=16384"""
+        """L4: Pro模型, thinking=True, template=deep, max_tokens=16384"""
         result = analyze_complexity("全面深度分析一下茅台的估值、财务、行业地位和未来前景")
         assert result.level == "L4"
-        assert result.recommended_model == "mimo-v2.5-pro"
+        assert result.recommended_model == get_qa_model_name(pro=True)
         assert result.recommended_thinking is True
         assert result.recommended_template == "deep"
         assert MAX_TOKENS_BY_LEVEL["L4"] == 16384
@@ -271,13 +287,13 @@ class TestComplexityConfiguration:
         assert l4.recommended_thinking is True
 
     def test_pro_model_from_l2(self):
-        """Pro 模型从 L2 开始使用，L0/L1 用标准模型"""
+        """Pro 模型从 L2 开始使用，L0/L1 用普通问答模型"""
         l0 = analyze_complexity("你好")
         l1 = analyze_complexity("茅台PE多少")
         l2 = analyze_complexity("茅台最近的估值、走势、成交量和财务数据")
-        assert l0.recommended_model == "mimo-v2.5"
-        assert l1.recommended_model == "mimo-v2.5"
-        assert l2.recommended_model == "mimo-v2.5-pro"
+        assert l0.recommended_model == get_qa_model_name()
+        assert l1.recommended_model == get_qa_model_name()
+        assert l2.recommended_model == get_qa_model_name(pro=True)
 
 
 # ── TaskPlanner 测试 ────────────────────────────
@@ -342,7 +358,7 @@ class TestRuntimeUpgrader:
             result, tool_success_rate=0.3, evidence_missing_count=5,
             contradictory_signals=False, actual_domain_count=1,
         )
-        assert upgraded.recommended_model == "mimo-v2.5-pro"
+        assert upgraded.recommended_model == get_qa_model_name(pro=True)
 
     def test_contradiction_triggers_pro_and_thinking(self):
         result = analyze_complexity("茅台PE多少")
@@ -350,7 +366,7 @@ class TestRuntimeUpgrader:
             result, tool_success_rate=1.0, evidence_missing_count=0,
             contradictory_signals=True, actual_domain_count=2,
         )
-        assert upgraded.recommended_model == "mimo-v2.5-pro"
+        assert upgraded.recommended_model == get_qa_model_name(pro=True)
         assert upgraded.recommended_thinking is True
 
     def test_multi_domain_upgrades_l3(self):
@@ -364,7 +380,7 @@ class TestRuntimeUpgrader:
     def test_l4_forces_thinking(self):
         result = ComplexityResult(
             level="L4", score=80, triggers=[], score_detail={},
-            need_clarify=False, recommended_model="mimo-v2.5-pro",
+            need_clarify=False, recommended_model=get_qa_model_name(pro=True),
             recommended_thinking=False, recommended_react=True,
             recommended_template="deep",
         )
@@ -387,7 +403,7 @@ class TestRuntimeUpgrader:
         """L4升级时必须设置recommended_react"""
         result = ComplexityResult(
             level="L3", score=60, triggers=[], score_detail={},
-            need_clarify=False, recommended_model="mimo-v2.5",
+            need_clarify=False, recommended_model=get_qa_model_name(),
             recommended_thinking=False, recommended_react=False,
             recommended_template="standard",
         )
@@ -763,4 +779,3 @@ class TestReactTimeoutAndHeartbeat:
         assert "超时" in ep.tool_call_summary
         assert ep.missing
         assert "sh.159934" in ep.stock_code
-

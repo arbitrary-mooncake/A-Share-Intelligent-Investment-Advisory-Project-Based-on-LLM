@@ -1037,7 +1037,7 @@ class LossEngine:
         production_snapshots: Optional[List[dict]] = None,
         eval_vs_prod_score_pairs: Optional[List[Tuple[float, float]]] = None,
     ) -> Dict[str, Any]:
-        """计算评测模型保真度损失 — 比较评测模型(M5/MiMo-V2.5)与生产模型(M1/M3)的评分差异。
+        """计算评测模型保真度损失 — 比较评测模型(M5/DeepSeek V4 Flash)与生产模型(M1/M3)的评分差异。
 
         总纲 §10: eval_model_fidelity 衡量评测结果在多大程度上可以代表生产环境。
         如果评测模型和生产模型的评分系统性偏离，则评测结论可能不适用于生产。

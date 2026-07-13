@@ -252,7 +252,7 @@ Full mode uses **6 independent LLM models**, assigned by task characteristics:
 | **M2** | Qwen3.6-Flash | Quick queries, quick screening, batch scoring |
 | **M3** | Qwen3.7-Plus | Technical, news, short-term scoring, events, money flow |
 | **M4** | (migrated to M1) | Reserved slot |
-| **M5** | MiMo-V2.5 | Evaluation system Agent analysis (cost optimization), Q&A |
+| **M5** | DeepSeek V4 Flash | Evaluation system Agent analysis (cost optimization), Q&A |
 | **M6** | DeepSeek V4 Pro | Evaluation orchestration, attribution diagnosis, report writing, LLM Free strategies |
 
 Lite mode routes all agents to DeepSeek V4 Pro (complex tasks) or DeepSeek V4 Flash (quick tasks) automatically.

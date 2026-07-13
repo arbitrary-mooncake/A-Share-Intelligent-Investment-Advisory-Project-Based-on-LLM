@@ -54,7 +54,7 @@ class ReportBuilder:
             "declarations": [
                 "本报告所有数值由代码计算生成",
                 "模拟盘结果仅供参考，目的是优化Agent系统",
-                "评测模型使用MiMo-V2.5，与生产模型(M1/M3)存在差异",
+                "评测模型使用DeepSeek V4 Flash，与生产模型(M1/M3)存在差异",
             ],
         }
 

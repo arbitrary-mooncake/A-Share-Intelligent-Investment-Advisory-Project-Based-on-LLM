@@ -435,7 +435,7 @@ def plan_task(question: str, complexity_level: str, history_text: str = "",
 
     # 全部复杂度统一使用两阶段快路径（并行拉取+单次LLM），不走ReAct
     # ReAct 串行 LLM-工具迭代导致频繁超时（18工具串行需270-810s），快路径并行+缓存3-15s完成
-    # L4 仍通过 model=mimo-v2.5-pro + thinking=True + deep模板 保持分析深度
+    # L4 仍通过配置的 Pro 模型 + thinking=True + deep模板保持分析深度
     need_react = False
 
     data_volume = "small"

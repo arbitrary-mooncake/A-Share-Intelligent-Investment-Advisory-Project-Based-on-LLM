@@ -7,7 +7,7 @@
     Model 2 (OPENAI_COMPATIBLE_2):    Qwen3.6-Flash  → 快速查询 + 快筛股票池（不动）
     Model 3 (OPENAI_COMPATIBLE_3):    Qwen3.7-Plus   → technical, news, short scorer, event, moneyflow
     Model 4 (OPENAI_COMPATIBLE_4):    Kimi K2.6      → (已迁移至 M1，当前无 Agent 分配)
-    Model 5 (OPENAI_COMPATIBLE_5):    MiMo-V2.5       → 智能问答主模型
+    Model 5 (OPENAI_COMPATIBLE_5):    DeepSeek V4 Flash → 智能问答主模型
     Model 6 (OPENAI_COMPATIBLE_6):    DeepSeek V4 Pro → 评测系统运筹调度
 
   Lite 模式（APP_MODE=lite）：单模型架构
@@ -62,7 +62,7 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
     "quick_query": "_2",
     "quick_screen": "_2",
 
-    # ── Model 5: MiMo-V2.5 (智能问答主模型) ──
+    # ── Model 5: DeepSeek V4 Flash (智能问答主模型) ──
     "qa_engine": "_5",
     # 复杂问题升级模型 → Model 1 (MiMo-V2.5-Pro)
     "qa_engine_pro": "",
@@ -129,7 +129,7 @@ def get_thinking_body(base_url: str, enabled: bool = True) -> dict:
 # ── 评测系统模型Profiles（总纲 §13.3）──
 # 通过 get_eval_model_config() 调用，不走 AGENT_MODEL_SUFFIX
 EVAL_PROFILES: Dict[str, Dict[str, Any]] = {
-    "eval_analysis": {       # 评测分析Agent（日常高频）→ MiMo-V2.5
+    "eval_analysis": {       # 评测分析Agent（日常高频）→ DeepSeek V4 Flash
         "suffix": "_5",
         "thinking": True,
         "max_tokens": 8000,
@@ -156,7 +156,7 @@ def get_eval_model_config(profile: str = "eval_analysis") -> Dict[str, str]:
 
     Args:
         profile: 评测模型profile名称
-            - "eval_analysis": 日常分析Agent（MiMo-V2.5, 性价比高）
+            - "eval_analysis": 日常分析Agent（DeepSeek V4 Flash, 性价比高）
             - "eval_orchestrator": 运筹调度（DeepSeek V4 Pro, 最强分析）
             - "eval_llm_free": LLM自由投资线（DeepSeek V4/V4.1）
 
@@ -236,3 +236,18 @@ def get_model_config_for_agent(
         "base_url": base_url,
         "model_name": model_name,
     }
+
+
+def get_qa_model_name(pro: bool = False) -> str:
+    """返回问答路由当前实际使用的模型名。
+
+    问答复杂度分析器只负责选择「普通问答」或「Pro 升级」角色，
+    具体模型由环境变量决定。这样更换 M5 时不会留下旧模型名，
+    也不会改变复杂问题升级到 M1 的既有路由逻辑。
+    """
+    agent_name = "qa_engine_pro" if pro else "qa_engine"
+    config = get_model_config_for_agent(agent_name)
+    if config.get("model_name"):
+        return config["model_name"]
+    # 与 get_model_config_for_agent 的 M1 回退保持一致。
+    return "mimo-v2.5-pro"

@@ -523,7 +523,7 @@ run.bat start
 | **M2** | Qwen3.6-Flash | 快速查询、快筛初筛、批量打分 |
 | **M3** | Qwen3.7-Plus | 技术面、新闻、短线评分、事件、资金流向、基金子代理 |
 | **M4** | (已迁移至 M1) | 保留位，避免破坏配置读取 |
-| **M5** | MiMo-V2.5 | 评估系统 Agent 分析（成本优化）、智能问答 |
+| **M5** | DeepSeek V4 Flash | 评估系统 Agent 分析（成本优化）、智能问答 |
 | **M6** | DeepSeek V4 Pro | 评估编排、归因诊断、报告撰写、LLM Free 策略 |
 
 精简版无需配置以上模型，所有 Agent 自动路由到 DeepSeek V4 Pro（复杂任务）或 DeepSeek V4 Flash（快速任务）。

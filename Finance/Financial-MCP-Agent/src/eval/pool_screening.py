@@ -361,8 +361,14 @@ LEVEL_TO_TIER = {
 
 
 def classify_batch_result(score: Dict[str, str]) -> str:
-    """将批量打分结果按总纲标准分类为 whitelist / initial_pool / blacklist"""
-    level = score.get("level", "中性")
+    """将批量打分结果按总纲标准分类。
+
+    ``中性``/``回避`` 只有在模型明确返回该等级时才应丢弃；缺失或
+    无法识别的等级属于兼容性回退，仍进入 ``initial_pool`` 供后续层处理。
+    """
+    level = score.get("level")
+    if not isinstance(level, str) or not level.strip():
+        return "initial_pool"
     return LEVEL_TO_TIER.get(level, "initial_pool")
 
 

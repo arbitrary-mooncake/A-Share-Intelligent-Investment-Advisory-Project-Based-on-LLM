@@ -1,6 +1,28 @@
 """Tests for line manager and pool manager"""
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
+
+import src.eval.pool_manager as pool_manager_module
 from src.eval.line_manager import LineManager, LineState, LINE_DEFINITIONS
 from src.eval.pool_manager import PoolManager
+
+
+@pytest.fixture(autouse=True)
+def isolated_pool_storage(monkeypatch):
+    """所有池管理测试使用临时文件，禁止改写真实精筛池。"""
+    tmpdir = tempfile.mkdtemp(
+        prefix=".pool_test_",
+        dir=Path(__file__).resolve().parent,
+    )
+    monkeypatch.setattr(pool_manager_module, "POOL_DIR", tmpdir)
+    monkeypatch.setattr(pool_manager_module, "POOL_FILE", f"{tmpdir}/refined_pools.json")
+    # 这些测试验证内存中的池管理逻辑，不需要落盘；禁止任何文件写入。
+    monkeypatch.setattr(pool_manager_module.PoolManager, "_save", lambda self: None)
+    yield
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_line_definitions():
@@ -66,6 +88,22 @@ def test_pool_manager_update():
     pool = pm.get_pool_with_scores("short")
     assert len(pool) == 1
     assert pool[0]["score"] == 82
+
+
+def test_pool_result_guard_preserves_existing_pool():
+    pm = PoolManager()
+    stocks = [
+        {"code": f"sh.{600000 + i}", "name": f"测试{i}", "final_score": 80}
+        for i in range(100)
+    ]
+    pm.update_pool("short", stocks)
+    snapshot = pm.snapshot_term("short")
+
+    reason = pm.validate_pool_replacement("short", [], snapshot)
+    assert reason is not None
+
+    pm.restore_term_snapshot("short", snapshot)
+    assert len(pm.get_pool("short")) == 100
 
 
 def test_pool_manager_blacklist():

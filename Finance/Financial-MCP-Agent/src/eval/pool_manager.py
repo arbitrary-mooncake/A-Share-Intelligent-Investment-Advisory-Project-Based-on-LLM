@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+from copy import deepcopy
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
@@ -100,6 +101,47 @@ class PoolManager:
         """获取带评分的精筛池"""
         pool_data = self.pools.get(term, {})
         return pool_data.get("stocks", [])
+
+    def snapshot_term(self, term: str) -> Dict[str, Any]:
+        """获取期限池的深拷贝快照，用于失败时回滚。"""
+        return deepcopy(self.pools.get(term, {}))
+
+    def restore_term_snapshot(self, term: str, snapshot: Dict[str, Any]) -> None:
+        """恢复期限池快照，避免失败任务覆盖已有精筛池。"""
+        if not snapshot:
+            return
+        self.pools[term] = deepcopy(snapshot)
+        self._save()
+
+    def validate_pool_replacement(
+        self,
+        term: str,
+        new_stocks: List[Dict[str, Any]],
+        previous_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """校验新池规模，阻止异常结果覆盖已有池。
+
+        精筛更新是替换操作。若已有正常规模的池，而新任务只返回空池或
+        明显不足目标的结果，通常意味着超时/数据源故障，不应把旧池清空。
+        """
+        previous = (
+            self.pools.get(term, {})
+            if previous_snapshot is None
+            else previous_snapshot
+        )
+        previous_stocks = previous.get("stocks", [])
+        previous_count = len(previous_stocks) if isinstance(previous_stocks, list) else 0
+        new_count = len(new_stocks) if isinstance(new_stocks, list) else 0
+        min_size = DEFAULT_POOL_CONFIG.get(term, {}).get("min_size", 0)
+
+        if previous_count > 0 and new_count == 0:
+            return f"新池结果为空，保留原有{previous_count}只{term}池，拒绝覆盖"
+        if previous_count >= min_size and new_count < min_size:
+            return (
+                f"新池仅{new_count}只，低于{term}池安全下限{min_size}只；"
+                f"原池{previous_count}只，拒绝覆盖"
+            )
+        return None
 
     def update_pool(self, term: str, stocks: List[Dict[str, Any]]):
         """更新精筛池"""

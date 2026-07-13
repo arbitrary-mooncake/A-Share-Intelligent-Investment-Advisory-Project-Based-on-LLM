@@ -1524,6 +1524,7 @@ async def run_pool_update_v3(
     from src.eval.config import get as eval_get
 
     pm = PoolManager()
+    original_term_snapshot = pm.snapshot_term(term)
     target_size = {"short": 100, "medium": 80, "long": 60}[term]
     ratio = eval_get("whitelist_pass_ratio", 1.2)
 
@@ -1579,6 +1580,14 @@ async def run_pool_update_v3(
                                key=lambda r: r.get("final_score", 0),
                                reverse=True)
         pool_checkpoint = sorted_results[:target_size]
+        checkpoint_guard = pm.validate_pool_replacement(
+            term, pool_checkpoint, previous_snapshot=original_term_snapshot
+        )
+        if checkpoint_guard:
+            # 更新中的候选数不足安全下限时，保留旧池；避免中途故障把
+            # 一个完整的生产池替换成小规模 checkpoint。
+            logger.warning("[V3:%s] 跳过不安全 checkpoint: %s", term, checkpoint_guard)
+            return
         pm.update_pool(term, pool_checkpoint)
         pool_data = pm.pools.get(term, {})
         pool_data["_checkpoint_in_progress"] = True
@@ -1760,14 +1769,20 @@ async def run_pool_update_v3(
                term, corrected_total, len(whitelist), stream_heap.high_size)
 
     # ── Layer 3 收尾 ──
+    l3_timed_out = False
     _stage("3_wait", f"等待 Layer 3 完成 (队列剩余{layer3_queue.qsize()}只)...")
     await asyncio.sleep(2.0)  # 让最后几个入队任务被消费
     await _safe_queue_put(layer3_queue, None, "poison")  # 毒丸
     try:
         await asyncio.wait_for(l3_task, timeout=3600.0)  # 最多再等 1h
     except asyncio.TimeoutError:
+        l3_timed_out = True
         logger.error("Layer 3 消费者超时 (1h), 强制结束")
         l3_task.cancel()
+        try:
+            await l3_task
+        except asyncio.CancelledError:
+            pass
     progress.stage_end("3_formal_score")
 
     # 停止心跳
@@ -1776,6 +1791,17 @@ async def run_pool_update_v3(
         await heartbeat_task
     except asyncio.CancelledError:
         pass
+
+    if l3_timed_out:
+        pm.restore_term_snapshot(term, original_term_snapshot)
+        message = "Layer 3 超时，已恢复更新前的精筛池，未用不完整结果覆盖"
+        _stage("failed", message)
+        return {
+            "term": term,
+            "error": "layer3_timeout",
+            "message": message,
+            "stats": {"partial_scored": len(layer3_results)},
+        }
 
     # ── 截断到 target_size (排除黑名单) ──
     all_bl_codes = set()
@@ -1835,6 +1861,20 @@ async def run_pool_update_v3(
             "max": max((s.get("final_score", 0) for s in layer3_results), default=0),
         },
     }
+
+    guard_reason = pm.validate_pool_replacement(
+        term, pool_final, previous_snapshot=original_term_snapshot
+    )
+    if guard_reason:
+        pm.restore_term_snapshot(term, original_term_snapshot)
+        logger.error("[V3:%s] %s", term, guard_reason)
+        _stage("failed", guard_reason)
+        return {
+            "term": term,
+            "error": "pool_result_guard",
+            "message": guard_reason,
+            "stats": stats,
+        }
 
     # ── 持久化 ──
     pm.clean_expired_blacklist()
@@ -1896,6 +1936,7 @@ async def run_pool_update_partial(
         {term, pool, removed, added, stats, final_pool_size}
     """
     pm = PoolManager()
+    original_term_snapshot = pm.snapshot_term(term)
     target_size = {"short": 100, "medium": 80, "long": 60}[term]
     replace_count = max(1, target_size // 5)  # 20%
     oversample = replace_count * 2
@@ -2017,6 +2058,25 @@ async def run_pool_update_partial(
     rescored.sort(key=lambda s: s.get("final_score", 0), reverse=True)
     new_stocks = rescored[:replace_count]
 
+    prospective_pool = [
+        s for s in current_pool
+        if s.get("code", "") not in set(removed_codes)
+    ] + new_stocks
+    guard_reason = pm.validate_pool_replacement(
+        term, prospective_pool, previous_snapshot=original_term_snapshot
+    )
+    if guard_reason:
+        pm.restore_term_snapshot(term, original_term_snapshot)
+        logger.error("[PartialUpdate:%s] %s", term, guard_reason)
+        _stage("failed", guard_reason)
+        return {
+            "term": term,
+            "mode": "partial",
+            "error": "pool_result_guard",
+            "message": guard_reason,
+            "stats": {"rescored": len(rescored), "requested": replace_count},
+        }
+
     stats = pm.update_pool_partial(term, new_stocks, removed_codes)
 
     if on_progress:
@@ -2067,6 +2127,7 @@ async def run_pool_update(
     from src.eval.config import get as eval_get
 
     pm = PoolManager()
+    original_term_snapshot = pm.snapshot_term(term)
     target_size = {"short": 100, "medium": 80, "long": 60}[term]
     ratio = eval_get("whitelist_pass_ratio", 1.2)
 
@@ -2108,6 +2169,20 @@ async def run_pool_update(
         term=term, target_size=target_size, ratio=ratio,
         on_progress=on_progress,
     )
+
+    guard_reason = pm.validate_pool_replacement(
+        term, layer3.get("pool", []), previous_snapshot=original_term_snapshot
+    )
+    if guard_reason:
+        pm.restore_term_snapshot(term, original_term_snapshot)
+        logger.error("[PoolUpdate:%s] %s", term, guard_reason)
+        _stage("failed", guard_reason)
+        return {
+            "term": term,
+            "error": "pool_result_guard",
+            "message": guard_reason,
+            "stats": layer3.get("stats", {}),
+        }
 
     # ── Store ──
     # 清理过期黑名单后存储

@@ -1,10 +1,24 @@
 """Tests for stock pipeline adapter"""
+import pytest
+
 from src.eval.adapters.stock_pipeline_adapter import (
     _build_decision_pack,
     _extract_signal_strings,
     extract_signal_packs_from_state,
     extract_analysis_texts_from_state,
 )
+from src.eval.score_assessment import ScoreAssessmentSchemaError
+
+
+def _valid_score(**fields):
+    """Build a score payload that satisfies the explicit P0 validity contract."""
+    return {
+        "validity": "valid",
+        "coverage": 1.0,
+        "missing_core_fields": [],
+        "missing_optional_fields": [],
+        **fields,
+    }
 
 
 class TestBuildDecisionPack:
@@ -12,17 +26,17 @@ class TestBuildDecisionPack:
 
     def test_build_from_short_term_scorer_output(self):
         """short_term_scorer uses 'recommendation' key."""
-        score_data = {
-            "score": 75,
-            "recommendation": "买入",
-            "confidence": 0.8,
-            "data_quality_score": 0.7,
-            "risk_gate": {"risk_level": "low", "risk_flags": []},
-            "reasoning": "技术面利多，但存在估值风险",
-            "sub_scores": {"technical_state": 20, "volume_liquidity": 15},
-            "risk_warning": "注意流动性风险",
-            "suggested_action": "短线持有",
-        }
+        score_data = _valid_score(
+            score=75,
+            recommendation="买入",
+            confidence=0.8,
+            data_quality_score=0.7,
+            risk_gate={"risk_level": "low", "risk_flags": []},
+            reasoning="技术面利多，但存在估值风险",
+            sub_scores={"technical_state": 20, "volume_liquidity": 15},
+            risk_warning="注意流动性风险",
+            suggested_action="短线持有",
+        )
         dp = _build_decision_pack("sh.603871", "嘉友国际", "short", "2026-06-19", score_data)
 
         assert dp.asset_type == "stock"
@@ -44,16 +58,16 @@ class TestBuildDecisionPack:
 
     def test_build_from_medium_term_scorer_output(self):
         """medium_term_scorer uses 'rating' key."""
-        score_data = {
-            "score": 68,
-            "rating": "推荐",
-            "confidence": 0.75,
-            "data_quality_score": 0.65,
-            "risk_gate": {"risk_level": "medium", "risk_flags": ["data_missing"]},
-            "reasoning": "基本面稳健，技术面中性，估值偏高",
-            "sub_scores": {"fundamental_score": 20, "valuation_score": 12},
-            "time_horizon": "3-6个月",
-        }
+        score_data = _valid_score(
+            score=68,
+            rating="推荐",
+            confidence=0.75,
+            data_quality_score=0.65,
+            risk_gate={"risk_level": "medium", "risk_flags": ["data_missing"]},
+            reasoning="基本面稳健，技术面中性，估值偏高",
+            sub_scores={"fundamental_score": 20, "valuation_score": 12},
+            time_horizon="3-6个月",
+        )
         dp = _build_decision_pack("sz.000001", "测试银行", "medium", "2026-06-19", score_data)
 
         assert dp.action == "buy"
@@ -64,81 +78,77 @@ class TestBuildDecisionPack:
 
     def test_build_from_long_term_scorer_output(self):
         """long_term_scorer uses 'rating' key with 强烈推荐."""
-        score_data = {
-            "score": 88,
-            "rating": "强烈推荐",
-            "confidence": 0.92,
-        }
+        score_data = _valid_score(
+            score=88,
+            rating="强烈推荐",
+            confidence=0.92,
+        )
         dp = _build_decision_pack("sh.600519", "贵州茅台", "long", "2026-06-19", score_data)
         assert dp.action == "strong_buy"
         assert dp.score == 88.0
 
     def test_build_strong_sell(self):
-        score_data = {
-            "score": 15,
-            "recommendation": "强烈卖出",
-            "confidence": 0.9,
-            "risk_gate": {"risk_level": "critical", "risk_flags": ["delist_risk"]},
-        }
+        score_data = _valid_score(
+            score=15,
+            recommendation="强烈卖出",
+            confidence=0.9,
+            risk_gate={"risk_level": "critical", "risk_flags": ["delist_risk"]},
+        )
         dp = _build_decision_pack("sz.000001", "测试", "medium", "2026-06-19", score_data)
         assert dp.action == "strong_sell"
         assert dp.score == 15.0
         assert dp.risk_gate_applied is True
 
-    def test_unknown_recommendation_defaults_to_hold(self):
-        score_data = {"score": 50, "recommendation": "未知建议", "confidence": 0.5}
+    def test_unknown_recommendation_returns_none(self):
+        score_data = _valid_score(score=50, recommendation="未知建议", confidence=0.5)
         dp = _build_decision_pack("sh.000001", "测试", "short", "2026-06-19", score_data)
-        assert dp.action == "hold"
+        assert dp is None
 
     def test_medium_term_中性(self):
-        score_data = {"score": 45, "rating": "中性"}
+        score_data = _valid_score(score=45, rating="中性")
         dp = _build_decision_pack("sh.000001", "测试", "medium", "2026-06-19", score_data)
         assert dp.action == "hold"
 
     def test_medium_term_减持_maps_to_sell(self):
         """减持 maps to sell; only 谨慎减持 maps to cautious_sell."""
-        score_data = {"score": 30, "rating": "减持"}
+        score_data = _valid_score(score=30, rating="减持")
         dp = _build_decision_pack("sh.000001", "测试", "medium", "2026-06-19", score_data)
         assert dp.action == "sell"
 
     def test_medium_term_谨慎减持_maps_to_cautious_sell(self):
         """谨慎减持 maps to cautious_sell."""
-        score_data = {"score": 35, "rating": "谨慎减持"}
+        score_data = _valid_score(score=35, rating="谨慎减持")
         dp = _build_decision_pack("sh.000001", "测试", "medium", "2026-06-19", score_data)
         assert dp.action == "cautious_sell"
 
     def test_production_mode(self):
-        score_data = {"score": 60, "recommendation": "观望"}
+        score_data = _valid_score(score=60, recommendation="观望")
         dp = _build_decision_pack(
             "sh.000001", "测试", "short", "2026-06-19", score_data, eval_mode=False
         )
         assert dp.task_type == "single_stock"
         assert dp.model_profile == "production"
 
-    def test_empty_score_data_returns_hold(self):
+    def test_empty_score_data_returns_none(self):
         dp = _build_decision_pack("sh.000001", "测试", "short", "2026-06-19", {})
-        assert dp.action == "hold"
-        assert dp.score == 0.0
-        assert dp.model_profile == "eval_analysis"
+        assert dp is None
 
-    def test_none_score_data_returns_hold(self):
+    def test_none_score_data_returns_none(self):
         dp = _build_decision_pack("sh.000001", "测试", "short", "2026-06-19", None)
-        assert dp.action == "hold"
-        assert dp.score == 0.0
+        assert dp is None
 
-    def test_string_score_converted_to_float(self):
-        score_data = {"score": "80", "recommendation": "买入", "confidence": "0.85"}
-        dp = _build_decision_pack("sh.000001", "测试", "short", "2026-06-19", score_data)
-        assert dp.score == 80.0
-        assert dp.confidence == 0.85
+    def test_string_score_is_schema_error(self):
+        score_data = _valid_score(score="80", recommendation="买入", confidence="0.85")
+        with pytest.raises(ScoreAssessmentSchemaError):
+            _build_decision_pack("sh.000001", "测试", "short", "2026-06-19", score_data)
 
     def test_key_signals_extracted_from_reasoning(self):
-        score_data = {
-            "score": 72,
-            "recommendation": "买入",
-            "reasoning": "技术面利多信号明确，MACD金叉突破。但存在估值风险和流动性压力。",
-            "risk_warning": "短期波动可能加大",
-        }
+        score_data = _valid_score(
+            score=72,
+            recommendation="买入",
+            reasoning="技术面利多信号明确，MACD金叉突破。但存在估值风险和流动性压力。",
+            risk_warning="短期波动可能加大",
+        )
         dp = _build_decision_pack("sh.000001", "测试", "short", "2026-06-19", score_data)
         assert dp.key_positive_signals is not None
         assert len(dp.key_positive_signals) > 0

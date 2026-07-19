@@ -209,6 +209,44 @@ def text_to_signal_pack(text: str, agent_name: str, as_of_date: str) -> Dict[str
     }
 
 
+def _is_explicit_agent_failure(value: Any) -> bool:
+    """Recognize explicit execution failures before compatibility fallback.
+
+    Failure messages are not analysis evidence.  Treating them as low-confidence
+    neutral text makes a broken agent look available to the risk gate.
+    """
+    if isinstance(value, dict):
+        status = str(value.get("status", "")).strip().lower()
+        validity = str(value.get("validity", "")).strip().lower()
+        if value.get("error") or value.get("_error"):
+            return True
+        if status in {"error", "failed", "timeout", "invalid"}:
+            return True
+        if validity in {"invalid", "error", "failed"}:
+            return True
+        if value.get("_scorer_failed") is True:
+            return True
+        value = value.get("analysis_text", "")
+
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    failure_markers = (
+        "agent执行失败",
+        "agent 执行失败",
+        "分析失败:",
+        "分析失败：",
+        "数据获取失败",
+        "调用失败",
+        "请求超时",
+        "pipeline failed",
+        "agent failed",
+        "agent execution failure",
+        "agent execution failed",
+    )
+    return any(marker in normalized for marker in failure_markers)
+
+
 # ── 合并引擎 ──────────────────────────────────────────
 
 def build_analysis_package(
@@ -233,9 +271,21 @@ def build_analysis_package(
         signal_packs: Dict[str, Dict[str, Any]] = {}
         for agent_name, text_key in agent_text_keys.items():
             sp_key = f"{agent_name}_signal_pack"
-            if sp_key in state_data and state_data[sp_key]:
+            raw_signal_pack = state_data.get(sp_key)
+            raw_text = state_data.get(text_key)
+            if _is_explicit_agent_failure(raw_signal_pack) or _is_explicit_agent_failure(raw_text):
+                sp = dict(FALLBACK_SIGNAL_PACK, agent_name=agent_name, as_of_date=as_of_date)
+                sp["validity"] = "invalid"
+                sp["status"] = "failed"
+                sp["confidence"] = 0.0
+                sp["data_quality_score"] = 0.0
+                sp["missing_data"] = ["Agent执行失败"]
+                sp["source_summary"] = "agent execution failure"
+                sp["error_type"] = "agent_execution_failure"
+                signal_packs[agent_name] = sp
+            elif raw_signal_pack:
                 signal_packs[agent_name] = _parse_signal_pack(state_data[sp_key], agent_name, as_of_date)
-            elif text_key in state_data and state_data[text_key]:
+            elif raw_text:
                 signal_packs[agent_name] = text_to_signal_pack(state_data[text_key], agent_name, as_of_date)
             else:
                 sp = dict(FALLBACK_SIGNAL_PACK, agent_name=agent_name, as_of_date=as_of_date)
@@ -251,7 +301,10 @@ def build_analysis_package(
 
         for agent_name, sp in signal_packs.items():
             md = sp.get("missing_data", [])
-            has_fatal_missing = any("Agent未执行" in str(x) for x in md)
+            has_fatal_missing = any(
+                marker in str(x) for x in md
+                for marker in ("Agent未执行", "Agent执行失败")
+            )
             dqs = sp.get("data_quality_score", 0)
             try:
                 dqs = float(dqs)

@@ -1,9 +1,10 @@
 """
 历史回放回测引擎 — Point-in-Time历史数据重放。
-用于快速测量Agent贡献（短线/中线/长线），不需等待未来自然成熟。
+用于严格的五域因子消融评测（短线/中线/长线），不需等待未来自然成熟。
+该结果不是生产 Agent 贡献，也不进入模型 Fidelity 指标。
 
 v2升级（2026-06）:
-  - 用真实PIT数据评分替代MD5哈希模拟
+  - 用严格、内容寻址的PIT数据评分替代MD5哈希模拟
   - 移除5锚点上限，处理全部anchor dates
   - 定义23条命名回测线 (SB-L0~L6, MB-L0~L7, LB-L0~L7)
   - 季度校准(方案B): 每锚点动态重筛池，消除存活偏差
@@ -21,10 +22,29 @@ import random
 import asyncio
 import logging
 import hashlib
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+import inspect
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional, Tuple, Mapping
 from dataclasses import dataclass, field
 from collections import namedtuple
+
+from src.eval.pit_boundary import (
+    AsOfContext,
+    EvidenceChannel,
+    FeatureLabelBoundary,
+    PITBoundaryError,
+    PITDataGateway,
+    PITDataUnavailableError,
+    PITMode,
+    PIT_SCHEMA_VERSION,
+    TimedEvidence,
+)
+from src.eval.score_assessment import (
+    ScoreAssessment,
+    ScoreAssessmentSchemaError,
+    ScoreValidity,
+    assess_score_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +67,101 @@ class BacktestConfig:
     prompt_override: Optional[Dict[str, str]] = None  # {agent_name: new_prompt, ...}
     # Gap #11: 策略参数覆盖
     param_overrides: Optional[Dict[str, Any]] = None  # {score_buy_threshold: 70, ...}
+    # Strict PIT identity.  Changing any of these values changes the context
+    # fingerprint and therefore prevents cache/snapshot aliasing.
+    model_profile: str = "eval_analysis"
+    prompt_version: str = "factor-domain-v1"
+    require_exact_pit: bool = True
+    minimum_common_samples: int = 2
+
+
+class EvalM5PITScoreProvider:
+    """Dedicated M5/eval scorer for immutable factor-domain evidence.
+
+    The provider receives no production Agent output, tools, cache handles, or
+    future labels.  Its only variable input is the factor-domain request built
+    from a verified content-addressed PIT snapshot.
+    """
+
+    SYSTEM_PROMPT = """You are the dedicated point-in-time evaluation scorer.
+Return exactly one JSON object and no markdown. Required schema:
+{"validity":"valid","score":0-100,"action":"buy|hold|sell","coverage":0-1,
+ "missing_core_fields":[],"missing_optional_fields":[]}.
+Use only the supplied factor domains. Never infer missing domains, current news,
+events, or future outcomes. If supplied data is insufficient, return validity
+"abstain", score null, action null, and name the missing core fields."""
+
+    def __init__(self) -> None:
+        self._clients: Dict[str, Any] = {}
+
+    def _config(self, model_profile: str) -> Dict[str, str]:
+        if not model_profile.startswith("eval_"):
+            raise ValueError("formal PIT scorer requires an eval_* model profile")
+        from src.utils.model_config import get_eval_model_config
+
+        config = get_eval_model_config(model_profile)
+        if not all(config.get(key) for key in ("api_key", "base_url", "model_name")):
+            raise RuntimeError(f"eval model profile is not configured: {model_profile}")
+        return config
+
+    def _client(self, model_profile: str):
+        if model_profile not in self._clients:
+            from openai import AsyncOpenAI
+
+            config = self._config(model_profile)
+            self._clients[model_profile] = AsyncOpenAI(
+                api_key=config["api_key"],
+                base_url=config["base_url"],
+                timeout=360,
+            )
+        return self._clients[model_profile]
+
+    async def score(self, request: Mapping[str, Any], model_profile: str) -> str:
+        config = self._config(model_profile)
+        from src.utils.model_config import get_thinking_body
+
+        response = await self._client(model_profile).chat.completions.create(
+            model=config["model_name"],
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(request, ensure_ascii=False, sort_keys=True),
+                },
+            ],
+            temperature=0,
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+            extra_body=get_thinking_body(config["base_url"], enabled=True),
+        )
+        return response.choices[0].message.content or ""
+
+    async def repair_json(
+        self,
+        raw_output: str,
+        request: Mapping[str, Any],
+        model_profile: str,
+    ) -> str:
+        """One syntax-only repair attempt; semantic/schema repair is forbidden."""
+        config = self._config(model_profile)
+        from src.utils.model_config import get_thinking_body
+
+        repair_prompt = (
+            "Repair JSON syntax only. Do not add, delete, reinterpret, or change "
+            "any semantic value. Return one JSON object only.\nRAW:\n" + raw_output
+        )
+        response = await self._client(model_profile).chat.completions.create(
+            model=config["model_name"],
+            messages=[
+                {"role": "system", "content": repair_prompt},
+                {"role": "user", "content": "Return the syntax-repaired JSON."},
+            ],
+            temperature=0,
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+            extra_body=get_thinking_body(config["base_url"], enabled=False),
+        )
+        return response.choices[0].message.content or ""
 
 
 # Gap #8: 存活偏差量化数据结构
@@ -89,7 +204,7 @@ class VerificationResult:
 BACKTEST_LINE_DEFINITIONS = {
     # ── 短线回测线 (6条) ──
     "SB-L0": {"term": "short", "agents": "all",
-              "description": "短线基线 (全5 agent)"},
+              "description": "短线基线 (全5因子域)"},
     "SB-L1": {"term": "short", "agents": "-fundamental",
               "description": "短线消融-基本面"},
     "SB-L2": {"term": "short", "agents": "-technical",
@@ -109,7 +224,7 @@ BACKTEST_LINE_DEFINITIONS = {
 
     # ── 中线回测线 (8条) ──
     "MB-L0": {"term": "medium", "agents": "all",
-              "description": "中线基线 (全5 agent)"},
+              "description": "中线基线 (全5因子域)"},
     "MB-L1": {"term": "medium", "agents": "-fundamental",
               "description": "中线消融-基本面"},
     "MB-L2": {"term": "medium", "agents": "-technical",
@@ -129,7 +244,7 @@ BACKTEST_LINE_DEFINITIONS = {
 
     # ── 长线回测线 (8条) ──
     "LB-L0": {"term": "long", "agents": "all",
-              "description": "长线基线 (全5 agent)"},
+              "description": "长线基线 (全5因子域)"},
     "LB-L1": {"term": "long", "agents": "-fundamental",
               "description": "长线消融-基本面"},
     "LB-L2": {"term": "long", "agents": "-technical",
@@ -176,14 +291,15 @@ class ReplayBacktestEngine:
 
     对每个anchor date:
       1. 设定as_of_date，获取该日及之前的历史数据
-      2. 对精筛池股票运行分析agent（仅可回溯的5个）
-      3. 运行消融线scorer
+      2. 从内容寻址快照计算5个确定性因子域（不调用生产agents）
+      3. 运行因子域消融scorer
       4. 按策略调仓并持有holding_days
       5. 计算持有期收益
-      6. 比较各消融线的收益差异 → agent贡献
+      6. 在common-valid sample join上比较因子域消融差异
     """
 
-    # 各agent消融时的分数折扣系数 (agent contribution weight)
+    # Legacy compatibility only.  Formal PIT replay never calls this fixed
+    # discount table; factor-domain variants are recomputed and reweighted.
     # 值越大 = 该agent对评分贡献越大 = 消融后分数降低越多
     _ABLATION_WEIGHTS = {
         "fundamental": 0.20,     # 基本面agent: 对中线/长线贡献最大
@@ -231,14 +347,53 @@ class ReplayBacktestEngine:
         "机械": (25.0, 2.5, 8.0),
     }
 
-    def __init__(self, config: BacktestConfig = None):
+    def __init__(
+        self,
+        config: BacktestConfig = None,
+        *,
+        pit_gateway: Optional[PITDataGateway] = None,
+        snapshot_ids: Optional[Mapping[Tuple[str, str], str]] = None,
+    ):
         self.config = config or BacktestConfig()
         self.results: Dict[str, Any] = {}
+        self._pit_gateway = pit_gateway
+        self._snapshot_ids = dict(snapshot_ids or {})
+        self._pit_bundle_cache: Dict[Tuple[str, str, str], Any] = {}
         # Gap #9: PIT disclosure date and fundamentals caches
         self._disclosure_date_cache: Dict[Tuple[str, str, str], Dict[str, str]] = {}  # {(ts_code, start_date, end_date): {report_period: ann_date}}
         self._pit_fundamentals_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}  # {(stock_code, anchor_date): pit_data}
         # Gap #8: Survivorship stats
         self._survivor_stats: Optional[SurvivorshipStats] = None
+
+    def _gateway(self) -> PITDataGateway:
+        """Return the strict gateway without importing production agent code."""
+        if self._pit_gateway is None:
+            from src.eval.data_fetcher import _call as tushare_call
+
+            def requester(api_name: str, params: Mapping[str, Any], fields: str):
+                return tushare_call(api_name, dict(params), fields)
+
+            self._pit_gateway = PITDataGateway(requester)
+        return self._pit_gateway
+
+    def _make_as_of_context(self, anchor_date: str) -> AsOfContext:
+        prompt_version = self.config.prompt_version
+        if self.config.prompt_override:
+            prompt_material = json.dumps(
+                self.config.prompt_override, ensure_ascii=False, sort_keys=True
+            )
+            prompt_version = (
+                f"{prompt_version}:override:"
+                f"{hashlib.sha256(prompt_material.encode('utf-8')).hexdigest()[:16]}"
+            )
+        return AsOfContext(
+            trade_date=anchor_date,
+            knowledge_cutoff=anchor_date,
+            model_profile=self.config.model_profile,
+            prompt_version=prompt_version,
+            cache_namespace="eval_pit",
+            schema_version=PIT_SCHEMA_VERSION,
+        )
 
     def generate_anchor_dates(self) -> List[str]:
         """生成回测anchor date列表"""
@@ -378,7 +533,22 @@ class ReplayBacktestEngine:
         Returns:
             {"bull": {...}, "bear": {...}, "ranging": {...}, "aggregate": {...}}
         """
+        if not benchmark_data:
+            return {
+                "status": "unsupported",
+                "validity": "abstain",
+                "error_type": "pit_benchmark_unavailable",
+                "error_message": (
+                    "formal regime replay requires timestamped benchmark evidence; "
+                    "calendar-era heuristics are not PIT labels"
+                ),
+                "experiment_type": "factor_domain_ablation",
+                "agent_contribution_eligible": False,
+                "fidelity_eligible": False,
+            }
         anchors = self.generate_anchor_dates()
+        for anchor in anchors:
+            self._make_as_of_context(anchor)
         regime_anchors = self.slice_anchors_by_regime(anchors, benchmark_data)
 
         regime_results = {}
@@ -394,10 +564,14 @@ class ReplayBacktestEngine:
                 result = await self.run_single_anchor(anchor_date, pool, price_data)
                 all_results.append(result)
 
-            contribution_summary = self._summarize_contributions(all_results)
+            factor_summary = self._summarize_contributions(all_results)
             regime_results[regime] = {
                 "num_anchors": len(all_results),
-                "contribution_summary": contribution_summary,
+                "factor_domain_summary": factor_summary,
+                "contribution_summary": {
+                    "validity": "unsupported",
+                    "reason": "factor-domain ablation is not Agent contribution",
+                },
             }
 
         # 汇总
@@ -407,6 +581,17 @@ class ReplayBacktestEngine:
             "bull_anchors": regime_results.get("bull", {}).get("num_anchors", 0),
             "bear_anchors": regime_results.get("bear", {}).get("num_anchors", 0),
             "ranging_anchors": regime_results.get("ranging", {}).get("num_anchors", 0),
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
+            "fidelity_eligible": False,
+            "pit_mode": (
+                "exact" if any(
+                    isinstance(value, dict)
+                    and value.get("factor_domain_summary", {}).get("validity") == "valid"
+                    for key, value in regime_results.items()
+                    if key != "aggregate"
+                ) else "unsupported"
+            ),
         }
         return regime_results
 
@@ -949,6 +1134,242 @@ class ReplayBacktestEngine:
 
         return min(max(base, 35.0), 80.0)
 
+    @staticmethod
+    def _bounded_score(value: float) -> float:
+        return min(max(float(value), 0.0), 100.0)
+
+    @staticmethod
+    def _finite_number(value: Any) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        result = float(value)
+        return result if math.isfinite(result) else None
+
+    def _load_pit_bundle(self, stock_code: str, context: AsOfContext):
+        """Build or replay one content-addressed, feature-only PIT bundle."""
+        ts_code = self._convert_to_ts_code(stock_code)
+        snapshot_id = self._snapshot_ids.get((context.trade_date.isoformat(), stock_code))
+        snapshot_id = snapshot_id or self._snapshot_ids.get(
+            (context.trade_date.isoformat(), ts_code)
+        )
+        cache_key = (context.fingerprint, ts_code, snapshot_id or "live")
+        if cache_key in self._pit_bundle_cache:
+            return self._pit_bundle_cache[cache_key]
+
+        gateway = self._gateway()
+        if snapshot_id:
+            bundle = gateway.replay_stock_bundle(snapshot_id)
+            expected = context.to_dict(include_snapshot=False)
+            actual = bundle.context.to_dict(include_snapshot=False)
+            if actual != expected or bundle.stock_code != ts_code:
+                raise PITBoundaryError(
+                    "offline snapshot context/stock does not match requested replay"
+                )
+        else:
+            bundle = gateway.build_stock_bundle(
+                ts_code,
+                context,
+                require_exact=self.config.require_exact_pit,
+            )
+        if self.config.require_exact_pit and bundle.pit_mode is not PITMode.EXACT:
+            raise PITDataUnavailableError(
+                "best_effort evidence is excluded from formal PIT evaluation"
+            )
+        self._pit_bundle_cache[cache_key] = bundle
+        return bundle
+
+    def _domain_scores(self, bundle) -> Tuple[Dict[str, float], List[str]]:
+        """Produce deterministic five-domain factors from the immutable bundle.
+
+        These are factor domains, not the output of production analysis agents.
+        Missing domains abstain instead of receiving a midpoint score.
+        """
+        scores: Dict[str, float] = {}
+        missing: List[str] = []
+
+        daily = list(bundle.daily)
+        closes = [self._finite_number(row.get("close")) for row in daily]
+        closes = [value for value in closes if value is not None and value > 0]
+        if len(closes) >= 20:
+            ret20 = closes[0] / closes[19] - 1.0
+            ret60 = closes[0] / closes[min(59, len(closes) - 1)] - 1.0
+            scores["technical"] = self._bounded_score(
+                50.0 + 180.0 * ret20 + 70.0 * ret60
+            )
+        else:
+            missing.append("technical")
+
+        fina = dict(bundle.fina_indicator[0]) if bundle.fina_indicator else {}
+        fundamental_values = {
+            key: self._finite_number(fina.get(key))
+            for key in ("roe", "roa", "or_yoy", "profit_yoy")
+        }
+        if any(value is not None for value in fundamental_values.values()):
+            roe = fundamental_values["roe"]
+            roa = fundamental_values["roa"]
+            revenue = fundamental_values["or_yoy"]
+            profit = fundamental_values["profit_yoy"]
+            components = []
+            if roe is not None:
+                components.append(self._bounded_score(45.0 + 2.5 * roe))
+            if roa is not None:
+                components.append(self._bounded_score(45.0 + 4.0 * roa))
+            if revenue is not None:
+                components.append(self._bounded_score(50.0 + 1.2 * revenue))
+            if profit is not None:
+                components.append(self._bounded_score(50.0 + 1.0 * profit))
+            scores["fundamental"] = sum(components) / len(components)
+        else:
+            missing.append("fundamental")
+
+        basic = dict(bundle.daily_basic[0]) if bundle.daily_basic else {}
+        pe = self._finite_number(basic.get("pe"))
+        pb = self._finite_number(basic.get("pb"))
+        value_components = []
+        if pe is not None and pe > 0:
+            value_components.append(self._bounded_score(100.0 - 1.7 * pe))
+        if pb is not None and pb > 0:
+            value_components.append(self._bounded_score(100.0 - 12.0 * pb))
+        if value_components:
+            scores["value"] = sum(value_components) / len(value_components)
+        else:
+            missing.append("value")
+
+        quality_components = []
+        quality_rules = (
+            ("debt_to_assets", lambda v: 100.0 - v),
+            ("current_ratio", lambda v: 35.0 + 25.0 * v),
+            ("ocf_to_or", lambda v: 50.0 + 200.0 * v),
+            ("netprofit_margin", lambda v: 45.0 + 2.0 * v),
+        )
+        for key, transform in quality_rules:
+            value = self._finite_number(fina.get(key))
+            if value is not None:
+                quality_components.append(self._bounded_score(transform(value)))
+        if len(quality_components) >= 2:
+            scores["quality_risk"] = sum(quality_components) / len(quality_components)
+        else:
+            missing.append("quality_risk")
+
+        flows = []
+        for row in list(bundle.moneyflow)[:20]:
+            net = self._finite_number(row.get("net_mf_amount"))
+            if net is not None:
+                flows.append(net)
+        amounts = []
+        for row in daily[:20]:
+            amount = self._finite_number(row.get("amount"))
+            if amount is not None and amount > 0:
+                amounts.append(amount)
+        if flows and amounts:
+            flow_ratio = sum(flows) / max(sum(amounts), 1.0)
+            scores["moneyflow"] = self._bounded_score(50.0 + 500.0 * flow_ratio)
+        else:
+            missing.append("moneyflow")
+
+        return scores, missing
+
+    def _score_factor_record(
+        self,
+        stock_code: str,
+        anchor_date: str,
+        agent_label: str,
+    ) -> Dict[str, Any]:
+        """Return an explicit score assessment for one factor-domain variant."""
+        sample_id = f"{anchor_date}|{stock_code}"
+        context = self._make_as_of_context(anchor_date)
+        try:
+            bundle = self._load_pit_bundle(stock_code, context)
+            domain_scores, missing = self._domain_scores(bundle)
+        except Exception as exc:
+            return {
+                "sample_id": sample_id,
+                "sample_key": [anchor_date, stock_code],
+                "validity": "abstain",
+                "score": None,
+                "coverage": 0.0,
+                "missing_core_fields": ["pit_evidence"],
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "pit_mode": "unsupported",
+                "experiment_type": "factor_domain_ablation",
+                "agent_contribution_eligible": False,
+            }
+
+        coverage = len(domain_scores) / 5.0
+        ablated_domain = agent_label[1:] if agent_label.startswith("-") else None
+        if ablated_domain in {"news", "event"}:
+            missing = [*missing, f"unsupported_ablation:{ablated_domain}"]
+        if missing:
+            return {
+                "sample_id": sample_id,
+                "sample_key": [anchor_date, stock_code],
+                "validity": "abstain",
+                "score": None,
+                "coverage": coverage,
+                "missing_core_fields": missing,
+                "error_type": "missing_factor_domain",
+                "error_message": "formal PIT scoring requires all five factor domains",
+                "pit_mode": bundle.pit_mode.value,
+                "data_snapshot_id": bundle.snapshot_id,
+                "context_fingerprint": bundle.context.fingerprint,
+                "experiment_type": "factor_domain_ablation",
+                "agent_contribution_eligible": False,
+            }
+
+        weights_by_term = {
+            "short": {
+                "fundamental": 0.10, "technical": 0.35, "value": 0.10,
+                "quality_risk": 0.15, "moneyflow": 0.30,
+            },
+            "medium": {
+                "fundamental": 0.25, "technical": 0.15, "value": 0.20,
+                "quality_risk": 0.25, "moneyflow": 0.15,
+            },
+            "long": {
+                "fundamental": 0.30, "technical": 0.05, "value": 0.25,
+                "quality_risk": 0.30, "moneyflow": 0.10,
+            },
+        }
+        weights = dict(weights_by_term.get(self.config.term, weights_by_term["medium"]))
+        if ablated_domain:
+            if ablated_domain not in weights:
+                return {
+                    "sample_id": sample_id,
+                    "sample_key": [anchor_date, stock_code],
+                    "validity": "invalid",
+                    "score": None,
+                    "coverage": coverage,
+                    "missing_core_fields": [f"unsupported_ablation:{ablated_domain}"],
+                    "error_type": "unsupported_domain_ablation",
+                    "pit_mode": bundle.pit_mode.value,
+                    "data_snapshot_id": bundle.snapshot_id,
+                    "context_fingerprint": bundle.context.fingerprint,
+                    "experiment_type": "factor_domain_ablation",
+                    "agent_contribution_eligible": False,
+                }
+            weights.pop(ablated_domain)
+        weight_total = sum(weights.values())
+        score = sum(domain_scores[name] * weight for name, weight in weights.items()) / weight_total
+        return {
+            "sample_id": sample_id,
+            "sample_key": [anchor_date, stock_code],
+            "validity": "valid",
+            "score": round(self._bounded_score(score), 2),
+            "coverage": coverage,
+            "missing_core_fields": [],
+            "domain_scores": {k: round(v, 4) for k, v in domain_scores.items()},
+            "ablated_domain": ablated_domain,
+            "pit_mode": bundle.pit_mode.value,
+            "pit_schema_version": PIT_SCHEMA_VERSION,
+            "data_snapshot_id": bundle.snapshot_id,
+            "context_fingerprint": bundle.context.fingerprint,
+            "model_profile": self.config.model_profile,
+            "prompt_version": bundle.context.prompt_version,
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
+        }
+
     async def _score_stock_pit(
         self,
         stock_code: str,
@@ -956,92 +1377,17 @@ class ReplayBacktestEngine:
         anchor_date: str,
         agent_label: str,
     ) -> float:
+        """Compatibility wrapper around the strict factor-domain assessment.
+
+        It intentionally never calls production agents, current-data MCP
+        tools, legacy eval caches, synthetic fallbacks, or fixed discounts.
         """
-        Point-in-Time scoring using real Agent analysis via cache.
-
-        总纲 §8.3: 回测中对精筛池跑分析Agent（仅可回溯的5个），禁用news/event。
-        总纲 §14.1: 分析Agent只跑一次，缓存跨线跨期限共享。
-
-        Args:
-            stock_code: 内部格式 (sh.601888)
-            company_name: 公司名称
-            anchor_date: YYYY-MM-DD
-            agent_label: "full" 或 "-fundamental" 等
-
-        Returns:
-            分数 (0-100)
-        """
-        import json
-        from src.eval.cache import read_cache, write_cache
-        from src.eval.adapters.stock_pipeline_adapter import run_stock_analysis
-
-        # Step 1: 尝试从评测缓存获取真实Agent分析结果
-        try:
-            cached_raw = read_cache("full_analysis", stock_code, anchor_date)
-            if cached_raw:
-                result = json.loads(cached_raw)
-            else:
-                logger.info("Backtest cache miss for %s @ %s, running agent analysis...",
-                           stock_code, anchor_date)
-                result = await run_stock_analysis(
-                    stock_code, company_name, anchor_date, eval_mode=True
-                )
-                # Only cache if result has no error AND contains valid term scores
-                if not result.get("error"):
-                    term = self.config.term
-                    term_key = f"{term}_term_score"
-                    term_score = result.get(term_key, {})
-                    has_valid_score = (
-                        isinstance(term_score, dict)
-                        and term_score.get("score") is not None
-                    )
-                    if has_valid_score:
-                        write_cache("full_analysis", stock_code, anchor_date,
-                                   json.dumps(result, ensure_ascii=False, default=str))
-                    else:
-                        logger.warning(
-                            "Backtest analysis for %s @ %s completed but missing "
-                            "valid %s score; not caching to allow retry.",
-                            stock_code, anchor_date, term_key
-                        )
-
-            # 提取该期限评分
-            term = self.config.term
-            term_key = f"{term}_term_score"
-            term_score = result.get(term_key, {})
-            if isinstance(term_score, dict):
-                base_score = float(term_score.get("score", 50))
-            else:
-                base_score = 50.0
-
-            # 消融调整（与模拟盘使用相同逻辑）
-            ablated_agent = None
-            if agent_label != "full" and agent_label.startswith("-"):
-                ablated_agent = agent_label.lstrip("-")
-
-            if ablated_agent and ablated_agent in self.config.ablation_agents:
-                signal_packs = result.get("signal_packs", {})
-                from src.eval.orchestrator import EvalOrchestrator
-                base_score = EvalOrchestrator._adjust_score_for_ablation(
-                    base_score, signal_packs, ablated_agent, term
-                )
-
-            return round(min(max(base_score, 10.0), 98.0), 2)
-
-        except Exception as e:
-            logger.warning("Agent analysis failed for %s @ %s: %s, falling back to PIT fundamentals",
-                          stock_code, anchor_date, str(e))
-
-        # Step 2: 回退 — PIT Tushare基本面数据
-        pit_data = self._fetch_pit_fundamentals(stock_code, anchor_date)
-        if pit_data.get("_has_data"):
-            base_score = self._compute_fundamental_score(pit_data, stock_code)
-        else:
-            base_score = self._fallback_composite_score(stock_code, anchor_date)
-
-        # 消融打折
-        score = self._apply_ablation_discount(base_score, agent_label, self.config.term)
-        return round(min(max(score, 10.0), 98.0), 2)
+        record = self._score_factor_record(stock_code, anchor_date, agent_label)
+        if record.get("validity") != "valid" or record.get("score") is None:
+            raise PITDataUnavailableError(
+                record.get("error_message") or record.get("error_type") or "PIT score unavailable"
+            )
+        return float(record["score"])
 
     # ═══════════════════════════════════════════════════════════
     # Core backtest methods
@@ -1281,76 +1627,174 @@ class ReplayBacktestEngine:
             ),
         }
 
+    def _outcome_label(
+        self,
+        stock_code: str,
+        anchor_date: str,
+        price_data: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Build a dated future outcome, kept outside scorer inputs.
+
+        Untimestamped flat price arrays are intentionally unsupported because
+        their first element cannot be proven to belong to the requested
+        anchor.  Dicts keyed by date and rows carrying trade_date/date are
+        accepted.
+        """
+        raw = price_data.get(stock_code)
+        points: List[Tuple[str, float]] = []
+        if isinstance(raw, Mapping):
+            iterable = raw.items()
+            for raw_date, raw_price in iterable:
+                try:
+                    normalized = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0:
+                    points.append((normalized, price))
+        elif isinstance(raw, list) and raw and all(isinstance(row, Mapping) for row in raw):
+            for row in raw:
+                raw_date = row.get("trade_date", row.get("date"))
+                raw_price = row.get("close", row.get("price"))
+                if raw_date is None:
+                    continue
+                date_text = str(raw_date)
+                try:
+                    normalized = (
+                        datetime.strptime(date_text, "%Y%m%d").strftime("%Y-%m-%d")
+                        if len(date_text) == 8 and date_text.isdigit()
+                        else datetime.strptime(date_text[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+                    )
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0:
+                    points.append((normalized, price))
+        else:
+            return None
+
+        points = sorted({date_key: price for date_key, price in points}.items())
+        future = [(date_key, price) for date_key, price in points if date_key >= anchor_date]
+        if len(future) <= self.config.holding_days:
+            return None
+        entry_date, entry = future[0]
+        exit_date, exit_price = future[self.config.holding_days]
+        sample_id = f"{anchor_date}|{stock_code}"
+        context = self._make_as_of_context(anchor_date)
+        # Constructing FeatureLabelBoundary makes the channel separation
+        # executable: future prices may be labels, never feature payloads.
+        label_evidence = TimedEvidence(
+            domain="holding_return",
+            source="provided_price_data",
+            available_at=exit_date,
+            fetched_at=datetime.now(timezone.utc),
+            payload={
+                "sample_id": sample_id,
+                "entry_date": entry_date,
+                "exit_date": exit_date,
+                "entry_price": entry,
+                "exit_price": exit_price,
+            },
+            channel=EvidenceChannel.OUTCOME_LABEL,
+            pit_mode=PITMode.EXACT,
+        )
+        FeatureLabelBoundary(context=context, outcome_labels=(label_evidence,))
+        return {
+            "sample_id": sample_id,
+            "sample_key": [anchor_date, stock_code],
+            "validity": "valid",
+            "entry_date": entry_date,
+            "outcome_date": exit_date,
+            "entry_price": entry,
+            "exit_price": exit_price,
+            "return": (exit_price - entry) / entry,
+            "channel": EvidenceChannel.OUTCOME_LABEL.value,
+        }
+
     async def run_single_anchor(self, anchor_date: str, pool: List[str],
                                  price_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        在单个anchor date上运行回测。
-
-        Args:
-            anchor_date: 回测时点 YYYY-MM-DD
-            pool: 精筛池股票列表 (stock codes, e.g. sh.601888)
-            price_data: 历史价格数据 {stock_code: [prices_by_date]}
-
-        Returns:
-            {
-                "anchor_date": "2024-06-14",
-                "term": "medium",
-                "ablation_results": {
-                    "full": {"scores": [...], "returns": [...]},
-                    "-fundamental": {"scores": [...], "returns": [...]},
-                    ...
-                }
-            }
-        """
-        from src.eval.label_builder import compute_holding_return
-        from datetime import datetime as dt
-
+        """Run one strict PIT factor-domain experiment at an anchor date."""
+        # Validate the entrance even when the pool is empty.
+        context = self._make_as_of_context(anchor_date)
         cfg = self.config
-        start_dt = dt.strptime(anchor_date, "%Y-%m-%d")
-        end_dt = start_dt + timedelta(days=cfg.holding_days)
-
-        ablation_results = {}
-
-        # 为每条消融线计算结果
-        for agent_label in ["full"] + [f"-{a}" for a in cfg.ablation_agents]:
-            scores = []
-            returns = []
-
+        labels = {
+            label["sample_id"]: label
+            for stock_code in pool
+            if (label := self._outcome_label(stock_code, anchor_date, price_data)) is not None
+        }
+        variants = ["full"] + [f"-{name}" for name in cfg.ablation_agents]
+        records_by_variant: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        abstentions: List[Dict[str, Any]] = []
+        for variant in variants:
+            records: Dict[str, Dict[str, Any]] = {}
             for stock_code in pool:
-                # Fix 1: 使用真实PIT评分 (替代MD5哈希模拟)
-                score = await self._score_stock_pit(
-                    stock_code, stock_code, anchor_date, agent_label
-                )
-
-                # 计算持有期收益
-                stock_prices = self._get_price_series(
-                    price_data, stock_code, anchor_date, cfg.holding_days
-                )
-                if stock_prices and len(stock_prices) >= 2:
-                    entry = stock_prices[0]
-                    exit_p = stock_prices[-1]
-                    ret_info = compute_holding_return(
-                        entry, exit_p, len(stock_prices) - 1
-                    )
-                    ret = ret_info["asset_return_pct"] / 100
+                record = self._score_factor_record(stock_code, anchor_date, variant)
+                if record.get("validity") == "valid":
+                    records[record["sample_id"]] = record
                 else:
-                    ret = 0.0
+                    abstentions.append({"variant": variant, **record})
+            records_by_variant[variant] = records
 
-                scores.append(score)
-                returns.append(ret)
+        common_ids = set(labels)
+        for records in records_by_variant.values():
+            common_ids &= set(records)
+        common_ids = set(sorted(common_ids))
 
-            ablation_results[agent_label] = {
+        ablation_results: Dict[str, Any] = {}
+        for variant, records in records_by_variant.items():
+            joined = []
+            for sample_id in sorted(common_ids):
+                score_record = records[sample_id]
+                label = labels[sample_id]
+                joined.append({
+                    "sample_id": sample_id,
+                    "sample_key": score_record["sample_key"],
+                    "score": score_record["score"],
+                    "return": label["return"],
+                    "data_snapshot_id": score_record["data_snapshot_id"],
+                    "context_fingerprint": score_record["context_fingerprint"],
+                    "pit_mode": score_record["pit_mode"],
+                })
+            scores = [item["score"] for item in joined]
+            returns = [item["return"] for item in joined]
+            ablation_results[variant] = {
+                "samples": joined,
                 "scores": scores,
                 "returns": returns,
-                "mean_score": sum(scores) / max(len(scores), 1),
-                "mean_return": sum(returns) / max(len(returns), 1),
+                "mean_score": (sum(scores) / len(scores)) if scores else None,
+                "mean_return": (sum(returns) / len(returns)) if returns else None,
+                "valid_feature_samples": len(records),
+                "common_valid_samples": len(joined),
+                "coverage": len(joined) / len(pool) if pool else 0.0,
             }
 
+        enough = len(common_ids) >= max(1, int(cfg.minimum_common_samples))
         return {
             "anchor_date": anchor_date,
             "term": cfg.term,
             "pool_size": len(pool),
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
+            "fidelity_eligible": False,
+            "pit_mode": (
+                "exact" if enough and cfg.require_exact_pit
+                else "best_effort" if enough
+                else "unsupported"
+            ),
+            "pit_schema_version": PIT_SCHEMA_VERSION,
+            "context_fingerprint": context.fingerprint,
+            "validity": "valid" if enough else "abstain",
+            "error_type": None if enough else "insufficient_common_valid_samples",
+            "coverage": {
+                "requested_samples": len(pool),
+                "valid_labels": len(labels),
+                "common_valid_samples": len(common_ids),
+                "common_valid_ratio": len(common_ids) / len(pool) if pool else 0.0,
+                "minimum_common_samples": max(1, int(cfg.minimum_common_samples)),
+            },
+            "common_valid_sample_ids": sorted(common_ids),
             "ablation_results": ablation_results,
+            "abstentions": abstentions,
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -1380,6 +1824,8 @@ class ReplayBacktestEngine:
         from src.eval.strategies.factory import get_strategy
         from src.eval.market_simulator import MarketData
 
+        for anchor in anchors:
+            self._make_as_of_context(anchor)
         strategy = get_strategy(term, "longhold", {})
         cfg = self.config
 
@@ -1392,6 +1838,8 @@ class ReplayBacktestEngine:
 
         daily_values: List[tuple] = []   # [(anchor_date, total_value), ...]
         trade_log: List[Dict] = []       # 每anchor的交易摘要
+        score_observations = 0
+        priced_anchor_count = 0
 
         anchors_sorted = sorted(anchors)
 
@@ -1399,19 +1847,26 @@ class ReplayBacktestEngine:
             # ── 1. 获取当日评分 ──
             scores: Dict[str, float] = {}
             for code in pool:
-                score = await self._score_stock_pit(code, code, anchor_date, "full")
+                try:
+                    score = await self._score_stock_pit(code, code, anchor_date, "full")
+                except PITDataUnavailableError:
+                    continue
                 scores[code] = score
+            score_observations += len(scores)
+            eligible_pool = [code for code in pool if code in scores]
 
             # ── 2. 获取当日收盘价 ──
             anchor_prices: Dict[str, float] = {}
-            for code in pool:
+            for code in eligible_pool:
                 series = self._get_price_series(price_data, code, anchor_date, 2)
                 if series and len(series) >= 1:
                     anchor_prices[code] = series[0]
+            if anchor_prices:
+                priced_anchor_count += 1
 
             # ── 3. 构建最小MarketData map (用于策略判定) ──
             market_data_map: Dict[str, MarketData] = {}
-            for code in pool:
+            for code in eligible_pool:
                 price = anchor_prices.get(code, 0)
                 if price > 0:
                     md = MarketData(stock_code=code, close=price, open=price)
@@ -1468,7 +1923,7 @@ class ReplayBacktestEngine:
 
             # ── 8. 选股 ──
             select_kwargs = {
-                "pool": pool,
+                "pool": eligible_pool,
                 "scores": scores,
                 "holdings": holdings,
                 "cash": cash,
@@ -1591,6 +2046,10 @@ class ReplayBacktestEngine:
             sharpe = 0.0
             win_rate = 0.0
 
+        reference_valid = (
+            score_observations >= max(1, int(self.config.minimum_common_samples))
+            and priced_anchor_count >= 2
+        )
         return {
             "line_id": "SB-L6",
             "term": "short",
@@ -1598,15 +2057,23 @@ class ReplayBacktestEngine:
             "description": BACKTEST_LINE_DEFINITIONS["SB-L6"]["description"],
             "num_anchors": len(daily_values),
             "initial_capital": initial_capital,
-            "final_value": round(values[-1], 2) if values else initial_capital,
-            "cumulative_return_pct": round(cumulative_return * 100, 2),
-            "annualized_return_pct": round(annualized_return * 100, 2),
-            "max_drawdown_pct": round(mdd * 100, 2),
-            "sharpe_ratio": round(sharpe, 2),
-            "win_rate_pct": round(win_rate * 100, 1),
+            "validity": "valid" if reference_valid else "abstain",
+            "error_type": None if reference_valid else "insufficient_reference_evidence",
+            "score_observations": score_observations,
+            "priced_anchor_count": priced_anchor_count,
+            "final_value": round(values[-1], 2) if reference_valid else None,
+            "cumulative_return_pct": round(cumulative_return * 100, 2) if reference_valid else None,
+            "annualized_return_pct": round(annualized_return * 100, 2) if reference_valid else None,
+            "max_drawdown_pct": round(mdd * 100, 2) if reference_valid else None,
+            "sharpe_ratio": round(sharpe, 2) if reference_valid else None,
+            "win_rate_pct": round(win_rate * 100, 1) if reference_valid else None,
             "final_holdings_count": len(holdings),
             "daily_values": [{"date": d, "value": v} for d, v in daily_values],
             "trade_log": trade_log,
+            "experiment_type": "factor_domain_reference",
+            "agent_contribution_eligible": False,
+            "fidelity_eligible": False,
+            "pit_mode": "exact" if self.config.require_exact_pit else "best_effort",
         }
 
     async def run_full_backtest(self, pool: List[str],
@@ -1624,6 +2091,8 @@ class ReplayBacktestEngine:
         if param_overrides:
             self.config.param_overrides = param_overrides
         anchors = self.generate_anchor_dates()
+        for anchor in anchors:
+            self._make_as_of_context(anchor)
         splits = self.get_train_val_test_split(anchors)
 
         total_anchors = len(anchors)
@@ -1631,17 +2100,10 @@ class ReplayBacktestEngine:
               f"(训练{len(splits['train'])} 验证{len(splits['validate'])} "
               f"测试{len(splits['test'])})")
 
-        # ── Gap #8: Survivorship bias check ──
-        print(f"\n[回测] 检测存活偏差 (检查ST/退市/长期停牌)...")
-        try:
-            self._survivor_stats = await self._check_survivor_events(
-                pool, self.config.start_date, self.config.end_date
-            )
-            print(f"  [存活偏差] {self._survivor_stats.affected_count}/{self._survivor_stats.total_pool_stocks}"
-                  f" 受影响的股票 ({self._survivor_stats.affected_pct}%)")
-        except Exception as e:
-            logger.warning("Survivorship check failed: %s", str(e))
-            self._survivor_stats = None
+        # Current status APIs are not a historical universe.  The fixed input
+        # pool remains usable for factor replay, but no current-data
+        # survivorship result is mixed into its PIT claims.
+        self._survivor_stats = None
 
         all_results = []
         processed = 0
@@ -1660,8 +2122,7 @@ class ReplayBacktestEngine:
                 result["split"] = split_name
                 all_results.append(result)
 
-        # 汇总agent贡献 (仅消融线，不含参考线)
-        contribution_summary = self._summarize_contributions(all_results)
+        factor_summary = self._summarize_contributions(all_results)
 
         # ── 短线参考线 (SB-L6: 连续持仓长持对照) ──
         reference_results = None
@@ -1681,29 +2142,20 @@ class ReplayBacktestEngine:
         # ── Gap #8: Survivorship bias assessment ──
         survivorship = self._compute_survivorship_bias()
 
-        # ── Gap #9: PIT disclosure-date status ──
-        has_pit_alignment = bool(self._disclosure_date_cache)
-        pit_disclaimer = ""
-        if has_pit_alignment:
-            stocks_with_disclosures = len(self._disclosure_date_cache)
-            pit_disclaimer = (
-                f"财务数据已按披露日期(disclosure_date)做PIT对齐，"
-                f"共{stocks_with_disclosures}只股票启用了披露日期过滤，消除了前视偏差"
-            )
-        else:
-            pit_disclaimer = (
-                "披露日期(disclosure_date)数据获取失败，回退至报告期(report_date)过滤"
-            )
+        has_pit_alignment = (
+            factor_summary.get("validity") == "valid"
+            and bool(all_results)
+            and all(result.get("pit_mode") == "exact" for result in all_results)
+        )
 
         decls = [
-            "本回测基于当前精筛股票池，不含回测期间退市/暴雷股票",
-            "news_agent和event_agent在回测中被禁用",
-            "绝对收益可能高估，但agent贡献排序受偏差影响较小",
-            "评分基于Tushare PIT历史数据，回退至段位确定性估算（无随机哈希）",
-            "SB-L6为参考线（长持对照），使用ShortLongHoldStrategy连续持仓，不参与消融ΔLoss计算",
+            "固定输入池未声明历史成分股版本，因此不评估动态universe或存活偏差",
+            "news/event为unsupported，未调用当前生产agents或当前数据MCP路径",
+            "仅exact PIT且有未来日期标签的common-valid样本进入统计",
+            "五域结果属于factor_domain_ablation，不属于Agent贡献或模型Fidelity",
+            "数据缺失时abstain，不使用代码段位、固定折扣或中性分回退",
+            "SB-L6为独立参考线，不进入任何贡献归因",
         ]
-        if pit_disclaimer:
-            decls.append(pit_disclaimer)
 
         result = {
             "config": {
@@ -1714,13 +2166,26 @@ class ReplayBacktestEngine:
                 "num_anchors_executed": len(all_results),
                 "num_anchors_total": len(anchors),
                 "pit_financial_enabled": has_pit_alignment,
+                "pit_schema_version": PIT_SCHEMA_VERSION,
+                "model_profile": self.config.model_profile,
+                "prompt_version": self.config.prompt_version,
             },
             "splits": {k: len(v) for k, v in splits.items()},
             "anchor_results": all_results,
-            "contribution_summary": contribution_summary,
+            "factor_domain_summary": factor_summary,
+            "contribution_summary": {
+                "validity": "unsupported",
+                "reason": "factor-domain ablation is not Agent contribution",
+            },
             "reference_line": reference_results,
             "survivorship_bias": survivorship,
             "declarations": decls,
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
+            "fidelity_eligible": False,
+            "pit_mode": "exact" if has_pit_alignment else "unsupported",
+            "validity": "valid" if has_pit_alignment else "abstain",
+            "error_type": None if has_pit_alignment else factor_summary.get("error_type"),
         }
         return result
 
@@ -1750,6 +2215,8 @@ class ReplayBacktestEngine:
             but with fewer anchors/stocks).
         """
         all_anchors = self.generate_anchor_dates()
+        for anchor in all_anchors:
+            self._make_as_of_context(anchor)
 
         # Evenly sample anchors
         if len(all_anchors) <= num_anchors:
@@ -1776,7 +2243,7 @@ class ReplayBacktestEngine:
             result = await self.run_single_anchor(anchor_date, mini_pool, price_data)
             all_results.append(result)
 
-        contribution_summary = self._summarize_contributions(all_results)
+        factor_summary = self._summarize_contributions(all_results)
 
         # Compute per-anchor aggregate metrics
         per_anchor_metrics = []
@@ -1786,8 +2253,9 @@ class ReplayBacktestEngine:
             per_anchor_metrics.append({
                 "anchor_date": r["anchor_date"],
                 "pool_size": r.get("pool_size", len(mini_pool)),
-                "mean_score": full_data.get("mean_score", 0),
-                "mean_return": full_data.get("mean_return", 0),
+                "mean_score": full_data.get("mean_score"),
+                "mean_return": full_data.get("mean_return"),
+                "common_valid_samples": full_data.get("common_valid_samples", 0),
             })
 
         return {
@@ -1800,9 +2268,18 @@ class ReplayBacktestEngine:
                 "anchor_dates": sampled_anchors,
                 "prompt_override_applied": self.config.prompt_override is not None,
             },
-            "contribution_summary": contribution_summary,
+            "factor_domain_summary": factor_summary,
+            "contribution_summary": {
+                "validity": "unsupported",
+                "reason": "factor-domain ablation is not Agent contribution",
+            },
             "per_anchor_metrics": per_anchor_metrics,
             "anchor_results": all_results,
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
+            "fidelity_eligible": False,
+            "pit_mode": "exact" if factor_summary.get("validity") == "valid" else "unsupported",
+            "validity": factor_summary.get("validity", "abstain"),
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -1834,6 +2311,36 @@ class ReplayBacktestEngine:
             季度校准结果
         """
         anchors = self.generate_anchor_dates()
+        for anchor in anchors:
+            self._make_as_of_context(anchor)
+        # stock_basic(list_status="L") is today's universe, not a versioned
+        # historical constituent set.  Reusing it would reintroduce
+        # survivorship leakage, so calibration fails closed until a
+        # content-addressed PIT universe provider is supplied.
+        return {
+            "status": "unsupported",
+            "validity": "abstain",
+            "error_type": "pit_dynamic_universe_unavailable",
+            "error_message": (
+                "quarterly calibration requires a versioned PIT universe snapshot; "
+                "current stock_basic data cannot represent a historical universe"
+            ),
+            "term": term,
+            "num_anchors": 0,
+            "anchor_results": [],
+            "factor_domain_summary": {
+                "validity": "abstain",
+                "error_type": "pit_dynamic_universe_unavailable",
+                "domains": {},
+            },
+            "contribution_summary": {
+                "validity": "unsupported",
+                "reason": "factor-domain ablation is not Agent contribution",
+            },
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
+            "fidelity_eligible": False,
+        }
 
         # 按季度分组
         quarters: Dict[str, List[str]] = {}
@@ -2097,54 +2604,124 @@ class ReplayBacktestEngine:
 
     def _get_price_series(self, price_data: Dict[str, Any], stock_code: str,
                           start_date: str, days: int) -> List[float]:
-        """从历史价格数据中提取持有期价格序列"""
+        """Extract dated prices only; flat arrays have no provable PIT date."""
         if stock_code not in price_data:
             return []
         data = price_data[stock_code]
-        if isinstance(data, list):
-            return data[:days + 1]
         if isinstance(data, dict):
-            # {date: price}
-            current = datetime.strptime(start_date, "%Y-%m-%d")
-            prices = []
-            for _ in range(days + 1):
-                key = current.strftime("%Y-%m-%d")
-                if key in data:
-                    prices.append(data[key])
-                current += timedelta(days=1)
-            return prices
+            points = []
+            for raw_date, raw_price in data.items():
+                try:
+                    key = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                if key >= start_date and math.isfinite(price) and price > 0:
+                    points.append((key, price))
+            return [price for _, price in sorted(points)[:days + 1]]
+        if isinstance(data, list) and data and all(isinstance(row, Mapping) for row in data):
+            points = []
+            for row in data:
+                raw_date = row.get("trade_date", row.get("date"))
+                raw_price = row.get("close", row.get("price"))
+                try:
+                    date_text = str(raw_date)
+                    key = (
+                        datetime.strptime(date_text, "%Y%m%d").strftime("%Y-%m-%d")
+                        if len(date_text) == 8 and date_text.isdigit()
+                        else datetime.strptime(date_text[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+                    )
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                if key >= start_date and math.isfinite(price) and price > 0:
+                    points.append((key, price))
+            return [price for _, price in sorted(points)[:days + 1]]
         return []
 
     def _summarize_contributions(self, all_results: List[Dict]) -> Dict[str, Any]:
-        """汇总所有anchor的agent贡献"""
+        """Summarize factor-domain ablation on ID-aligned exact-PIT samples.
+
+        The compatibility method name is retained, but the payload explicitly
+        forbids treating this deterministic factor experiment as an Agent
+        contribution or model-fidelity result.
+        """
         from collections import defaultdict
 
-        agent_deltas = defaultdict(list)
+        domain_deltas = defaultdict(list)
+        requested = 0
+        common_sample_ids = set()
 
         for result in all_results:
+            requested += int(result.get("pool_size", 0) or 0)
+            if (
+                result.get("pit_mode") != "exact"
+                or result.get("experiment_type") != "factor_domain_ablation"
+            ):
+                continue
             ablation = result.get("ablation_results", {})
-            full_ret = ablation.get("full", {}).get("mean_return", 0)
+            full_samples = {
+                item.get("sample_id"): item
+                for item in ablation.get("full", {}).get("samples", [])
+                if item.get("sample_id")
+            }
 
-            for agent_label, data in ablation.items():
-                if agent_label == "full":
-                    continue
-                delta = data.get("mean_return", 0) - full_ret
-                # delta > 0 means ablation line did better = agent had negative contribution
-                # We want: delta_L > 0 means agent helps
-                agent_name = agent_label.lstrip("-")
-                agent_deltas[agent_name].append(-delta)  # flip sign
-
-        summary = {}
-        for agent_name, deltas in agent_deltas.items():
-            if deltas:
-                mean_delta = sum(deltas) / len(deltas)
-                summary[agent_name] = {
-                    "mean_delta_L": round(mean_delta, 4),
-                    "sample_size": len(deltas),
-                    "direction": "positive" if mean_delta > 0 else "negative",
+            variant_maps = {
+                label: {
+                    item.get("sample_id"): item
+                    for item in data.get("samples", [])
+                    if item.get("sample_id")
                 }
+                for label, data in ablation.items()
+            }
+            anchor_common_ids = set(full_samples)
+            for sample_map in variant_maps.values():
+                anchor_common_ids &= set(sample_map)
+            common_sample_ids.update(anchor_common_ids)
 
-        return summary
+            for domain_label, data in ablation.items():
+                if domain_label == "full" or not domain_label.startswith("-"):
+                    continue
+                variant_samples = variant_maps[domain_label]
+                paired_ids = anchor_common_ids
+                for sample_id in paired_ids:
+                    # The same realized label is joined by sample ID.  Score
+                    # changes are reported separately from return; no fixed
+                    # discount is invented.
+                    full_item = full_samples[sample_id]
+                    variant_item = variant_samples[sample_id]
+                    domain = domain_label[1:]
+                    domain_deltas[domain].append({
+                        "sample_id": sample_id,
+                        "score_delta": full_item["score"] - variant_item["score"],
+                        "realized_return": full_item["return"],
+                    })
+
+        domains = {}
+        for domain, paired in domain_deltas.items():
+            if paired:
+                deltas = [item["score_delta"] for item in paired]
+                domains[domain] = {
+                    "mean_score_delta": round(sum(deltas) / len(deltas), 4),
+                    "sample_size": len(paired),
+                    "sample_ids": [item["sample_id"] for item in paired],
+                }
+        minimum = max(1, int(self.config.minimum_common_samples))
+        valid = len(common_sample_ids) >= minimum
+        return {
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
+            "fidelity_eligible": False,
+            "validity": "valid" if valid else "abstain",
+            "error_type": None if valid else "insufficient_common_valid_samples",
+            "domains": domains if valid else {},
+            "coverage": {
+                "requested_samples": requested,
+                "common_valid_samples": len(common_sample_ids),
+                "common_valid_ratio": len(common_sample_ids) / requested if requested else 0.0,
+                "minimum_common_samples": minimum,
+            },
+        }
 
     def get_config(self) -> Dict[str, Any]:
         cfg = self.config
@@ -2155,6 +2732,12 @@ class ReplayBacktestEngine:
             "holding_days": cfg.holding_days,
             "anchor_frequency": cfg.anchor_frequency,
             "ablation_agents": cfg.ablation_agents,
+            "model_profile": cfg.model_profile,
+            "prompt_version": cfg.prompt_version,
+            "require_exact_pit": cfg.require_exact_pit,
+            "pit_schema_version": PIT_SCHEMA_VERSION,
+            "experiment_type": "factor_domain_ablation",
+            "agent_contribution_eligible": False,
         }
 
 

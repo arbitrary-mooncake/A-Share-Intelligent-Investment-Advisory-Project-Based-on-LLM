@@ -162,11 +162,20 @@ class TestParseBatchResponse:
         assert results[0]["code"] == "sh.600519"
 
     def test_invalid_response_returns_empty(self):
-        """无有效 JSON 的响应应返回空列表"""
+        """无有效 JSON 的响应不得静默吞掉，应抛出语法错误由调用方标记 invalid。"""
+        from src.api.batch_scorer import (
+            BatchResponseSyntaxError,
+            parse_batch_response,
+        )
+
+        with pytest.raises(BatchResponseSyntaxError):
+            parse_batch_response("这不是JSON，只是随便说说")
+
+    def test_blank_response_returns_empty(self):
+        """空白响应视为空输出（由调用方按 empty_llm_response 处理），不抛错。"""
         from src.api.batch_scorer import parse_batch_response
 
-        results = parse_batch_response("这不是JSON，只是随便说说")
-        assert results == []
+        assert parse_batch_response("   ") == []
 
     def test_partial_valid_response_extracted(self):
         """响应中嵌入有效 JSON 数组应被提取"""
@@ -178,15 +187,17 @@ class TestParseBatchResponse:
         assert len(results) == 1
         assert results[0]["code"] == "sh.603871"
 
-    def test_missing_level_defaults_to_neutral(self):
-        """缺少 level 字段应默认为 '中性'"""
+    def test_missing_level_is_explicitly_invalid(self):
+        """缺少 level 字段不得伪装为中性结论。"""
         from src.api.batch_scorer import parse_batch_response
 
         response = """[{"code": "sh.000001", "reason": "测试", "risk": "测试"}]"""
         results = parse_batch_response(response)
 
         assert len(results) == 1
-        assert results[0].get("level", "中性") == "中性"
+        assert results[0]["level"] is None
+        assert results[0]["validity"] == "invalid"
+        assert results[0]["error_code"] == "invalid_level"
 
     def test_invalid_stock_entry_filtered(self):
         """code 无效的条目应被过滤"""

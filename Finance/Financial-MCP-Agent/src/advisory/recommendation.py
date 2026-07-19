@@ -1,16 +1,15 @@
-"""
-股票推荐引擎 — 基于 n/x/5 规则的推荐引擎。
-
-从精筛池（stock_pool.json）挑选股票，查生产缓存辅助决策。
-只读缓存，不触发分析 Agent，不调用 LLM。
-"""
+"""基于已发布精筛池和生产缓存的股票推荐引擎。"""
 from __future__ import annotations
 
 import glob
 import json
 import logging
 import os
+import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from src.eval.refined_pool_repository import RefinedPoolError, RefinedPoolRepository
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +19,15 @@ _BASE_DIR = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 
-_DEFAULT_POOL_PATH = os.path.join(_BASE_DIR, "stock_pool.json")
+_DEFAULT_POOL_PATH = os.path.join(_BASE_DIR, "data", "eval", "refined_pools.json")
 _DEFAULT_CACHE_DIR = os.path.join(_BASE_DIR, "data", "intermediate_cache")
+_TERMS = ("short", "medium", "long")
+_SCORER_BY_TERM = {
+    "short": "short_term_scorer",
+    "medium": "medium_term_scorer",
+    "long": "long_term_scorer",
+}
+_POOL_MAX_AGE_DAYS = {"short": 30, "medium": 60, "long": 90}
 
 # ── 全局单例 ──
 
@@ -41,60 +47,279 @@ class RecommendationEngine:
         """初始化推荐引擎。
 
         Args:
-            pool_path: 精筛池 JSON 路径，默认项目根目录 stock_pool.json。
+            pool_path: 精筛池 JSON 路径，默认 data/eval/refined_pools.json。
             cache_dir:  生产缓存目录，默认 data/intermediate_cache/。
         """
         self.pool_path: str = pool_path or _DEFAULT_POOL_PATH
         self.cache_dir: str = cache_dir or _DEFAULT_CACHE_DIR
+        self.repository = RefinedPoolRepository(self.pool_path)
+        self._last_pool_status: Dict[str, Any] = {
+            "status": "unknown", "generation": 0
+        }
 
     # ── 公共方法 ──
 
     def load_pool_stocks(self) -> List[Dict[str, Any]]:
-        """从 stock_pool.json 加载 short/medium/long 三个期限池，去重。
+        """从已发布精筛池加载三个期限，合并同股多期限信号。
 
         Returns:
-            每只股票的 dict 列表，包含 stock_code / company_name / score /
-            term / term_score / recommendation / detected_industry。
+            每只股票只出现一次；``terms`` 和 ``term_scores`` 保留所有期限。
         """
         if not os.path.isfile(self.pool_path):
             logger.warning("精筛池文件不存在: %s", self.pool_path)
+            self._last_pool_status = self.repository.status()
             return []
 
         try:
-            with open(self.pool_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
+            data = self.repository.read()
+            self._last_pool_status = self.repository.status()
+        except (RefinedPoolError, json.JSONDecodeError, OSError) as e:
             logger.error("精筛池文件读取失败: %s", e)
+            self._last_pool_status = {"status": "error", "error": str(e)}
             return []
 
-        pools = data.get("pools", {})
-        seen: set[str] = set()
-        result: List[Dict[str, Any]] = []
+        # The real eval pool uses top-level term keys.  Keep a read-only adapter
+        # for the previous advisory fixture shape during migration.
+        pools = data.get("pools", data)
+        by_code: Dict[str, Dict[str, Any]] = {}
+        generation = self.repository.generation(data)
+        published_at = data.get("_repository", {}).get("published_at", "")
 
-        for term in ("short", "medium", "long"):
+        for term in _TERMS:
             term_pool = pools.get(term, {})
-            stocks = term_pool.get("stocks", {})
-            for code, info in stocks.items():
-                if code in seen:
+            if not isinstance(term_pool, dict):
+                continue
+            stocks = term_pool.get("stocks", [])
+            iterable = stocks.items() if isinstance(stocks, dict) else (
+                (None, item) for item in stocks if isinstance(item, (dict, str))
+            )
+            for mapped_code, raw_info in iterable:
+                info = raw_info if isinstance(raw_info, dict) else {"code": raw_info}
+                code = str(
+                    info.get("stock_code") or info.get("code") or mapped_code or ""
+                )
+                if not code:
                     continue
-                seen.add(code)
-
-                term_score_data = info.get("term_score") or {}
-
-                result.append({
-                    "stock_code": info.get("stock_code", code),
-                    "company_name": info.get("company_name", ""),
-                    "score": info.get("score"),
-                    "term": term,
-                    "term_score": term_score_data,
-                    "recommendation": info.get("recommendation", ""),
-                    "detected_industry": term_score_data.get(
-                        "detected_industry",
-                        info.get("detected_industry", ""),
+                score_data = info.get("term_score") or {}
+                pool_score = info.get("final_score", info.get("score"))
+                cache = self.get_score_cache_info(code, term)
+                score_time = (
+                    info.get("scored_at")
+                    or info.get("score_time")
+                    or term_pool.get("updated_at", "")
+                )
+                membership = {
+                    "score": pool_score,
+                    "validity": info.get(
+                        "validity",
+                        score_data.get("validity", "legacy_non_actionable")
+                        if isinstance(score_data, dict)
+                        else "legacy_non_actionable",
                     ),
-                })
+                    "coverage": info.get(
+                        "coverage",
+                        score_data.get("coverage", 0.0)
+                        if isinstance(score_data, dict)
+                        else 0.0,
+                    ),
+                    "score_time": score_time,
+                    "recommendation": info.get("recommendation", info.get("rating", "")),
+                    "pool_updated_at": term_pool.get("updated_at", ""),
+                    "pool_version": term_pool.get("version", 0),
+                    "cache_score": cache.get("score"),
+                    "cache_date": cache.get("cache_date"),
+                    "cache_fresh": cache.get("is_fresh", False),
+                    "cache_validity": cache.get("validity", "missing"),
+                }
+                pool_age = self._age_days(term_pool.get("updated_at", ""))
+                membership["pool_age_days"] = pool_age
+                membership["pool_fresh"] = (
+                    pool_age is not None and pool_age <= _POOL_MAX_AGE_DAYS[term]
+                )
+                membership.update(score_data if isinstance(score_data, dict) else {})
 
-        return result
+                existing = by_code.get(code)
+                if existing is None:
+                    existing = {
+                        "stock_code": code,
+                        "company_name": info.get("company_name", info.get("name", "")),
+                        "score": pool_score,
+                        "validity": membership["validity"],
+                        "coverage": membership["coverage"],
+                        "term": term,  # compatibility: first/primary membership
+                        "term_score": score_data,
+                        "terms": [],
+                        "term_scores": {},
+                        "recommendation": membership["recommendation"],
+                        "detected_industry": score_data.get(
+                            "detected_industry", info.get("detected_industry", "")
+                        ) if isinstance(score_data, dict) else info.get("detected_industry", ""),
+                        "pool_generation": generation,
+                        "pool_published_at": published_at,
+                    }
+                    by_code[code] = existing
+                existing["terms"].append(term)
+                existing["term_scores"][term] = membership
+
+        return list(by_code.values())
+
+    def get_pool_status(self) -> Dict[str, Any]:
+        """Status of the publication last observed by this engine."""
+        try:
+            status = self.repository.status()
+            data = self.repository.read()
+            term_status: Dict[str, Any] = {}
+            has_stale = False
+            for term in _TERMS:
+                pool = data.get(term, {})
+                stocks = pool.get("stocks", []) if isinstance(pool, dict) else []
+                age = self._age_days(pool.get("updated_at", "")) if isinstance(pool, dict) else None
+                state = "empty" if not stocks else (
+                    "stale" if age is None or age > _POOL_MAX_AGE_DAYS[term] else "fresh"
+                )
+                has_stale = has_stale or state == "stale"
+                term_status[term] = {"status": state, "age_days": age, "size": len(stocks)}
+            if status["status"] == "current" and has_stale:
+                status["status"] = "stale"
+            status["terms"] = term_status
+            return status
+        except RefinedPoolError as exc:
+            return {"status": "error", "error": str(exc), "generation": 0}
+
+    @staticmethod
+    def _age_days(value: Any) -> Optional[int]:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+        return (datetime.now().date() - parsed.date()).days
+
+    def get_score_cache_info(
+        self, stock_code: str, term: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Return score plus the exact scorer/date/freshness provenance."""
+        if not os.path.isdir(self.cache_dir):
+            return {
+                "score": None,
+                "term": term,
+                "cache_date": None,
+                "is_fresh": False,
+                "validity": "missing",
+            }
+        if term is not None and term not in _SCORER_BY_TERM:
+            raise ValueError(f"unknown investment term: {term}")
+
+        safe_code = stock_code.replace(".", "_")
+        scorer_names = (
+            [_SCORER_BY_TERM[term]] if term else list(_SCORER_BY_TERM.values())
+        )
+        candidates: List[tuple] = []
+        for scorer in scorer_names:
+            for path in glob.glob(os.path.join(self.cache_dir, f"{scorer}_{safe_code}_*.json")):
+                candidates.append((path, scorer))
+
+        def cache_sort_key(item: tuple) -> tuple:
+            match = re.search(r"_(\d{4}-\d{2}-\d{2})(?:_eval)?\.json$", item[0])
+            return (match.group(1) if match else "", item[0])
+
+        candidates.sort(key=cache_sort_key, reverse=True)
+
+        rejected_validity: Optional[str] = None
+        for filepath, scorer in candidates:
+            try:
+                with open(filepath, "r", encoding="utf-8") as handle:
+                    cache = json.load(handle)
+            except (json.JSONDecodeError, OSError):
+                continue
+            content = cache.get("content")
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except json.JSONDecodeError:
+                    content = None
+            source = content if isinstance(content, dict) else cache
+            score = self._extract_cache_score(cache)
+            if score is None:
+                if isinstance(source, dict):
+                    rejected_validity = str(
+                        source.get("validity", "legacy_non_actionable")
+                    )
+                continue
+            cache_date = self._cache_date(filepath, cache)
+            age_days: Optional[int] = None
+            fresh = False
+            if cache_date:
+                age_days = (datetime.now().date() - cache_date.date()).days
+                fresh = 0 <= age_days <= 1
+            resolved_term = next(
+                (key for key, value in _SCORER_BY_TERM.items() if value == scorer), None
+            )
+            return {
+                "score": score,
+                "term": resolved_term,
+                "scorer": scorer,
+                "cache_date": cache_date.date().isoformat() if cache_date else None,
+                "age_days": age_days,
+                "is_fresh": fresh,
+                "validity": "valid",
+                "coverage": source.get("coverage", 0.0),
+            }
+        return {
+            "score": None,
+            "term": term,
+            "cache_date": None,
+            "is_fresh": False,
+            "validity": rejected_validity or "missing",
+        }
+
+    @staticmethod
+    def _extract_cache_score(cache: Dict[str, Any]) -> Optional[float]:
+        content = cache.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError:
+                content = None
+        for source in (content, cache):
+            if not isinstance(source, dict):
+                continue
+            if source.get("validity") != "valid":
+                continue
+            if source.get("missing_core_fields"):
+                continue
+            coverage = source.get("coverage")
+            if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
+                continue
+            if not 0.0 < float(coverage) <= 1.0:
+                continue
+            if source.get("score") is not None:
+                try:
+                    return float(source["score"])
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    @staticmethod
+    def _cache_date(filepath: str, cache: Dict[str, Any]) -> Optional[datetime]:
+        for key in ("as_of_date", "date", "created_at", "updated_at"):
+            value = cache.get(key)
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+                except ValueError:
+                    pass
+        match = re.search(r"_(\d{4}-\d{2}-\d{2})(?:_eval)?\.json$", filepath)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y-%m-%d")
+            except ValueError:
+                pass
+        try:
+            return datetime.fromtimestamp(os.path.getmtime(filepath))
+        except OSError:
+            return None
 
     def check_score_cache(self, stock_code: str) -> Optional[float]:
         """检查 intermediate_cache/ 中的打分缓存文件。
@@ -108,50 +333,7 @@ class RecommendationEngine:
         Returns:
             score 数值，或 None（无缓存 / 解析失败）。
         """
-        if not os.path.isdir(self.cache_dir):
-            return None
-
-        safe_code = stock_code.replace(".", "_")
-
-        # 主搜索：生产环境现有的 scorer 缓存
-        # 文件名如: short_term_scorer_{safe_code}_{date}.json
-        pattern = os.path.join(self.cache_dir, f"*scorer*{safe_code}*.json")
-        matching: List[str] = glob.glob(pattern)
-
-        # 备选搜索：brief 中描述的 scoring_ 前缀模式
-        alt_pattern = os.path.join(self.cache_dir, f"*scoring*{safe_code}*score*.json")
-        matching.extend(glob.glob(alt_pattern))
-
-        if not matching:
-            return None
-
-        # 按文件名降序排列（最新优先）
-        matching.sort(reverse=True)
-
-        for filepath in matching:
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-
-            # 尝试从 content 字段中提取（content 是 JSON 字符串的常见模式）
-            content_str = cache.get("content")
-            if content_str and isinstance(content_str, str):
-                try:
-                    content = json.loads(content_str)
-                    score = content.get("score")
-                    if score is not None:
-                        return float(score)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            # 直接从缓存顶层提取
-            score = cache.get("score")
-            if score is not None:
-                return float(score)
-
-        return None
+        return self.get_score_cache_info(stock_code).get("score")
 
     def check_signal_pack_cache(
         self, stock_code: str, agent: str
@@ -213,16 +395,13 @@ class RecommendationEngine:
         Returns:
             裁剪后的股票代码列表。
         """
-        n = len(candidate_codes)
-        if n <= 5:
-            return list(candidate_codes)
-
-        # 构建池评分查找表（作为 cache miss 时的降级后备）
+        # 构建池评分查找表（作为 cache miss 时的降级后备）。旧池中只有
+        # final_score 而没有有效性契约的值仅用于展示，不得参与推荐。
         pool_lookup: Dict[str, float] = {}
         for s in pool_stocks:
             sc = s.get("stock_code", "")
             score = s.get("score")
-            if sc and score is not None:
+            if sc and score is not None and s.get("validity") == "valid":
                 pool_lookup[sc] = float(score)
 
         # 逐只检查打分缓存
@@ -277,8 +456,16 @@ class RecommendationEngine:
             code = s.get("stock_code", "")
             name = s.get("company_name", "")
             lines.append(f"### 候选 {i}: {name}（{code}）")
-            lines.append(f"- 所属期限池: {s.get('term', 'N/A')}")
-            lines.append(f"- 精筛池综合评分: {s.get('score', 'N/A')}")
+            terms = s.get("terms") or [s.get("term", "N/A")]
+            lines.append(f"- 所属期限池: {', '.join(terms)}")
+            if s.get("term_scores"):
+                lines.append(f"- 各期限评分与新鲜度: {json.dumps(s['term_scores'], ensure_ascii=False)}")
+            if s.get("validity") == "valid":
+                lines.append(f"- 精筛池综合评分: {s.get('score', 'N/A')}")
+            else:
+                lines.append(
+                    f"- 精筛池综合评分: 不可用于决策（{s.get('validity', 'legacy_non_actionable')}）"
+                )
             lines.append(f"- 精筛池推荐: {s.get('recommendation', 'N/A')}")
             lines.append(f"- 归属行业: {s.get('detected_industry', 'N/A')}")
 

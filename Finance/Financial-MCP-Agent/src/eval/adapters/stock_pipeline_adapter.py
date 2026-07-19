@@ -11,7 +11,10 @@ A股管线适配器 -- 非侵入式包装现有ScoringEngine。
   - eval_mode 通过设置 AnalysisPackage 的 task_type="eval" 体现
 """
 from datetime import datetime
+import math
 from typing import Dict, Any, Optional, List
+
+from src.eval.score_assessment import ScoreAssessmentSchemaError
 
 
 async def run_stock_analysis(
@@ -70,6 +73,7 @@ async def run_stock_analysis(
         "long_term_decision": None,
         "signal_packs": {},
         "analysis_texts": {},
+        "score_assessments": {},
         "execution_time": 0.0,
         "error": None,
     }
@@ -89,17 +93,43 @@ async def run_stock_analysis(
         # 以注入 model_config 和 as_of_date。
         score_result = await engine.score_stock(stock_code, company_name)
 
-        if score_result and score_result.get("score_data"):
+        if not score_result or not isinstance(score_result, dict):
+            result["error"] = "ScoringEngine returned an empty or invalid response"
+        elif score_result.get("error"):
+            # ScoringEngine intentionally reports failures as a result dict.  Do not
+            # turn that failure into three empty/neutral decisions.
+            result["error"] = str(score_result["error"])
+        elif score_result.get("score_data"):
             score_data = score_result["score_data"]
 
+            # Evidence is needed to state coverage on every score result.
+            result["signal_packs"] = score_result.get("signal_packs", {})
+            result["analysis_texts"] = score_result.get("analysis_texts", {})
+
             # 提取三种期限评分（scorer 输出的原始 dict）
-            short_score = score_data.get("short_term_score", {})
-            medium_score = score_data.get("medium_term_score", {})
-            long_score = score_data.get("long_term_score", {})
+            short_score = _attach_runtime_score_contract(
+                score_data.get("short_term_score"), result["signal_packs"], "short"
+            )
+            medium_score = _attach_runtime_score_contract(
+                score_data.get("medium_term_score"), result["signal_packs"], "medium"
+            )
+            long_score = _attach_runtime_score_contract(
+                score_data.get("long_term_score"), result["signal_packs"], "long"
+            )
 
             result["short_term_score"] = short_score
             result["medium_term_score"] = medium_score
             result["long_term_score"] = long_score
+
+            from src.eval.score_assessment import assess_score_payload
+            for term_name, payload in (
+                ("short", short_score),
+                ("medium", medium_score),
+                ("long", long_score),
+            ):
+                result["score_assessments"][term_name] = assess_score_payload(
+                    payload, core_fields=("score",), legacy_is_invalid=True
+                ).to_dict()
 
             # 构建DecisionPack
             result["short_term_decision"] = _build_decision_pack(
@@ -115,15 +145,139 @@ async def run_stock_analysis(
                 result["as_of_date"], long_score, eval_mode
             )
 
-            # 提取 signal_packs 和分析文本（pipeline 已直接返回）
-            result["signal_packs"] = score_result.get("signal_packs", {})
-            result["analysis_texts"] = score_result.get("analysis_texts", {})
+        else:
+            result["error"] = "ScoringEngine response is missing score_data"
 
+    except ScoreAssessmentSchemaError:
+        # Parsed-but-invalid score schemas are producer/programming errors.
+        # They must remain observable to the caller instead of becoming a
+        # successful result with neutral defaults.
+        raise
     except Exception as e:
         result["error"] = str(e)
 
     result["execution_time"] = (datetime.now() - start_time).total_seconds()
     return result
+
+
+def _attach_runtime_score_contract(
+    score_data: Any,
+    signal_packs: Dict[str, Any],
+    term: str,
+) -> Dict[str, Any]:
+    """Add an explicit validity contract to a fresh ScoringEngine result."""
+    required_agents = {
+        "short": ("technical", "news", "event", "moneyflow"),
+        "medium": ("fundamental", "technical", "value", "news", "event", "quality_risk", "moneyflow"),
+        "long": ("fundamental", "technical", "value", "news", "event", "quality_risk", "moneyflow"),
+    }.get(term, ())
+    available_agents = [
+        name for name in required_agents
+        if isinstance(signal_packs.get(name), dict)
+        and not signal_packs[name].get("error")
+        and str(signal_packs[name].get("validity", "valid")).lower() not in {"invalid", "error", "failed"}
+    ]
+    coverage = len(available_agents) / len(required_agents) if required_agents else 0.0
+
+    if not isinstance(score_data, dict) or not score_data:
+        return {
+            "validity": "invalid",
+            "coverage": coverage,
+            "missing_core_fields": ["score"],
+            "missing_optional_fields": [],
+            "error_type": "missing_score_payload",
+            "error_message": f"{term} scorer returned no score payload",
+        }
+
+    payload = dict(score_data)
+    if not available_agents:
+        payload.pop("score", None)
+        payload.update({
+            "validity": "invalid",
+            "coverage": 0.0,
+            "missing_core_fields": ["analysis_evidence"],
+            "missing_optional_fields": [],
+            "error_type": "missing_analysis_evidence",
+            "error_message": f"{term} scorer has no usable analysis evidence",
+        })
+        return payload
+
+    explicit_validity = str(payload.get("validity", "")).strip().lower()
+    if explicit_validity in {"invalid", "error", "failed"}:
+        payload.pop("score", None)
+        payload.update({
+            "validity": "invalid",
+            "coverage": coverage,
+            "missing_core_fields": list(payload.get("missing_core_fields") or []),
+            "missing_optional_fields": list(payload.get("missing_optional_fields") or []),
+            "error_type": payload.get("error_type") or "upstream_invalid",
+            "error_message": payload.get("error_message") or f"{term} scorer marked result invalid",
+        })
+        return payload
+    if explicit_validity == "abstain" or payload.get("missing_core_fields"):
+        payload.pop("score", None)
+        payload.update({
+            "validity": "abstain",
+            "coverage": coverage,
+            "missing_core_fields": list(payload.get("missing_core_fields") or []),
+            "missing_optional_fields": list(payload.get("missing_optional_fields") or []),
+            "error_type": payload.get("error_type") or "missing_core_data",
+            "error_message": payload.get("error_message") or f"{term} scorer abstained",
+        })
+        return payload
+
+    if payload.get("_scorer_failed"):
+        payload.pop("score", None)
+        payload.update({
+            "validity": "invalid",
+            "coverage": coverage,
+            "missing_core_fields": ["score"],
+            "missing_optional_fields": [],
+            "error_type": "scorer_failed",
+            "error_message": f"{term} scorer failed",
+        })
+        return payload
+
+    gate = payload.get("risk_gate")
+    if isinstance(gate, dict) and gate.get("abstain") is True:
+        payload.pop("score", None)
+        payload.update({
+            "validity": "abstain",
+            "coverage": coverage,
+            "missing_core_fields": [],
+            "missing_optional_fields": [],
+            "error_type": "risk_gate_abstain",
+            "error_message": str(gate.get("abstain_reason") or "risk gate abstained"),
+        })
+        return payload
+
+    raw_score = payload.get("score")
+    if (
+        isinstance(raw_score, bool)
+        or not isinstance(raw_score, (int, float))
+        or not math.isfinite(float(raw_score))
+        or not 0 <= float(raw_score) <= 100
+    ):
+        payload.pop("score", None)
+        payload.update({
+            "validity": "invalid",
+            "coverage": coverage,
+            "missing_core_fields": ["score"],
+            "missing_optional_fields": [],
+            "error_type": "invalid_score",
+            "error_message": f"{term} scorer returned a missing or invalid score",
+        })
+        return payload
+
+    payload.update({
+        "validity": "valid",
+        "coverage": coverage,
+        "missing_core_fields": [],
+        "missing_optional_fields": [
+            f"agent:{name}" for name in required_agents if name not in available_agents
+        ],
+    })
+    return payload
 
 
 def _build_decision_pack(
@@ -133,7 +287,7 @@ def _build_decision_pack(
     as_of_date: str,
     score_data: Dict[str, Any],
     eval_mode: bool = True,
-) -> 'DecisionPack':
+) -> Optional['DecisionPack']:
     """
     从scorer的JSON输出映射为DecisionPack。
 
@@ -152,17 +306,15 @@ def _build_decision_pack(
         eval_mode: 是否评测模式
     """
     from src.utils.analysis_schema import DecisionPack
+    from src.eval.score_assessment import assess_score_payload
 
     if not score_data or not isinstance(score_data, dict):
-        return DecisionPack(
-            asset_type="stock",
-            symbol=stock_code,
-            name=company_name,
-            term=term,
-            as_of_date=as_of_date,
-            action="hold",
-            model_profile="eval_analysis" if eval_mode else "production",
-        )
+        return None
+    assessment = assess_score_payload(
+        score_data, core_fields=("score",), legacy_is_invalid=True
+    )
+    if not assessment.usable:
+        return None
 
     # --- action 映射 ---
     # short_term_scorer 用 "recommendation"，medium/long 用 "rating"
@@ -186,13 +338,23 @@ def _build_decision_pack(
         "谨慎减持": "cautious_sell",
         "减持": "sell",
     }
-    action = action_map.get(recommendation, "hold")
+    action = action_map.get(recommendation)
+    if action is None:
+        return None
 
     # --- score ---
     try:
-        score = float(score_data.get("score", 0))
+        score = assessment.require_valid()
     except (ValueError, TypeError):
-        score = 0.0
+        return None
+    except KeyError:
+        return None
+    if not math.isfinite(score) or not 0 <= score <= 100:
+        return None
+
+    risk_gate = score_data.get("risk_gate", {})
+    if isinstance(risk_gate, dict) and risk_gate.get("abstain"):
+        return None
 
     # --- confidence ---
     try:
@@ -207,7 +369,6 @@ def _build_decision_pack(
         dq = 0.5
 
     # --- risk_gate ---
-    risk_gate = score_data.get("risk_gate", {})
     risk_gate_applied = bool(risk_gate.get("risk_flags")) if isinstance(risk_gate, dict) else False
     risk_gate_result = risk_gate if isinstance(risk_gate, dict) else None
 

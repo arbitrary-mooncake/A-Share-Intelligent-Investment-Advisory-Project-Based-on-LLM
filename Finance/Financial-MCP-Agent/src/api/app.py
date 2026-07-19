@@ -2380,6 +2380,7 @@ async def _run_batch_fetch(batch_id: str):
         for s in stocks:
             data = s.get("data", {}) or {}
             score = s.get("score", {}) or {}
+            score_validity = score.get("validity", "invalid")
             results_out.append({
                 "code": s.get("code", ""),
                 "name": s.get("name", ""),
@@ -2387,16 +2388,23 @@ async def _run_batch_fetch(batch_id: str):
                 "roe": data.get("roe", ""), "industry": data.get("industry", ""),
                 "market_cap": data.get("market_cap", ""),
                 "price_changes": data.get("price_changes", {}),
-                "level": score.get("level", "中性"),
+                "level": score.get("level") if score_validity == "valid" else None,
                 "confidence": score.get("confidence", ""),
                 "reason": score.get("reason", ""), "risk": score.get("risk", ""),
+                "validity": score_validity,
+                "coverage": score.get("coverage", 0.0),
+                "error_code": score.get("error_code", ""),
             })
         with open(_results_path, "w", encoding="utf-8") as f:
             json.dump(results_out, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"持久化批量任务失败: {e}")
 
-    scored_ok = sum(1 for s in stocks if s.get("score"))
+    scored_ok = sum(
+        1 for s in stocks
+        if isinstance(s.get("score"), dict)
+        and s["score"].get("validity") == "valid"
+    )
     logger.info(
         f"{SUCCESS_ICON} 批量打分全流程完成: {batch_id}, "
         f"数据 {fetched_ok}/{total}, 打分 {scored_ok}/{fetched_ok}"
@@ -2630,17 +2638,28 @@ async def batch_score_results(batch_id: str):
             entry["price_changes"] = data.get("price_changes", {})
         score = s.get("score")
         if score:
-            entry["level"] = score.get("level", "中性")
+            score_validity = score.get("validity", "invalid")
+            entry["level"] = score.get("level") if score_validity == "valid" else None
             entry["confidence"] = score.get("confidence", "")
             entry["reason"] = score.get("reason", "")
             entry["risk"] = score.get("risk", "")
+            entry["validity"] = score_validity
+            entry["coverage"] = score.get("coverage", 0.0)
+            entry["error_code"] = score.get("error_code", "")
         if s.get("all_scores"):
             # 全维度模式
             entry["all_scores"] = {}
             for term, sc in s["all_scores"].items():
                 entry["all_scores"][term] = {
-                    "level": sc.get("level", "中性"),
+                    "level": (
+                        sc.get("level")
+                        if sc.get("validity", "invalid") == "valid"
+                        else None
+                    ),
                     "reason": sc.get("reason", ""),
+                    "validity": sc.get("validity", "invalid"),
+                    "coverage": sc.get("coverage", 0.0),
+                    "error_code": sc.get("error_code", ""),
                 }
         stocks_out.append(entry)
 
@@ -3520,8 +3539,11 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
 
         # 判断是否需要 LLM 介入挑选
         needs_llm = any(c == "__LLM_PICK__" for c in trimmed_codes)
+        selection_status = "scored"
+        selection_error = ""
         if needs_llm:
             trimmed_codes = [c for c in trimmed_codes if c != "__LLM_PICK__"]
+            llm_pick_succeeded = False
             # 无缓存评分时，用 LLM 基于问题从候选中挑最优 5 只
             if question and len(trimmed_codes) > 5:
                 try:
@@ -3537,7 +3559,8 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
                             f"  {s.get('company_name', code)}（{code}）"
                             f" | 行业: {s.get('detected_industry', '未知')}"
                             f" | 期限池: {s.get('term', 'N/A')}"
-                            f" | 池评分: {s.get('score', 'N/A')}"
+                            f" | 池评分: "
+                            f"{s.get('score', 'N/A') if s.get('validity') == 'valid' else '不可用于决策'}"
                         )
 
                     pick_prompt = (
@@ -3572,12 +3595,30 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
                         if arr_match:
                             picked = json.loads(arr_match.group())
                             if isinstance(picked, list) and len(picked) > 0:
-                                trimmed_codes = picked
+                                candidate_set = set(trimmed_codes)
+                                picked = list(dict.fromkeys(
+                                    code for code in picked
+                                    if isinstance(code, str) and code in candidate_set
+                                ))[:5]
+                                if picked:
+                                    trimmed_codes = picked
+                                    llm_pick_succeeded = True
                 except Exception as e:
-                    logger.warning(f"LLM 挑选失败，保留前5只: {e}")
-                    trimmed_codes = trimmed_codes[:5]
-            elif len(trimmed_codes) > 5:
-                trimmed_codes = trimmed_codes[:5]
+                    selection_error = f"LLM挑选失败: {e}"
+                    logger.warning("%s；本次推荐 abstain", selection_error)
+            elif not question:
+                selection_error = "没有可验证评分，且未提供可用于LLM选择的问题"
+            else:
+                selection_error = "没有可验证评分，候选数量不足以执行LLM择优"
+
+            if not llm_pick_succeeded:
+                # 不能把 provider/schema 故障或无问题退化成文件顺序的前5只。
+                trimmed_codes = []
+                selection_status = "abstain"
+                if not selection_error:
+                    selection_error = "LLM未返回有效候选"
+            else:
+                selection_status = "llm_selected"
 
         # 匹配完整股票信息
         result_stocks = []
@@ -3588,14 +3629,25 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
                     "stock_code": s["stock_code"],
                     "company_name": s["company_name"],
                     "pool_term": s.get("term", ""),
-                    "pool_score": s.get("score"),
+                    "pool_terms": s.get("terms", [s.get("term", "")]),
+                    "term_scores": s.get("term_scores", {}),
+                    "pool_score": s.get("score") if s.get("validity") == "valid" else None,
+                    "legacy_pool_score": s.get("score") if s.get("validity") != "valid" else None,
+                    "pool_validity": s.get("validity", "legacy_non_actionable"),
+                    "pool_coverage": s.get("coverage", 0.0),
+                    "pool_generation": s.get("pool_generation", 0),
+                    "pool_published_at": s.get("pool_published_at", ""),
                     "cache_score": cache_score,
                     "industry": s.get("detected_industry", ""),
                 })
 
         # 按评分排序
         result_stocks.sort(
-            key=lambda x: x.get("cache_score") or x.get("pool_score") or 0,
+            key=lambda x: (
+                x.get("cache_score")
+                if x.get("cache_score") is not None
+                else (x.get("pool_score") if x.get("pool_score") is not None else -1)
+            ),
             reverse=True,
         )
 
@@ -3606,7 +3658,10 @@ async def advisory_recommend(request: AdvisoryRecommendRequest):
             "filtered_count": len(filtered_codes),
             "recommended_count": len(result_stocks),
             "needs_llm_pick": needs_llm,
+            "selection_status": selection_status,
+            "selection_error": selection_error,
             "question_used": bool(question),
+            "pool_status": engine.get_pool_status(),
             "recommendations": result_stocks,
         }
     except HTTPException:

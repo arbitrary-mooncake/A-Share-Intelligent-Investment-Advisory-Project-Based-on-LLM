@@ -12,14 +12,259 @@ import heapq
 import json
 import logging
 import math
+import os
 import re
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Callable, Optional
 
-from src.eval.pool_manager import PoolManager
+from src.eval.pool_manager import (
+    DEFAULT_BLACKLIST_TTL,
+    DEFAULT_POOL_CONFIG,
+    PoolManager,
+)
+from src.eval.score_assessment import (
+    ScoreAssessment,
+    ScoreAssessmentSchemaError,
+    assess_score_payload,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_TERM_SCORE_KEYS = {
+    "short": "short_term_score",
+    "medium": "medium_term_score",
+    "long": "long_term_score",
+}
+
+
+def _invalid_score_record(
+    stock: Dict[str, Any],
+    stage: str,
+    error_type: str,
+    error_message: str,
+    *,
+    validity: str = "invalid",
+    coverage: float = 0.0,
+    missing_core_fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create an observable non-investment result for screening diagnostics."""
+    return {
+        "code": stock.get("code", ""),
+        "name": stock.get("name", ""),
+        "stage": stage,
+        "validity": validity,
+        "coverage": coverage,
+        "missing_core_fields": list(missing_core_fields or ["score"]),
+        "error_type": error_type,
+        "error_message": error_message,
+    }
+
+
+def _assess_fresh_term_score(
+    score_data: Any,
+    signal_packs: Dict[str, Any],
+    term: str,
+) -> tuple[ScoreAssessment, Dict[str, Any]]:
+    """Attach and validate the score contract emitted by a fresh pipeline run."""
+    from src.eval.adapters.stock_pipeline_adapter import _attach_runtime_score_contract
+
+    raw_term = score_data.get(_TERM_SCORE_KEYS[term]) if isinstance(score_data, dict) else None
+    contract = _attach_runtime_score_contract(raw_term, signal_packs or {}, term)
+    assessment = assess_score_payload(
+        contract, core_fields=("score",), legacy_is_invalid=True
+    )
+    return assessment, contract
+
+
+def _assess_cached_term_score(
+    cache_data: Any,
+    term: str,
+) -> tuple[Optional[ScoreAssessment], Optional[Dict[str, Any]]]:
+    """Accept only cache entries written with the explicit score contract."""
+    if not isinstance(cache_data, dict):
+        return None, None
+    contracts = cache_data.get("score_contracts")
+    if cache_data.get("contract_version") != 2 or not isinstance(contracts, dict):
+        return None, None
+    contract = contracts.get(term)
+    if not isinstance(contract, dict) or not isinstance(contract.get("scored_at"), str):
+        return None, None
+    assessment = assess_score_payload(
+        contract, core_fields=("score",), legacy_is_invalid=True
+    )
+    return assessment, contract
+
+
+def _score_recommendation(contract: Dict[str, Any], score_data: Any) -> str:
+    """Read the term scorer's recommendation without inventing a fallback view."""
+    recommendation = contract.get("recommendation") or contract.get("rating")
+    if not recommendation and isinstance(score_data, dict):
+        recommendation = score_data.get("recommendation") or score_data.get("rating")
+    return str(recommendation or "")
+
+
+def _contract_cache_payload(
+    score_data: Dict[str, Any],
+    signal_packs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist all term contracts so legacy score-only caches fail closed."""
+    contracts: Dict[str, Any] = {}
+    scored_at = datetime.now().isoformat()
+    for term in _TERM_SCORE_KEYS:
+        _, contracts[term] = _assess_fresh_term_score(score_data, signal_packs, term)
+        contracts[term]["scored_at"] = scored_at
+    return {
+        "contract_version": 2,
+        "scored_at": scored_at,
+        "score_data": score_data,
+        "score_contracts": contracts,
+    }
+
+
+def _clean_blacklist_document(document: Dict[str, Any]) -> None:
+    """Remove expired blacklist entries in-memory before one atomic publish."""
+    now = datetime.now()
+    blacklist = document.get("blacklist")
+    if not isinstance(blacklist, dict):
+        blacklist = {"short": [], "medium": [], "long": []}
+        document["blacklist"] = blacklist
+    for term in ("short", "medium", "long"):
+        cleaned = []
+        for entry in blacklist.get(term, []):
+            expires_at = entry.get("expires_at", "") if isinstance(entry, dict) else ""
+            if expires_at:
+                try:
+                    if now > datetime.fromisoformat(expires_at):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(entry, dict):
+                cleaned.append(entry)
+        blacklist[term] = cleaned
+
+
+def _build_pool_generation(
+    pm: PoolManager,
+    term: str,
+    stocks: List[Dict[str, Any]],
+    *,
+    reserve: Optional[List[Dict[str, Any]]] = None,
+    blacklist_additions: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Build one complete short/medium/long+reserve+blacklist generation."""
+    document = deepcopy(pm.pools)
+    document.pop("_repository", None)
+    _clean_blacklist_document(document)
+    previous_term = document.get(term, {})
+    next_term = {
+        "stocks": deepcopy(stocks),
+        "updated_at": datetime.now().isoformat(),
+        "version": int(previous_term.get("version", 0)) + 1,
+    }
+    if reserve is None:
+        for key in ("reserve", "reserve_updated_at"):
+            if key in previous_term:
+                next_term[key] = deepcopy(previous_term[key])
+    else:
+        next_term["reserve"] = deepcopy(reserve)
+        next_term["reserve_updated_at"] = datetime.now().isoformat()
+    document[term] = next_term
+
+    blacklist = document.setdefault(
+        "blacklist", {"short": [], "medium": [], "long": []}
+    )
+    entries = blacklist.setdefault(term, [])
+    existing_codes = {
+        entry.get("code", "") for entry in entries if isinstance(entry, dict)
+    }
+    for item in blacklist_additions or []:
+        code = item.get("code", "")
+        if not code or code in existing_codes:
+            continue
+        now = datetime.now()
+        entries.append({
+            "code": code,
+            "term": term,
+            "reason": item.get(
+                "layer1_reason", item.get("recommendation", "批量粗筛判定")
+            ),
+            "added_at": now.isoformat(),
+            "expires_at": (
+                now + timedelta(days=DEFAULT_BLACKLIST_TTL.get(term, 365))
+            ).isoformat(),
+        })
+        existing_codes.add(code)
+    document["updated_at"] = datetime.now().isoformat()
+    return document
+
+
+def _publish_pool_generation(
+    pm: PoolManager,
+    term: str,
+    stocks: List[Dict[str, Any]],
+    *,
+    reserve: Optional[List[Dict[str, Any]]] = None,
+    blacklist_additions: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """CAS-publish one complete generation; mutate ``pm`` only after success."""
+    document = _build_pool_generation(
+        pm,
+        term,
+        stocks,
+        reserve=reserve,
+        blacklist_additions=blacklist_additions,
+    )
+    token = pm.repository.stage(
+        document, expected_generation=pm._generation
+    )
+    try:
+        published = pm.repository.publish_staged(
+            token, expected_generation=pm._generation
+        )
+    except Exception:
+        # CAS conflicts/fault injection must leave neither a new current nor a
+        # misleading perpetual "updating" status for this failed writer.
+        _discard_staged_checkpoint(pm, token)
+        raise
+    pm.pools = published
+    pm._generation = pm.repository.generation(published)
+    return published
+
+
+def _stage_pool_checkpoint(
+    pm: PoolManager,
+    term: str,
+    stocks: List[Dict[str, Any]],
+) -> str:
+    """Write crash-recovery state to invisible staging, never to current."""
+    document = _build_pool_generation(pm, term, stocks)
+    document[term]["_checkpoint_in_progress"] = True
+    document[term]["_checkpoint_completed_count"] = len(stocks)
+    return pm.repository.stage(document, expected_generation=pm._generation)
+
+
+def _discard_staged_checkpoint(pm: PoolManager, token: Optional[str]) -> None:
+    """Best-effort cleanup of the exact staging token owned by this update."""
+    if not token:
+        return
+    stage_path = os.path.join(pm.repository.staging_dir, token + ".json")
+    try:
+        os.remove(stage_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("无法清理精筛池 checkpoint %s: %s", token, exc)
+
+
+def _pool_capacity_failure(term: str, valid_count: int) -> Optional[str]:
+    """Require a production-safe number of explicitly valid candidates."""
+    minimum = int(DEFAULT_POOL_CONFIG[term]["min_size"])
+    if valid_count < minimum:
+        return f"显式有效候选仅{valid_count}只，低于{term}池安全下限{minimum}只"
+    return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -440,11 +685,24 @@ async def batch_score_layer1(
     )
 
     # Step D: 分档
-    whitelist, initial_pool, blacklist = [], [], []
+    whitelist, initial_pool, blacklist, invalid = [], [], [], []
     discarded = 0
     for s in scored:
         score_data = s.get("score", {})
         if isinstance(score_data, dict):
+            if score_data.get("validity") != "valid":
+                invalid.append(_invalid_score_record(
+                    s,
+                    "layer1",
+                    str(score_data.get("error_code") or "invalid_layer1_score"),
+                    str(score_data.get("reason") or "Layer 1 打分无有效结论"),
+                    validity=str(score_data.get("validity") or "invalid"),
+                    coverage=float(score_data.get("coverage") or 0.0),
+                    missing_core_fields=list(
+                        score_data.get("missing_core_fields") or ["level"]
+                    ),
+                ))
+                continue
             tier = classify_batch_result(score_data)
             entry = {
                 "code": s.get("code", ""),
@@ -464,14 +722,19 @@ async def batch_score_layer1(
                 discarded += 1
 
     logger.info(
-        "[Layer 1] 分档完成: 白名单%d只, 初筛池%d只, 黑名单%d只, 丢弃%d只",
-        len(whitelist), len(initial_pool), len(blacklist), discarded
+        "[Layer 1] 分档完成: 白名单%d只, 初筛池%d只, 黑名单%d只, 丢弃%d只, 无效%d只",
+        len(whitelist), len(initial_pool), len(blacklist), discarded, len(invalid)
     )
 
     if on_progress:
         on_progress(len(ts_stocks), len(ts_stocks))
 
-    return {"whitelist": whitelist, "initial_pool": initial_pool, "blacklist": blacklist}
+    return {
+        "whitelist": whitelist,
+        "initial_pool": initial_pool,
+        "blacklist": blacklist,
+        "invalid": invalid,
+    }
 
 
 async def batch_score_layer1_stream(
@@ -514,7 +777,25 @@ async def batch_score_layer1_stream(
         on_progress=_fetch_progress,
     )
     valid = [s for s in batch_stocks if s.get("status") == "fetched" and s.get("data")]
+    fetch_invalid = [
+        {
+            "code": s.get("code", ""),
+            "name": s.get("name", ""),
+            "_score_validity": "invalid",
+            "_score_coverage": 0.0,
+            "_score_error_type": "layer1_data_unavailable",
+            "_score_error_message": str(
+                s.get("error") or "Layer 1 数据获取失败或返回空数据"
+            ),
+            "_score_missing_core_fields": ["level"],
+        }
+        for s in batch_stocks
+        if not (s.get("status") == "fetched" and s.get("data"))
+    ]
     logger.info("[Layer 1-Stream] 数据获取完成: %d/%d 有效", len(valid), len(batch_stocks))
+
+    if fetch_invalid:
+        yield fetch_invalid
 
     # Step C: 分批 LLM 打分, 逐批 yield
     # yield 同时携带原始 data 字典, 供 Layer 2 复用 (避免冗余 fetch_batch)。
@@ -532,6 +813,23 @@ async def batch_score_layer1_stream(
         for s in scored:
             sd = s.get("score", {})
             if isinstance(sd, dict):
+                if sd.get("validity") != "valid":
+                    batch_results.append({
+                        "code": s.get("code", ""),
+                        "name": s.get("name", ""),
+                        "_score_validity": str(sd.get("validity") or "invalid"),
+                        "_score_coverage": float(sd.get("coverage") or 0.0),
+                        "_score_error_type": str(
+                            sd.get("error_code") or "invalid_layer1_score"
+                        ),
+                        "_score_error_message": str(
+                            sd.get("reason") or "Layer 1 打分无有效结论"
+                        ),
+                        "_score_missing_core_fields": list(
+                            sd.get("missing_core_fields") or ["level"]
+                        ),
+                    })
+                    continue
                 entry = {
                     "code": s.get("code", ""),
                     "name": s.get("name", ""),
@@ -539,6 +837,8 @@ async def batch_score_layer1_stream(
                     "layer1_confidence": sd.get("confidence", ""),
                     "layer1_reason": sd.get("reason", ""),
                     "layer1_risk": sd.get("risk", ""),
+                    "_score_validity": "valid",
+                    "_score_coverage": float(sd.get("coverage", 1.0)),
                     "_raw_data": s.get("data"),
                 }
                 batch_results.append(entry)
@@ -576,12 +876,13 @@ _LAYER2_SYSTEM_PROMPT = """你是 A 股精筛排序器。你的任务不是判�
 1. **精确区分**: 这批股票 Layer 1 都已判为"推荐"，彼此差别可能很细微。请精确使用 0-100 连续值，65 和 68 的差异要有依据，不要所有人都在 70-80。
 2. **数据引用规则**: 只能引用股票数据中实际出现的数字，严禁编造。
 3. **跨行业可比**: 参考行业估值基准，银行 PE 6 倍合理 ≠ 科技 PE 60 倍高估。
-4. **宁可保守**: 数据不足时给 40-50 的中性分，不要猜测。
+4. **数据不足必须弃权**: 核心数据不足时不得给 40-50 中性分；输出
+   `validity="abstain", score=null, error_type="insufficient_data"`。
 
 ## 输出格式
 严格输出 JSON 数组（不要 markdown 代码块标记）：
 
-[{"code": "sh.603871", "score": 78, "reason": "低估值+高ROE+行业景气(30字内)", "risk": "原材料涨价(30字内)"},
+[{"code": "sh.603871", "validity": "valid", "score": 78, "reason": "低估值+高ROE+行业景气(30字内)", "risk": "原材料涨价(30字内)"},
  ...]
 """
 
@@ -645,9 +946,23 @@ async def score_layer2_batch(
         fetched = await fetch_batch(batch_input, semaphore=24)
         valid = [f for f in fetched if f.get("status") == "fetched" and f.get("data")]
 
+    valid_codes = {item.get("code", "") for item in valid}
+    fetch_invalid = [
+        {
+            "code": stock.get("code", ""),
+            "score": None,
+            "validity": "invalid",
+            "coverage": 0.0,
+            "missing_core_fields": ["score"],
+            "error_type": "layer2_data_unavailable",
+            "error_message": "Layer 2 无可用股票数据",
+        }
+        for stock in recommended_stocks
+        if stock.get("code", "") not in valid_codes
+    ]
     if not valid:
         logger.warning("[Layer 2] 无有效股票数据")
-        return []
+        return fetch_invalid
 
     logger.info("[Layer 2] 数据复用: %d/%d 来自 L1 pre-fetched, %d 需重新获取",
                 pre_hit, len(recommended_stocks), len(valid) - pre_hit)
@@ -703,17 +1018,21 @@ async def score_layer2_batch(
 
 ## 输出要求
 对上述 {len(stocks_data)} 只股票，返回 JSON 数组（不要 markdown 代码块）。
-每只股票输出: code, score(0-100连续值), reason(30字内), risk(30字内)
+每只股票输出: code, validity(valid/abstain), score(仅valid时为0-100连续值),
+reason(30字内), risk(30字内)。核心数据不足必须 abstain 且 score=null，
+不得用 40/50 分代替故障或数据缺失。
 
 只返回 JSON 数组:"""
 
     sem = asyncio.Semaphore(8)
     score_lock = asyncio.Lock()
-    results = []
+    results = list(fetch_invalid)
 
     async def _score_chunk(chunk):
         stocks_data = [s["data"] for s in chunk]
         prompt = _build_l2_prompt(stocks_data)
+        expected = {s.get("code", ""): s for s in chunk}
+        chunk_results: List[Dict[str, Any]] = []
         try:
             response = await asyncio.wait_for(
                 asyncio.get_running_loop().run_in_executor(
@@ -724,36 +1043,124 @@ async def score_layer2_batch(
                 ), timeout=300.0
             )
             if response:
-                import re
                 text = str(response).strip()
                 start = text.find('[')
+                parsed = None
                 if start >= 0:
                     for end in range(len(text), start, -1):
                         try:
-                            parsed = json.loads(text[start:end])
-                            if isinstance(parsed, list):
-                                async with score_lock:
-                                    for item in parsed:
-                                        if isinstance(item, dict):
-                                            code = item.get("code", "")
-                                            if re.match(r'^(sh|sz)\.\d{5,6}$', code):
-                                                results.append({
-                                                    "code": code,
-                                                    "score": float(item.get("score", 50)),
-                                                    "reason": item.get("reason", ""),
-                                                    "risk": item.get("risk", ""),
-                                                })
+                            candidate = json.loads(text[start:end])
+                            if isinstance(candidate, list):
+                                parsed = candidate
                                 break
                         except json.JSONDecodeError:
                             continue
+                parsed_by_code: Dict[str, Dict[str, Any]] = {}
+                for item in parsed or []:
+                    if not isinstance(item, dict):
+                        continue
+                    code = item.get("code", "")
+                    if code in expected and code not in parsed_by_code:
+                        parsed_by_code[code] = item
+                for code in expected:
+                    item = parsed_by_code.get(code)
+                    if item is None:
+                        chunk_results.append({
+                            "code": code,
+                            "score": None,
+                            "validity": "invalid",
+                            "coverage": 0.0,
+                            "missing_core_fields": ["score"],
+                            "error_type": "missing_layer2_item",
+                            "error_message": "Layer 2 响应缺少该股票",
+                        })
+                        continue
+                    raw_validity = str(item.get("validity") or "").strip().lower()
+                    if raw_validity != "valid":
+                        controlled_validity = (
+                            "abstain" if raw_validity == "abstain" else "invalid"
+                        )
+                        chunk_results.append({
+                            "code": code,
+                            "score": None,
+                            "validity": controlled_validity,
+                            "coverage": 0.0,
+                            "missing_core_fields": ["score"],
+                            "error_type": str(
+                                item.get("error_type")
+                                or ("insufficient_data" if controlled_validity == "abstain" else "missing_validity")
+                            ),
+                            "error_message": str(
+                                item.get("reason")
+                                or "Layer 2 未返回显式 valid 评分契约"
+                            ),
+                        })
+                        continue
+                    raw_score = item.get("score")
+                    if (
+                        isinstance(raw_score, bool)
+                        or not isinstance(raw_score, (int, float))
+                        or not math.isfinite(float(raw_score))
+                        or not 0.0 <= float(raw_score) <= 100.0
+                    ):
+                        chunk_results.append({
+                            "code": code,
+                            "score": None,
+                            "validity": "invalid",
+                            "coverage": 0.0,
+                            "missing_core_fields": ["score"],
+                            "error_type": "invalid_layer2_score",
+                            "error_message": "Layer 2 返回缺失、非数值或越界分数",
+                        })
+                        continue
+                    chunk_results.append({
+                        "code": code,
+                        "score": float(raw_score),
+                        "reason": item.get("reason", ""),
+                        "risk": item.get("risk", ""),
+                        "validity": "valid",
+                        "coverage": 1.0,
+                        "missing_core_fields": [],
+                    })
+            else:
+                chunk_results.extend({
+                    "code": code,
+                    "score": None,
+                    "validity": "invalid",
+                    "coverage": 0.0,
+                    "missing_core_fields": ["score"],
+                    "error_type": "empty_layer2_response",
+                    "error_message": "Layer 2 响应为空",
+                } for code in expected)
         except asyncio.TimeoutError:
             logger.warning("[Layer 2] 批次超时")
+            chunk_results.extend({
+                "code": code,
+                "score": None,
+                "validity": "invalid",
+                "coverage": 0.0,
+                "missing_core_fields": ["score"],
+                "error_type": "layer2_timeout",
+                "error_message": "Layer 2 打分超时",
+            } for code in expected)
         except Exception as e:
             logger.error("[Layer 2] 批次失败: %s", e)
+            chunk_results.extend({
+                "code": code,
+                "score": None,
+                "validity": "invalid",
+                "coverage": 0.0,
+                "missing_core_fields": ["score"],
+                "error_type": "layer2_error",
+                "error_message": str(e),
+            } for code in expected)
+        async with score_lock:
+            results.extend(chunk_results)
 
     await asyncio.gather(*[_score_chunk(c) for c in chunks])
 
-    logger.info("[Layer 2] DSV4Pro 打分完成: %d 只有效分数", len(results))
+    valid_count = sum(1 for item in results if item.get("validity") == "valid")
+    logger.info("[Layer 2] DSV4Pro 打分完成: %d/%d 只有效分数", valid_count, len(results))
     return results
 
 
@@ -766,6 +1173,7 @@ async def quick_screen_layer2(
     term: str,
     threshold: int = 50,
     on_progress: Optional[Callable] = None,
+    invalid_results: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Layer 2: 用M2(Qwen3.6-Flash)快筛初筛池，淘汰明显不行的。
@@ -814,8 +1222,34 @@ async def quick_screen_layer2(
     eliminated = 0
     for s in scored:
         score_data = s.get("score", {})
-        level = score_data.get("level", "中性") if isinstance(score_data, dict) else "中性"
-        numeric_score = level_map.get(level, 50)
+        if not isinstance(score_data, dict) or score_data.get("validity") != "valid":
+            if invalid_results is not None:
+                payload = score_data if isinstance(score_data, dict) else {}
+                invalid_results.append(_invalid_score_record(
+                    s,
+                    "layer2_quick_screen",
+                    str(payload.get("error_code") or "invalid_quick_screen_score"),
+                    str(payload.get("reason") or "Layer 2 快筛无有效结论"),
+                    validity=str(payload.get("validity") or "invalid"),
+                    coverage=float(payload.get("coverage") or 0.0),
+                    missing_core_fields=list(
+                        payload.get("missing_core_fields") or ["level"]
+                    ),
+                ))
+            continue
+        level = score_data.get("level")
+        if level not in level_map:
+            if invalid_results is not None:
+                invalid_results.append(_invalid_score_record(
+                    s,
+                    "layer2_quick_screen",
+                    "invalid_quick_screen_level",
+                    "Layer 2 快筛返回了未知评级",
+                    coverage=float(score_data.get("coverage") or 0.0),
+                    missing_core_fields=["level"],
+                ))
+            continue
+        numeric_score = level_map[level]
 
         if numeric_score >= threshold:
             s["quick_screen_score"] = numeric_score
@@ -960,7 +1394,7 @@ async def formal_score_layer3(
     candidates = list(whitelist[:quota["whitelist_slots"]])
     initial_sorted = sorted(
         initial_passing,
-        key=lambda x: x.get("quick_screen_score", 50),
+        key=lambda x: x["quick_screen_score"],
         reverse=True
     )
     candidates += initial_sorted[:quota["initial_slots"]]
@@ -976,11 +1410,10 @@ async def formal_score_layer3(
     scored_candidates = []
     whitelist_final = []
     blacklist_final = []
+    invalid_results: List[Dict[str, Any]] = []
     candidates_lock = asyncio.Lock()
     sem = asyncio.Semaphore(3)
     completed_count = 0
-
-    term_key = {"short": "short_term_score", "medium": "medium_term_score", "long": "long_term_score"}
 
     async def _score_one(stock: Dict[str, Any]) -> None:
         nonlocal completed_count
@@ -988,7 +1421,8 @@ async def formal_score_layer3(
         code = stock.get("code", "")
         name = stock.get("name", code)
         safe_code = code.replace(".", "_").replace("/", "_")
-        entry = {**stock, "final_score": 50, "recommendation": ""}
+        entry: Optional[Dict[str, Any]] = None
+        invalid: Optional[Dict[str, Any]] = None
 
         # 检查 full_analysis 缓存 (1天TTL)
         cache_date = datetime.now().strftime("%Y-%m-%d")
@@ -1002,22 +1436,29 @@ async def formal_score_layer3(
                 cache_data = json.loads(cached_full)
             except (json.JSONDecodeError, TypeError, ValueError):
                 cache_data = None
-            sd = cache_data.get("score_data", {}) if cache_data else {}
-            if sd:
-                term_score = sd.get(term_key.get(term, "medium_term_score"), {})
-                actual_score = term_score.get("score") if isinstance(term_score, dict) else sd.get("score", 50)
-                if actual_score is None:
-                    actual_score = sd.get("score", 50)
-                rec = sd.get("recommendation", "")
-                entry = {**stock, "final_score": actual_score or 50,
-                         "recommendation": rec}
-                logger.info("  %s 命中full_analysis缓存, score=%s", code, actual_score)
+            assessment, contract = _assess_cached_term_score(cache_data, term)
+            if assessment is not None and assessment.usable and contract is not None:
+                actual_score = assessment.require_valid()
+                sd = cache_data.get("score_data", {})
+                rec = _score_recommendation(contract, sd)
+                entry = {
+                    **stock,
+                    "final_score": actual_score,
+                    "recommendation": rec,
+                    "validity": "valid",
+                    "coverage": assessment.coverage,
+                    "missing_core_fields": [],
+                    "scored_at": contract["scored_at"],
+                }
+                logger.info("  %s 命中有效full_analysis缓存, score=%s", code, actual_score)
                 async with candidates_lock:
-                    if "强烈推荐" in str(rec) or (actual_score or 0) >= 85:
+                    if "强烈推荐" in rec or actual_score >= 85:
                         whitelist_final.append(entry)
-                    elif "卖出" in str(rec) or (actual_score or 50) < 30:
+                        scored_candidates.append(entry)
+                    elif "卖出" in rec or actual_score < 30:
                         blacklist_final.append(entry)
-                    scored_candidates.append(entry)
+                    else:
+                        scored_candidates.append(entry)
                     completed_count += 1
                 return
 
@@ -1025,36 +1466,73 @@ async def formal_score_layer3(
         try:
             async with sem:
                 result = await engine.score_stock(code, name)
-            if result and result.get("score_data"):
+            if result and not result.get("error") and result.get("score_data"):
+                sd = result["score_data"]
+                signal_packs = result.get("signal_packs", {})
+                assessment, contract = _assess_fresh_term_score(
+                    sd, signal_packs, term
+                )
                 # 写入 full_analysis 缓存
                 try:
                     write_cache("full_pool_analysis", safe_code, cache_date,
-                                json.dumps({"score_data": result["score_data"]},
+                                json.dumps(_contract_cache_payload(sd, signal_packs),
                                            ensure_ascii=False, default=str))
                 except Exception:
                     pass
-                sd = result["score_data"]
-                score = sd.get("score") or 50
-
-                term_score = sd.get(term_key.get(term, "medium_term_score"), {})
-                actual_score = term_score.get("score") if isinstance(term_score, dict) else score
-                if actual_score is None:
-                    actual_score = score
-                recommendation = sd.get("recommendation", "")
-
-                entry = {**stock, "final_score": actual_score, "recommendation": recommendation}
+                if assessment.usable:
+                    entry = {
+                        **stock,
+                        "final_score": assessment.require_valid(),
+                        "recommendation": _score_recommendation(contract, sd),
+                        "validity": "valid",
+                        "coverage": assessment.coverage,
+                        "missing_core_fields": [],
+                        "scored_at": datetime.now().isoformat(),
+                    }
+                else:
+                    invalid = _invalid_score_record(
+                        stock,
+                        "layer3_formal",
+                        assessment.error_type or "unusable_formal_score",
+                        assessment.error_message or "正式评分未产生可用结论",
+                        validity=assessment.validity.value,
+                        coverage=assessment.coverage,
+                        missing_core_fields=list(assessment.missing_core_fields),
+                    )
+            else:
+                invalid = _invalid_score_record(
+                    stock,
+                    "layer3_formal",
+                    "formal_scoring_failed",
+                    str((result or {}).get("error") or "正式评分未返回 score_data"),
+                )
+        except ScoreAssessmentSchemaError:
+            raise
         except Exception as e:
             logger.warning("  正式评分失败 %s: %s", code, e)
-            entry = {**stock, "final_score": 40, "recommendation": ""}
+            invalid = _invalid_score_record(
+                stock, "layer3_formal", type(e).__name__, str(e)
+            )
 
         async with candidates_lock:
-            if "强烈推荐" in str(entry.get("recommendation", "")) or entry.get("final_score", 0) >= 85:
-                whitelist_final.append(entry)
-                scored_candidates.append(entry)
-            elif "卖出" in str(entry.get("recommendation", "")) or entry.get("final_score", 50) < 30:
-                blacklist_final.append(entry)
+            if entry is None:
+                invalid_results.append(invalid or _invalid_score_record(
+                    stock, "layer3_formal", "unknown_failure", "正式评分失败"
+                ))
             else:
-                scored_candidates.append(entry)
+                if (
+                    "强烈推荐" in str(entry.get("recommendation", ""))
+                    or entry["final_score"] >= 85
+                ):
+                    whitelist_final.append(entry)
+                    scored_candidates.append(entry)
+                elif (
+                    "卖出" in str(entry.get("recommendation", ""))
+                    or entry["final_score"] < 30
+                ):
+                    blacklist_final.append(entry)
+                else:
+                    scored_candidates.append(entry)
             completed_count += 1
             if on_progress and completed_count % 5 == 0:
                 on_progress(completed_count, len(candidates))
@@ -1076,7 +1554,7 @@ async def formal_score_layer3(
         on_progress(len(candidates), len(candidates))
 
     # Step D: LLM动态阈值
-    all_scores = [s.get("final_score", 50) for s in scored_candidates]
+    all_scores = [s["final_score"] for s in scored_candidates]
     threshold = await _dynamic_threshold(all_scores, target_size)
 
     # Step E: 按阈值筛选
@@ -1089,6 +1567,8 @@ async def formal_score_layer3(
     stats = {
         "candidates": len(candidates),
         "scored": len(all_scores),
+        "invalid": len(invalid_results),
+        "invalid_results": invalid_results,
         "whitelist_final": len(whitelist_final),
         "blacklist_final": len(blacklist_final),
         "pool_size": len(pool_final),
@@ -1106,6 +1586,10 @@ async def formal_score_layer3(
         "pool": pool_final,
         "whitelist": whitelist_final,
         "blacklist": blacklist_final,
+        "invalid": invalid_results,
+        "ranked_candidates": sorted(
+            scored_candidates, key=lambda item: item["final_score"], reverse=True
+        ),
         "stats": stats,
     }
 
@@ -1292,6 +1776,8 @@ async def _layer3_consumer(
     results: List[Dict[str, Any]],
     whitelist_final: List[Dict[str, Any]],
     blacklist_final: List[Dict[str, Any]],
+    invalid_results: List[Dict[str, Any]],
+    stage_failures: List[str],
     lock: asyncio.Lock,
     term: str,
     progress: Optional[PipelineProgress] = None,
@@ -1314,8 +1800,6 @@ async def _layer3_consumer(
     completed = 0
     total_dispatched = 0
     last_heartbeat = datetime.now()
-    term_key = {"short": "short_term_score", "medium": "medium_term_score",
-                 "long": "long_term_score"}
     cache_date = datetime.now().strftime("%Y-%m-%d")
 
     # B2: 预加载黑名单 (per-term)
@@ -1338,57 +1822,45 @@ async def _layer3_consumer(
         from src.utils.cache_utils import read_cache, write_cache
         code = stock.get("code", "")
         name = stock.get("name", code)
-
-        # B2: 黑名单阻断
-        if code in _blacklist_codes:
-            logger.info("[L3] %s 在%s黑名单, 跳过评分", code, term)
-            queue.task_done()
-            return
-
-        safe_code = code.replace(".", "_").replace("/", "_")
-        entry = {**stock, "final_score": 50, "recommendation": ""}
-
-        # full_analysis 缓存检查
-        cached_full = None
-        try:
-            cached_full = read_cache("full_pool_analysis", safe_code, cache_date)
-        except Exception:
-            pass
-        if cached_full:
-            try:
-                cache_data = json.loads(cached_full)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                cache_data = None
-            sd = cache_data.get("score_data", {}) if cache_data else {}
-            if sd:
-                ts = sd.get(term_key.get(term, "medium_term_score"), {})
-                actual_score = ts.get("score") if isinstance(ts, dict) else sd.get("score", 50)
-                if actual_score is None:
-                    actual_score = sd.get("score", 50)
-                rec = sd.get("recommendation", "")
-                entry = {**stock, "final_score": actual_score or 50, "recommendation": rec}
-                logger.debug("  %s 命中full_analysis缓存, score=%s", code, actual_score)
-                async with lock:
-                    if "强烈推荐" in str(rec) or (actual_score or 0) >= 85:
-                        whitelist_final.append(entry)
-                    elif "卖出" in str(rec) or (actual_score or 50) < 30:
-                        blacklist_final.append(entry)
-                    results.append(entry)
-                    completed += 1
-                    last_heartbeat = datetime.now()
-                    if progress:
-                        progress.stage_progress("3_formal_score", completed)
-                        progress.queue_depth = queue.qsize()
-                        progress.report_completed_stock({
-                            "code": code, "name": name,
-                            "final_score": entry.get("final_score"),
-                            "recommendation": entry.get("recommendation", ""),
-                        })
-                queue.task_done()
-                return
-
+        entry: Optional[Dict[str, Any]] = None
+        invalid: Optional[Dict[str, Any]] = None
         t_start = time.time()
         try:
+            # B2: 黑名单阻断不是评分失败，也不进入排名。
+            if code in _blacklist_codes:
+                logger.info("[L3] %s 在%s黑名单, 跳过评分", code, term)
+                return
+
+            safe_code = code.replace(".", "_").replace("/", "_")
+            cached_full = None
+            try:
+                cached_full = read_cache("full_pool_analysis", safe_code, cache_date)
+            except Exception:
+                pass
+            if cached_full:
+                try:
+                    cache_data = json.loads(cached_full)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    cache_data = None
+                assessment, contract = _assess_cached_term_score(cache_data, term)
+                if assessment is not None and assessment.usable and contract is not None:
+                    sd = cache_data.get("score_data", {})
+                    entry = {
+                        **stock,
+                        "final_score": assessment.require_valid(),
+                        "recommendation": _score_recommendation(contract, sd),
+                        "validity": "valid",
+                        "coverage": assessment.coverage,
+                        "missing_core_fields": [],
+                        "scored_at": contract["scored_at"],
+                    }
+                    logger.debug(
+                        "  %s 命中有效full_analysis缓存, score=%s",
+                        code,
+                        entry["final_score"],
+                    )
+                    return
+
             # 共用 engine 实例, 只靠 semaphore 控制并发
             async with sem:
                 result = await asyncio.wait_for(
@@ -1396,52 +1868,106 @@ async def _layer3_consumer(
                     timeout=per_task_timeout,
                 )
             elapsed = time.time() - t_start
-            if result and result.get("score_data"):
+            if result and not result.get("error") and result.get("score_data"):
+                sd = result["score_data"]
+                signal_packs = result.get("signal_packs", {})
+                assessment, contract = _assess_fresh_term_score(
+                    sd, signal_packs, term
+                )
                 try:
                     write_cache("full_pool_analysis", safe_code, cache_date,
-                                json.dumps({"score_data": result["score_data"]},
+                                json.dumps(_contract_cache_payload(sd, signal_packs),
                                            ensure_ascii=False, default=str))
                 except Exception:
                     pass
-                sd = result["score_data"]
-                score = sd.get("score") or 50
-                ts = sd.get(term_key.get(term, "medium_term_score"), {})
-                actual_score = ts.get("score") if isinstance(ts, dict) else score
-                if actual_score is None:
-                    actual_score = score
-                rec = sd.get("recommendation", "")
-                entry = {**stock, "final_score": actual_score, "recommendation": rec}
-                logger.info("[L3] %s 完成 (%.0fs) score=%s", code, elapsed, actual_score)
+                if assessment.usable:
+                    entry = {
+                        **stock,
+                        "final_score": assessment.require_valid(),
+                        "recommendation": _score_recommendation(contract, sd),
+                        "validity": "valid",
+                        "coverage": assessment.coverage,
+                        "missing_core_fields": [],
+                        "scored_at": datetime.now().isoformat(),
+                    }
+                    logger.info(
+                        "[L3] %s 完成 (%.0fs) score=%s",
+                        code,
+                        elapsed,
+                        entry["final_score"],
+                    )
+                else:
+                    invalid = _invalid_score_record(
+                        stock,
+                        "layer3_formal",
+                        assessment.error_type or "unusable_formal_score",
+                        assessment.error_message or "正式评分未产生可用结论",
+                        validity=assessment.validity.value,
+                        coverage=assessment.coverage,
+                        missing_core_fields=list(assessment.missing_core_fields),
+                    )
             else:
-                entry = {**stock, "final_score": 50, "recommendation": ""}
+                invalid = _invalid_score_record(
+                    stock,
+                    "layer3_formal",
+                    "formal_scoring_failed",
+                    str((result or {}).get("error") or "正式评分未返回 score_data"),
+                )
                 logger.warning("[L3] %s 无评分数据 (%.0fs)", code, elapsed)
         except asyncio.TimeoutError:
             elapsed = time.time() - t_start
             logger.error("[L3] %s 超时 (%.0fs, limit=%.0fs)", code, elapsed, per_task_timeout)
-            entry = {**stock, "final_score": 40, "recommendation": "超时"}
+            invalid = _invalid_score_record(
+                stock, "layer3_formal", "formal_scoring_timeout", "正式评分超时"
+            )
+        except ScoreAssessmentSchemaError as exc:
+            elapsed = time.time() - t_start
+            logger.error("[L3] %s 评分契约错误 (%.0fs): %s", code, elapsed, exc)
+            stage_failures.append(f"{code}: {exc}")
+            invalid = _invalid_score_record(
+                stock, "layer3_formal", "score_schema_error", str(exc)
+            )
         except Exception as e:
             elapsed = time.time() - t_start
             exc_type = type(e).__name__
             logger.error("[L3] %s 失败 (%.0fs, %s): %s", code, elapsed, exc_type, e)
-            entry = {**stock, "final_score": 40, "recommendation": ""}
-
-        async with lock:
-            if "强烈推荐" in str(entry.get("recommendation", "")) or entry.get("final_score", 0) >= 85:
-                whitelist_final.append(entry)
-            elif "卖出" in str(entry.get("recommendation", "")) or entry.get("final_score", 50) < 30:
-                blacklist_final.append(entry)
-            results.append(entry)
-            completed += 1
-            last_heartbeat = datetime.now()
-            if progress:
-                progress.stage_progress("3_formal_score", completed)
-                progress.queue_depth = queue.qsize()
-                progress.report_completed_stock({
-                    "code": code, "name": name,
-                    "final_score": entry.get("final_score"),
-                    "recommendation": entry.get("recommendation", ""),
-                })
-        queue.task_done()
+            invalid = _invalid_score_record(
+                stock, "layer3_formal", exc_type, str(e)
+            )
+        finally:
+            if entry is not None or invalid is not None:
+                async with lock:
+                    if entry is None:
+                        diagnostic = invalid or _invalid_score_record(
+                            stock, "layer3_formal", "unknown_failure", "正式评分失败"
+                        )
+                        invalid_results.append(diagnostic)
+                    elif (
+                        "卖出" in str(entry.get("recommendation", ""))
+                        or entry["final_score"] < 30
+                    ):
+                        blacklist_final.append(entry)
+                    else:
+                        results.append(entry)
+                        if (
+                            "强烈推荐" in str(entry.get("recommendation", ""))
+                            or entry["final_score"] >= 85
+                        ):
+                            whitelist_final.append(entry)
+                    completed += 1
+                    last_heartbeat = datetime.now()
+                    if progress:
+                        progress.stage_progress("3_formal_score", completed)
+                        progress.queue_depth = queue.qsize()
+                        progress.report_completed_stock({
+                            "code": code,
+                            "name": name,
+                            "final_score": entry.get("final_score") if entry else None,
+                            "recommendation": entry.get("recommendation", "") if entry else "",
+                            "validity": "valid" if entry else diagnostic.get("validity", "invalid"),
+                            "error_type": None if entry else diagnostic.get("error_type"),
+                        })
+            queue.task_done()
 
     # 主循环: 从队列拉取任务, 分派到 _score_one
     while True:
@@ -1480,20 +2006,17 @@ async def _safe_queue_put(queue: asyncio.Queue, item: Any, label: str = "",
                           timeout: float = 10.0):
     """安全入队: 超时保护, 队列满时等待而非死锁.
 
-    如果队列满, 等待 timeout 秒后仍无法入队, 记录警告并丢弃 (非毒丸).
-    毒丸 (item is None) 不会丢弃——必须入队以确保消费者退出.
+    如果队列满, 等待 timeout 秒后仍无法入队, 记录警告并继续等待。
+    评分候选与毒丸都不可静默丢弃，否则会伪造完整覆盖率。
     """
     try:
         await asyncio.wait_for(queue.put(item), timeout=timeout)
         if isinstance(item, dict) and "code" in item:
             logger.debug("[%s] dispatch %s to L3", label, item["code"])
     except asyncio.TimeoutError:
-        if item is None:
-            logger.warning("[%s] 毒丸入队超时, 重试...", label)
-            await queue.put(item)  # 毒丸必须入队, 无限等待
-        else:
-            code = item.get("code", str(item)) if isinstance(item, dict) else str(item)
-            logger.warning("[%s] 队列满 %.0fs, 丢弃 %s", label, timeout, code)
+        code = item.get("code", str(item)) if isinstance(item, dict) else str(item)
+        logger.warning("[%s] 队列满 %.0fs, 继续等待入队 %s", label, timeout, code)
+        await queue.put(item)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1557,6 +2080,11 @@ async def run_pool_update_v3(
     layer3_results: List[Dict] = []
     whitelist_final: List[Dict] = []
     blacklist_final: List[Dict] = []
+    layer1_invalid: List[Dict[str, Any]] = []
+    layer2_invalid: List[Dict[str, Any]] = []
+    layer3_invalid: List[Dict[str, Any]] = []
+    layer3_stage_failures: List[str] = []
+    layer2_stage_failures: List[str] = []
     layer3_lock = asyncio.Lock()
     layer3_queue_maxsize = max(200, target_size * 2)
     layer3_queue = asyncio.Queue(maxsize=layer3_queue_maxsize)
@@ -1571,29 +2099,21 @@ async def run_pool_update_v3(
     # Checkpoint: 每 5 分钟写一次 refined_pools.json, crash 时最多丢 5 分钟工作
     CHECKPOINT_INTERVAL = 300  # 5 分钟
     _last_checkpoint = time.time()
+    _checkpoint_token: Optional[str] = None
 
     def _write_checkpoint():
-        """中间 checkpoint: 把当前已完成的 L3 股票按 final_score 排序写入."""
+        """把当前显式有效的 L3 结果写入不可见 staging generation."""
+        nonlocal _checkpoint_token
         if not layer3_results:
             return
         sorted_results = sorted(layer3_results,
                                key=lambda r: r.get("final_score", 0),
                                reverse=True)
         pool_checkpoint = sorted_results[:target_size]
-        checkpoint_guard = pm.validate_pool_replacement(
-            term, pool_checkpoint, previous_snapshot=original_term_snapshot
-        )
-        if checkpoint_guard:
-            # 更新中的候选数不足安全下限时，保留旧池；避免中途故障把
-            # 一个完整的生产池替换成小规模 checkpoint。
-            logger.warning("[V3:%s] 跳过不安全 checkpoint: %s", term, checkpoint_guard)
-            return
-        pm.update_pool(term, pool_checkpoint)
-        pool_data = pm.pools.get(term, {})
-        pool_data["_checkpoint_in_progress"] = True
-        pool_data["_checkpoint_completed_count"] = len(layer3_results)
-        pm._save()
-        logger.info("[V3:%s] Checkpoint: %d/%d L3完成, 写入top-%d到精筛池",
+        previous_token = _checkpoint_token
+        _checkpoint_token = _stage_pool_checkpoint(pm, term, pool_checkpoint)
+        _discard_staged_checkpoint(pm, previous_token)
+        logger.info("[V3:%s] Checkpoint: %d/%d L3完成, top-%d仅写入staging",
                    term, len(layer3_results), target_size, len(pool_checkpoint))
 
     # D4: L3 配额控制
@@ -1610,7 +2130,7 @@ async def run_pool_update_v3(
             return 0.0
         return min(1.0, heap_slots / stream_heap.total)
     stream_heap = StreamingTopAlphaHeap(alpha_fn=alpha_fn, epsilon=3.0, stable_batches=3)
-    layer2_fallback = False  # 如果 DSV4Pro 失败, 用 Layer 1 兜底
+    layer2_fallback = False  # 兼容结果字段；故障不再伪装成中性分
 
     # Layer 3 消费者
     _stage("3_start", "启动 Layer 3 消费者 (2并发, 15min超时)...")
@@ -1618,6 +2138,7 @@ async def run_pool_update_v3(
     l3_task = asyncio.create_task(
         _layer3_consumer(
             layer3_queue, layer3_results, whitelist_final, blacklist_final,
+            layer3_invalid, layer3_stage_failures,
             layer3_lock, term, progress=progress,
             heartbeat_interval=30.0, per_task_timeout=900.0,
         )
@@ -1653,6 +2174,19 @@ async def run_pool_update_v3(
         new_recommended = []
         for stock in batch:
             code = stock.get("code", "")
+            if stock.get("_score_validity") != "valid":
+                layer1_invalid.append(_invalid_score_record(
+                    stock,
+                    "layer1",
+                    str(stock.get("_score_error_type") or "invalid_layer1_score"),
+                    str(stock.get("_score_error_message") or "Layer 1 打分无有效结论"),
+                    validity=str(stock.get("_score_validity") or "invalid"),
+                    coverage=float(stock.get("_score_coverage") or 0.0),
+                    missing_core_fields=list(
+                        stock.get("_score_missing_core_fields") or ["level"]
+                    ),
+                ))
+                continue
             # 累积 L1 raw data (供 Layer 2 复用, 避免冗余 fetch)
             raw_data = stock.pop("_raw_data", None)
             if raw_data and code:
@@ -1691,28 +2225,42 @@ async def run_pool_update_v3(
                     layer2_scored = await score_layer2_batch(
                         chunk, term, pre_fetched_data=raw_map_snapshot,
                     )
+                    valid_in_chunk = 0
                     for s in layer2_scored:
-                        numeric = s.get("score", 50)
-                        if isinstance(numeric, (int, float)):
+                        if s.get("validity") == "valid":
+                            numeric = s["score"]
+                            valid_in_chunk += 1
                             code = s.get("code", "")
                             recommended_score_map[code] = float(numeric)
                             stock = code_to_stock.get(code)
                             if stock:
                                 stock["layer2_score"] = float(numeric)
                                 stream_heap.feed(float(numeric), stock)
+                        else:
+                            stock = code_to_stock.get(s.get("code", ""), s)
+                            layer2_invalid.append(_invalid_score_record(
+                                stock,
+                                "layer2_ranking",
+                                str(s.get("error_type") or "invalid_layer2_score"),
+                                str(s.get("error_message") or "Layer 2 排序无有效结论"),
+                                validity=str(s.get("validity") or "invalid"),
+                                coverage=float(s.get("coverage") or 0.0),
+                                missing_core_fields=list(
+                                    s.get("missing_core_fields") or ["score"]
+                                ),
+                            ))
+                    if chunk and valid_in_chunk == 0:
+                        layer2_stage_failures.append(
+                            f"Layer 2 chunk({len(chunk)}只)没有任何有效分数"
+                        )
                     stream_heap.batch_done()
                 except Exception as e:
-                    logger.warning("Layer 2 DSV4Pro 失败, 启用 Layer 1 兜底排序: %s", e)
-                    layer2_fallback = True
-                    # Layer 1 兜底: 用 confidence 近似分数
-                    conf_map = {"高": 80, "中": 50, "低": 30}
+                    logger.error("Layer 2 DSV4Pro 阶段失败，不生成替代分数: %s", e)
+                    layer2_stage_failures.append(str(e))
                     for stock in chunk:
-                        code = stock.get("code", "")
-                        conf = stock.get("layer1_confidence", "中")
-                        fallback_score = conf_map.get(conf, 50)
-                        recommended_score_map[code] = fallback_score
-                        stock["layer2_score"] = fallback_score
-                        stream_heap.feed(fallback_score, stock)
+                        layer2_invalid.append(_invalid_score_record(
+                            stock, "layer2_ranking", type(e).__name__, str(e)
+                        ))
                     stream_heap.batch_done()
 
                 # τ 稳定 → dispatch
@@ -1793,14 +2341,48 @@ async def run_pool_update_v3(
         pass
 
     if l3_timed_out:
-        pm.restore_term_snapshot(term, original_term_snapshot)
-        message = "Layer 3 超时，已恢复更新前的精筛池，未用不完整结果覆盖"
+        _discard_staged_checkpoint(pm, _checkpoint_token)
+        message = "Layer 3 超时，已保留更新前的精筛池，未用不完整结果覆盖"
         _stage("failed", message)
         return {
             "term": term,
             "error": "layer3_timeout",
             "message": message,
             "stats": {"partial_scored": len(layer3_results)},
+        }
+
+    if layer2_stage_failures:
+        _discard_staged_checkpoint(pm, _checkpoint_token)
+        message = "；".join(layer2_stage_failures[:3])
+        _stage("failed", f"Layer 2 阶段失败，保留上一代精筛池：{message}")
+        return {
+            "term": term,
+            "error": "layer2_stage_failed",
+            "message": message,
+            "invalid_results": layer1_invalid + layer2_invalid + layer3_invalid,
+            "stats": {
+                "layer1_invalid": len(layer1_invalid),
+                "layer2_invalid": len(layer2_invalid),
+                "layer3_invalid": len(layer3_invalid),
+                "valid_scored": len(layer3_results),
+            },
+        }
+
+    if layer3_stage_failures:
+        _discard_staged_checkpoint(pm, _checkpoint_token)
+        message = "；".join(layer3_stage_failures[:3])
+        _stage("failed", f"Layer 3 评分契约错误，保留上一代精筛池：{message}")
+        return {
+            "term": term,
+            "error": "layer3_schema_failed",
+            "message": message,
+            "invalid_results": layer1_invalid + layer2_invalid + layer3_invalid,
+            "stats": {
+                "layer1_invalid": len(layer1_invalid),
+                "layer2_invalid": len(layer2_invalid),
+                "layer3_invalid": len(layer3_invalid),
+                "valid_scored": len(layer3_results),
+            },
         }
 
     # ── 截断到 target_size (排除黑名单) ──
@@ -1839,6 +2421,10 @@ async def run_pool_update_v3(
             "name": s.get("name", ""),
             "final_score": s.get("final_score", 0),
             "recommendation": s.get("recommendation", ""),
+            "validity": "valid",
+            "coverage": s.get("coverage", 0.0),
+            "missing_core_fields": [],
+            "scored_at": s.get("scored_at", ""),
         }
         for s in scored_filtered
         if s.get("code", "") not in pool_codes
@@ -1855,6 +2441,10 @@ async def run_pool_update_v3(
         "pool_size": len(pool_final),
         "reserve_size": len(reserve_candidates),
         "layer2_fallback": layer2_fallback,
+        "layer1_invalid": len(layer1_invalid),
+        "layer2_invalid": len(layer2_invalid),
+        "layer3_invalid": len(layer3_invalid),
+        "invalid_results": layer1_invalid + layer2_invalid + layer3_invalid,
         "elapsed_s": round(progress.elapsed_seconds),
         "score_range": {
             "min": min((s.get("final_score", 0) for s in layer3_results), default=0),
@@ -1862,11 +2452,11 @@ async def run_pool_update_v3(
         },
     }
 
-    guard_reason = pm.validate_pool_replacement(
+    guard_reason = _pool_capacity_failure(term, len(pool_final)) or pm.validate_pool_replacement(
         term, pool_final, previous_snapshot=original_term_snapshot
     )
     if guard_reason:
-        pm.restore_term_snapshot(term, original_term_snapshot)
+        _discard_staged_checkpoint(pm, _checkpoint_token)
         logger.error("[V3:%s] %s", term, guard_reason)
         _stage("failed", guard_reason)
         return {
@@ -1876,24 +2466,27 @@ async def run_pool_update_v3(
             "stats": stats,
         }
 
-    # ── 持久化 ──
-    pm.clean_expired_blacklist()
-    # 最终写入前清除 checkpoint 标记
-    pool_data = pm.pools.get(term, {})
-    pool_data.pop("_checkpoint_in_progress", None)
-    pool_data.pop("_checkpoint_completed_count", None)
-    pm.update_pool(term, pool_final)
-    # 候补名单随精筛池一并写入
-    pm.save_reserve(term, reserve_candidates)
-
+    # ── 持久化: 精筛池+候补+黑名单一次 CAS 原子发布 ──
     all_blacklist = blacklist + blacklist_final
-    for b in all_blacklist:
-        code = b.get("code", "")
-        if code and not pm.is_blacklisted(code, term):
-            pm.add_to_blacklist(
-                code, term,
-                b.get("layer1_reason", b.get("recommendation", "批量粗筛判定")),
-            )
+    try:
+        _publish_pool_generation(
+            pm,
+            term,
+            pool_final,
+            reserve=reserve_candidates,
+            blacklist_additions=all_blacklist,
+        )
+    except Exception as exc:
+        _discard_staged_checkpoint(pm, _checkpoint_token)
+        logger.error("[V3:%s] 精筛池原子发布失败: %s", term, exc)
+        _stage("failed", f"原子发布失败，保留上一代精筛池：{exc}")
+        return {
+            "term": term,
+            "error": "pool_publish_failed",
+            "message": str(exc),
+            "stats": stats,
+        }
+    _discard_staged_checkpoint(pm, _checkpoint_token)
 
     result["pool"] = pool_final
     result["whitelist"] = whitelist_final
@@ -2008,6 +2601,8 @@ async def run_pool_update_partial(
     sem = asyncio.Semaphore(2)
     rescore_lock = asyncio.Lock()
     rescored: List[Dict[str, Any]] = []
+    invalid_results: List[Dict[str, Any]] = []
+    stage_failures: List[str] = []
     completed = 0
 
     async def _rescore_one(candidate: Dict[str, Any]):
@@ -2021,27 +2616,69 @@ async def run_pool_update_partial(
                     shared_engine.score_stock(code, name),
                     timeout=900.0,
                 )
-            if result_data and result_data.get("score_data"):
+            if (
+                result_data
+                and not result_data.get("error")
+                and result_data.get("score_data")
+            ):
                 sd = result_data["score_data"]
-                term_key = {"short": "short_term_score", "medium": "medium_term_score",
-                           "long": "long_term_score"}[term]
-                ts = sd.get(term_key, {})
-                actual_score = ts.get("score") if isinstance(ts, dict) else sd.get("score", 50)
-                if actual_score is None:
-                    actual_score = sd.get("score", 50)
-                rec = sd.get("recommendation", "")
-                entry = {**candidate, "final_score": actual_score, "recommendation": rec}
+                assessment, contract = _assess_fresh_term_score(
+                    sd, result_data.get("signal_packs", {}), term
+                )
+                if assessment.usable:
+                    entry = {
+                        **candidate,
+                        "final_score": assessment.require_valid(),
+                        "recommendation": _score_recommendation(contract, sd),
+                        "validity": "valid",
+                        "coverage": assessment.coverage,
+                        "missing_core_fields": [],
+                        "scored_at": datetime.now().isoformat(),
+                    }
+                else:
+                    entry = None
+                    invalid = _invalid_score_record(
+                        candidate,
+                        "partial_rescore",
+                        assessment.error_type or "unusable_partial_score",
+                        assessment.error_message or "候补复评分未产生可用结论",
+                        validity=assessment.validity.value,
+                        coverage=assessment.coverage,
+                        missing_core_fields=list(assessment.missing_core_fields),
+                    )
             else:
-                entry = {**candidate, "final_score": candidate.get("final_score", 50)}
+                entry = None
+                invalid = _invalid_score_record(
+                    candidate,
+                    "partial_rescore",
+                    "partial_scoring_failed",
+                    str((result_data or {}).get("error") or "候补复评分未返回 score_data"),
+                )
         except asyncio.TimeoutError:
             logger.error("[PartialUpdate] %s L3超时 (>900s)", code)
-            entry = {**candidate, "final_score": 40, "recommendation": "超时"}
+            entry = None
+            invalid = _invalid_score_record(
+                candidate, "partial_rescore", "partial_scoring_timeout", "候补复评分超时"
+            )
+        except ScoreAssessmentSchemaError as exc:
+            logger.error("[PartialUpdate] %s 评分契约错误: %s", code, exc)
+            stage_failures.append(f"{code}: {exc}")
+            entry = None
+            invalid = _invalid_score_record(
+                candidate, "partial_rescore", "score_schema_error", str(exc)
+            )
         except Exception as e:
             logger.error("[PartialUpdate] %s L3失败 (%s): %s", code, type(e).__name__, e)
-            entry = {**candidate, "final_score": 40, "recommendation": ""}
+            entry = None
+            invalid = _invalid_score_record(
+                candidate, "partial_rescore", type(e).__name__, str(e)
+            )
 
         async with rescore_lock:
-            rescored.append(entry)
+            if entry is not None:
+                rescored.append(entry)
+            else:
+                invalid_results.append(invalid)
             completed += 1
             if on_progress:
                 pct = 10.0 + 80.0 * (completed / max(len(candidates), 1))
@@ -2053,9 +2690,39 @@ async def run_pool_update_partial(
 
     _stage("3_done", f"L3打分完成: {len(rescored)}只")
 
+    if stage_failures:
+        message = "；".join(stage_failures[:3])
+        _stage("failed", f"候补复评分契约错误，保留上一代精筛池：{message}")
+        return {
+            "term": term,
+            "mode": "partial",
+            "error": "partial_score_schema_failed",
+            "message": message,
+            "invalid_results": invalid_results,
+        }
+
     # ── Step 4: 取 top N 替换底部 ──
     _stage("4_merge", "合并新旧池...")
     rescored.sort(key=lambda s: s.get("final_score", 0), reverse=True)
+    if len(rescored) < replace_count:
+        message = (
+            f"候补显式有效复评分仅{len(rescored)}只，不足替换所需{replace_count}只；"
+            "保留上一代精筛池"
+        )
+        logger.error("[PartialUpdate:%s] %s", term, message)
+        _stage("failed", message)
+        return {
+            "term": term,
+            "mode": "partial",
+            "error": "insufficient_valid_candidates",
+            "message": message,
+            "invalid_results": invalid_results,
+            "stats": {
+                "valid_rescored": len(rescored),
+                "invalid_rescored": len(invalid_results),
+                "requested": replace_count,
+            },
+        }
     new_stocks = rescored[:replace_count]
 
     prospective_pool = [
@@ -2065,19 +2732,30 @@ async def run_pool_update_partial(
     guard_reason = pm.validate_pool_replacement(
         term, prospective_pool, previous_snapshot=original_term_snapshot
     )
-    if guard_reason:
-        pm.restore_term_snapshot(term, original_term_snapshot)
-        logger.error("[PartialUpdate:%s] %s", term, guard_reason)
-        _stage("failed", guard_reason)
+    added_codes = {stock.get("code", "") for stock in new_stocks}
+    next_reserve = [
+        stock for stock in reserve if stock.get("code", "") not in added_codes
+    ]
+    try:
+        _publish_pool_generation(
+            pm, term, prospective_pool, reserve=next_reserve
+        )
+    except Exception as exc:
+        logger.error("[PartialUpdate:%s] 原子发布失败: %s", term, exc)
+        _stage("failed", f"原子发布失败，保留上一代精筛池：{exc}")
         return {
             "term": term,
             "mode": "partial",
-            "error": "pool_result_guard",
-            "message": guard_reason,
-            "stats": {"rescored": len(rescored), "requested": replace_count},
+            "error": "pool_publish_failed",
+            "message": str(exc),
+            "invalid_results": invalid_results,
         }
-
-    stats = pm.update_pool_partial(term, new_stocks, removed_codes)
+    stats = {
+        "kept": len(prospective_pool) - len(new_stocks),
+        "added": len(new_stocks),
+        "removed": len(removed_codes),
+        "new_pool_size": len(prospective_pool),
+    }
 
     if on_progress:
         on_progress({"overall_pct": 100.0, "stage": "done"})
@@ -2088,6 +2766,8 @@ async def run_pool_update_partial(
     result["stats"] = {
         **stats,
         "candidates_rescored": len(rescored),
+        "invalid_rescored": len(invalid_results),
+        "invalid_results": invalid_results,
         "elapsed_s": 0,
     }
     result["final_pool_size"] = stats["new_pool_size"]
@@ -2157,7 +2837,13 @@ async def run_pool_update(
 
     # ── Layer 2: Quick Screen ──
     _stage("2_quick_screen", f"用M2快筛初筛池{len(layer1['initial_pool'])}只...")
-    initial_passing = await quick_screen_layer2(layer1["initial_pool"], term, on_progress=on_progress)
+    layer2_invalid: List[Dict[str, Any]] = []
+    initial_passing = await quick_screen_layer2(
+        layer1["initial_pool"],
+        term,
+        on_progress=on_progress,
+        invalid_results=layer2_invalid,
+    )
     result["stages"]["2_quick_screen"] = f"快筛通过{len(initial_passing)}只"
 
     # ── Layer 3: Formal Scoring ──
@@ -2170,11 +2856,10 @@ async def run_pool_update(
         on_progress=on_progress,
     )
 
-    guard_reason = pm.validate_pool_replacement(
+    guard_reason = _pool_capacity_failure(term, len(layer3.get("pool", []))) or pm.validate_pool_replacement(
         term, layer3.get("pool", []), previous_snapshot=original_term_snapshot
     )
     if guard_reason:
-        pm.restore_term_snapshot(term, original_term_snapshot)
         logger.error("[PoolUpdate:%s] %s", term, guard_reason)
         _stage("failed", guard_reason)
         return {
@@ -2184,20 +2869,40 @@ async def run_pool_update(
             "stats": layer3.get("stats", {}),
         }
 
-    # ── Store ──
-    # 清理过期黑名单后存储
-    pm.clean_expired_blacklist()
-    pm.update_pool(term, layer3["pool"])
-
-    # 黑名单入库 (Layer1 + Layer3)
+    # ── Store: 三期限池+候补+黑名单一次 CAS 原子发布 ──
+    pool_codes = {stock.get("code", "") for stock in layer3["pool"]}
+    reserve = [
+        {
+            "code": stock.get("code", ""),
+            "name": stock.get("name", ""),
+            "final_score": stock["final_score"],
+            "recommendation": stock.get("recommendation", ""),
+            "validity": "valid",
+            "coverage": stock.get("coverage", 0.0),
+            "missing_core_fields": [],
+            "scored_at": stock.get("scored_at", ""),
+        }
+        for stock in layer3.get("ranked_candidates", [])
+        if stock.get("code", "") not in pool_codes
+    ][: target_size // 2]
     all_blacklist = layer1["blacklist"] + layer3.get("blacklist", [])
-    for b in all_blacklist:
-        code = b.get("code", "")
-        if code and not pm.is_blacklisted(code, term):
-            pm.add_to_blacklist(
-                code, term,
-                b.get("layer1_reason", b.get("recommendation", "批量粗筛判定")),
-            )
+    try:
+        _publish_pool_generation(
+            pm,
+            term,
+            layer3["pool"],
+            reserve=reserve,
+            blacklist_additions=all_blacklist,
+        )
+    except Exception as exc:
+        logger.error("[PoolUpdate:%s] 精筛池原子发布失败: %s", term, exc)
+        _stage("failed", f"原子发布失败，保留上一代精筛池：{exc}")
+        return {
+            "term": term,
+            "error": "pool_publish_failed",
+            "message": str(exc),
+            "stats": layer3.get("stats", {}),
+        }
 
     result["stages"]["3_formal_score"] = (
         f"精筛池{len(layer3['pool'])}只, "
@@ -2207,7 +2912,17 @@ async def run_pool_update(
     result["pool"] = layer3["pool"]
     result["whitelist"] = layer3["whitelist"]
     result["blacklist"] = layer3["blacklist"]
-    result["stats"] = layer3["stats"]
+    result["stats"] = {
+        **layer3["stats"],
+        "layer1_invalid": len(layer1.get("invalid", [])),
+        "layer2_invalid": len(layer2_invalid),
+        "invalid_results": (
+            layer1.get("invalid", [])
+            + layer2_invalid
+            + layer3.get("invalid", [])
+        ),
+        "reserve_size": len(reserve),
+    }
     result["final_pool_size"] = len(layer3["pool"])
 
     _stage("done",

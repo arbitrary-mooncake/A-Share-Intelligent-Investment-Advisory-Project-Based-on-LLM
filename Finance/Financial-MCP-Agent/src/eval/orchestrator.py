@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 from src.eval.database import init_db, generate_id
 from src.eval.repositories import (
     create_batch, update_batch_status, get_latest_batch,
-    create_snapshot, get_snapshots_by_batch
+    get_snapshots_by_batch
 )
-from src.eval.schemas import EvalBatch, PredictionSnapshot
+from src.eval.schemas import EvalBatch
 from src.eval.line_manager import LineManager, ABLATION_AGENTS
 from src.eval.pool_manager import PoolManager
 from src.eval.market_simulator import MarketSimulator, MarketData, Order as SimOrder
@@ -30,13 +30,6 @@ _EVAL_CONFIG_DIR = os.path.join(
     "config", "eval"
 )
 _LAST_SETTLED_PATH = os.path.join(_EVAL_CONFIG_DIR, "last_settled.json")
-
-# 补回时可用的分析Agent（news/event不可靠补回）
-_CATCHUP_BACKFILLABLE_AGENTS = [
-    "fundamental", "technical", "value", "quality_risk", "moneyflow"
-]
-_CATCHUP_DISABLED_AGENTS = ["news", "event"]
-
 
 class EvalOrchestrator:
     """评测编排器 — 管理完整的检查-结算-评分-调仓循环"""
@@ -457,64 +450,24 @@ class EvalOrchestrator:
     def _save_catchup_snapshots(self, date_str: str,
                                  rebalance_results: Dict[str, Any]):
         """
-        为补回日保存各线持仓快照。
+        补回流程不生成预测快照。
 
-        遍历所有成功调仓的线，为每条线的每个持仓创建PredictionSnapshot。
-        news/event的signal_pack标记为pit_mode='partial'。
+        历史补回目前没有逐股、逐期限的真实 ``DecisionPack`` 可供持久化。
+        旧实现用空 signal pack + ``hold/50`` 伪造预测，这会把数据故障统计成
+        中性投资结论。调仓和结算仍可完成，但预测覆盖率必须如实保留为空。
         """
-        for term, term_result in rebalance_results.items():
-            if term_result.get("status") == "skipped":
-                continue
-            for line_id, line_result in term_result.get("lines", {}).items():
-                if line_result.get("status") != "success":
-                    continue
-                line = self.line_manager.get_line(line_id)
-                if not line:
-                    continue
-                for stock_code, shares in line.holdings.items():
-                    if shares <= 0:
-                        continue
-                    # 构建signal_pack_bundle：5个可补回+2个partial
-                    signal_bundle = {}
-                    for agent in _CATCHUP_BACKFILLABLE_AGENTS:
-                        signal_bundle[agent] = {
-                            "agent_name": agent,
-                            "stock_code": stock_code,
-                            "as_of_date": date_str,
-                            "pit_mode": "backfill",
-                            "bias": "neutral",
-                            "confidence": 0.5,
-                            "data_quality_score": 0.6,
-                            "signals": [],
-                            "risk_flags": [],
-                            "notes": "Catch-up backfill via Tushare historical data"
-                        }
-                    for agent in _CATCHUP_DISABLED_AGENTS:
-                        signal_bundle[agent] = self._build_partial_signal_pack(
-                            agent, stock_code, date_str
-                        )
-
-                    snap = PredictionSnapshot(
-                        batch_id=self.current_batch_id,
-                        line_id=line_id,
-                        symbol=stock_code,
-                        name="",
-                        term=term,
-                        as_of_date=date_str,
-                        pit_mode="partial",  # 补回模式（news/event缺失）
-                        action="hold",
-                        score=50.0,
-                        signal_pack_bundle_json=json.dumps(
-                            signal_bundle, ensure_ascii=False, default=str
-                        ),
-                    )
-                    try:
-                        create_snapshot(snap)
-                    except Exception:
-                        logger.warning(
-                            "保存补回快照失败: %s %s %s",
-                            date_str, line_id, stock_code, exc_info=True
-                        )
+        completed_lines = sum(
+            1
+            for term_result in rebalance_results.values()
+            for line_result in term_result.get("lines", {}).values()
+            if line_result.get("status") == "success"
+        )
+        if completed_lines:
+            logger.info(
+                "补回日 %s 完成 %d 条线路；因缺少有效逐股评分，不生成预测快照",
+                date_str,
+                completed_lines,
+            )
 
     def _get_or_create_strategy(self, line_id: str, term: str, strategy_type: str):
         """Get cached strategy instance or create new one. Preserves state across days."""
@@ -602,13 +555,16 @@ class EvalOrchestrator:
         for line in lines:
             all_holdings.update(code for code, shares in line.holdings.items() if shares > 0)
 
-        # 获取池内评分用于分级（优先缓存，缺失用默认分）
+        # 获取池内评分用于分级。缺失或未通过有效性/新鲜度门禁的评分不参与。
         pool_scores_for_tier = {}
         pool_data = self.pool_manager.get_pool_with_scores(term)
         for s in pool_data:
-            code = s.get("code", "") if isinstance(s, dict) else s
-            score = s.get("final_score", s.get("score", 50)) if isinstance(s, dict) else 50
-            pool_scores_for_tier[code] = score
+            if not isinstance(s, dict):
+                continue
+            code = s.get("code", "")
+            score = self._validated_pool_score(s, current_date)
+            if code and score is not None:
+                pool_scores_for_tier[code] = score
 
         # 计算每个股票的分析频率等级
         tiers = EvalOrchestrator._get_scoring_frequency_tier(
@@ -664,10 +620,10 @@ class EvalOrchestrator:
                 scores = await self._get_real_scores(
                     stocks_to_analyze, term, current_date, line_agents
                 )
-                # 补充非分析日股票的池内缓存评分
+                # 补充非分析日股票的、已通过 validity + freshness 门禁的池评分。
                 for code in pool:
-                    if code not in scores:
-                        scores[code] = pool_scores_for_tier.get(code, 50.0)
+                    if code not in scores and code in pool_scores_for_tier:
+                        scores[code] = pool_scores_for_tier[code]
 
                 # Gap #19: 记录每只股票的评分到 memory_manager（仅首次）
                 if not scores_recorded:
@@ -685,7 +641,8 @@ class EvalOrchestrator:
 
                 # 策略选股
                 select_kwargs = {
-                    "pool": pool,
+                    # 没有有效评分的候选不会以隐式 0/50 分进入选股逻辑。
+                    "pool": [code for code in pool if code in scores],
                     "scores": scores,
                     "holdings": line.holdings,
                     "cash": line.cash,
@@ -698,8 +655,12 @@ class EvalOrchestrator:
                 buy_orders = strategy.select_stocks(**select_kwargs)
 
                 # 策略卖出
+                scored_holdings = {
+                    code: shares for code, shares in line.holdings.items()
+                    if code in scores
+                }
                 sell_orders = strategy.generate_sell_orders(
-                    line.holdings, scores,
+                    scored_holdings, scores,
                     {code: market_data_map.get(code) for code in pool},
                     line.purchase_prices, line.hold_days
                 )
@@ -804,6 +765,10 @@ class EvalOrchestrator:
             read_cache, write_cache, read_signal_pack_cache, write_signal_pack_cache
         )
         from src.eval.adapters.stock_pipeline_adapter import run_stock_analysis
+        from src.eval.score_assessment import (
+            ScoreAssessmentSchemaError,
+            assess_score_payload,
+        )
         from src.stock_pool.scoring_engine import ScoringEngine
         import json
 
@@ -862,7 +827,7 @@ class EvalOrchestrator:
                                 analysis_texts = result.get("analysis_texts", {})
                                 for agent_name, _ in _ALL_AGENTS:
                                     sp = signal_packs.get(agent_name)
-                                    if sp and isinstance(sp, dict):
+                                    if self._is_cacheable_signal_pack(sp):
                                         write_signal_pack_cache(
                                             agent_name, code, as_of_date, sp
                                         )
@@ -890,7 +855,7 @@ class EvalOrchestrator:
                             analysis_texts = result.get("analysis_texts", {})
                             for agent_name, _ in _ALL_AGENTS:
                                 sp = signal_packs.get(agent_name)
-                                if sp and isinstance(sp, dict):
+                                if self._is_cacheable_signal_pack(sp):
                                     write_signal_pack_cache(
                                         agent_name, code, as_of_date, sp
                                     )
@@ -898,16 +863,35 @@ class EvalOrchestrator:
                                 if txt:
                                     write_cache(agent_name, code, as_of_date, txt)
 
-                            write_cache("full_analysis", code, as_of_date,
-                                       json.dumps(result, ensure_ascii=False, default=str))
+                            assessments = result.get("score_assessments", {})
+                            if assessments and all(
+                                isinstance(item, dict)
+                                and item.get("validity") == "valid"
+                                for item in assessments.values()
+                            ):
+                                write_cache(
+                                    "full_analysis",
+                                    code,
+                                    as_of_date,
+                                    json.dumps(result, ensure_ascii=False, default=str),
+                                )
 
                     # ── Step 5: 提取评分 ──
                     term_key = f"{term}_term_score"
                     term_score = result.get(term_key, {})
-                    if isinstance(term_score, dict):
-                        base_score = float(term_score.get("score", 50))
-                    else:
-                        base_score = 50.0
+                    assessment = assess_score_payload(
+                        term_score, core_fields=("score",), legacy_is_invalid=True
+                    )
+                    if not assessment.usable:
+                        logger.warning(
+                            "Ignoring unusable %s score for %s: %s (%s)",
+                            term,
+                            code,
+                            assessment.validity.value,
+                            assessment.error_type,
+                        )
+                        return (code, None)
+                    base_score = assessment.require_valid()
 
                     # ── Step 6: 消融线调整 ──
                     if ablated_agent and ablated_agent in ABLATION_AGENTS:
@@ -920,18 +904,14 @@ class EvalOrchestrator:
                         return (code, round(base_score, 2))
 
                 except Exception as e:
-                    logger.warning("Failed to get real score for %s: %s", code, str(e))
-                    if "Tushare" in str(e) or "token" in str(e).lower():
-                        raise RuntimeError(
-                            f"Tushare不可用且缓存中无 {code}@{as_of_date} 的数据，"
-                            f"无法继续。请检查Tushare配置或网络连接。错误: {e}"
-                        ) from e
-                    return (code, 50.0)
+                    logger.error("Failed to get real score for %s: %s", code, str(e), exc_info=True)
+                    raise
 
         results = await asyncio.gather(*[_score_one(c) for c in pool])
 
         for code, score_val in results:
-            scores[code] = score_val
+            if score_val is not None:
+                scores[code] = score_val
 
         return scores
 
@@ -952,6 +932,8 @@ class EvalOrchestrator:
         from src.eval.cache import read_cache, write_cache
         from src.utils.analysis_package_builder import build_analysis_package
         from src.utils.risk_gate import apply_risk_gate
+        from src.eval.adapters.stock_pipeline_adapter import _attach_runtime_score_contract
+        from src.eval.score_assessment import assess_score_payload
 
         # ── Step A: 检查scorer缓存（1天TTL） ──
         scorer_keys = ["short_term_scorer", "medium_term_scorer", "long_term_scorer"]
@@ -971,37 +953,67 @@ class EvalOrchestrator:
                 break
 
         if all_scorer_cached and len(cached_scores) == 3:
-            logger.debug("All scorer caches hit for %s @ %s, using cached scores",
-                        stock_code, as_of_date)
-            result = {
-                "stock_code": stock_code,
-                "as_of_date": as_of_date,
-                "signal_packs": signal_packs,
-                "analysis_texts": {},
-                "short_term_score": cached_scores["short_term_scorer"],
-                "medium_term_score": cached_scores["medium_term_scorer"],
-                "long_term_score": cached_scores["long_term_scorer"],
-                "_from_agent_cache": True,
-                "_scorer_cache_hit": True,
+            cache_assessments = {
+                scorer_name: assess_score_payload(
+                    payload, core_fields=("score",), legacy_is_invalid=True
+                )
+                for scorer_name, payload in cached_scores.items()
             }
-            # Apply risk gate on cached scores
-            state_data = {f"{a}_signal_pack": sp for a, sp in signal_packs.items()}
-            state_data["current_date"] = as_of_date
-            try:
-                pkg = build_analysis_package(state_data, as_of_date)
-                for term_label, scorer_name in [
-                    ("short", "short_term_scorer"),
-                    ("medium", "medium_term_scorer"),
-                    ("long", "long_term_scorer"),
-                ]:
-                    score_val = cached_scores[scorer_name].get("score", 50)
-                    gate = apply_risk_gate(pkg, term_label, score_val)
-                    if gate.score_cap is not None:
-                        cached_scores[scorer_name]["score"] = min(score_val, gate.score_cap)
+            if not all(a.usable for a in cache_assessments.values()):
+                logger.warning(
+                    "Scorer cache for %s @ %s predates the validity contract; recomputing scorers from agent caches",
+                    stock_code,
+                    as_of_date,
+                )
+                # Do not return a synthetic failure and do not fall back to the
+                # full agent pipeline.  The seven agent packs are fresh: bypass
+                # only the legacy scorer cache, recompute below, and overwrite
+                # those scorer cache entries with the new explicit contract.
+                all_scorer_cached = False
+                cached_scores = {}
+            else:
+                logger.debug("All scorer caches hit for %s @ %s, using cached scores",
+                            stock_code, as_of_date)
+                result = {
+                    "stock_code": stock_code,
+                    "as_of_date": as_of_date,
+                    "signal_packs": signal_packs,
+                    "analysis_texts": {},
+                    "short_term_score": cached_scores["short_term_scorer"],
+                    "medium_term_score": cached_scores["medium_term_scorer"],
+                    "long_term_score": cached_scores["long_term_scorer"],
+                    "_from_agent_cache": True,
+                    "_scorer_cache_hit": True,
+                }
+                # Apply risk gate on cached scores
+                state_data = {f"{a}_signal_pack": sp for a, sp in signal_packs.items()}
+                state_data["current_date"] = as_of_date
+                try:
+                    pkg = build_analysis_package(state_data, as_of_date)
+                    for term_label, scorer_name in [
+                        ("short", "short_term_scorer"),
+                        ("medium", "medium_term_scorer"),
+                        ("long", "long_term_scorer"),
+                    ]:
+                        score_val = cache_assessments[scorer_name].require_valid()
+                        gate = apply_risk_gate(pkg, term_label, score_val)
+                        if gate.score_cap is not None:
+                            cached_scores[scorer_name]["score"] = min(score_val, gate.score_cap)
+                        cached_scores[scorer_name]["risk_gate"] = {
+                            "risk_level": gate.risk_level,
+                            "risk_flags": gate.risk_flags_found,
+                            "score_cap": gate.score_cap,
+                            "abstain": gate.abstain,
+                            "data_quality_score": gate.data_quality_score,
+                        }
+                        cached_scores[scorer_name] = _attach_runtime_score_contract(
+                            cached_scores[scorer_name], signal_packs, term_label
+                        )
                         result[f"{term_label}_term_score"] = cached_scores[scorer_name]
-            except Exception as e:
-                logger.warning("Risk gate on cached scores failed for %s: %s", stock_code, e)
-            return result
+                except Exception as e:
+                    logger.error("Risk gate on cached scores failed for %s: %s", stock_code, e)
+                    raise
+                return result
 
         # ── Step B: scorer缓存未命中 → 恢复analysis texts, 直接调用scorer ──
         logger.info("Scorer cache miss for %s @ %s, calling scorers directly from agent caches",
@@ -1046,14 +1058,20 @@ class EvalOrchestrator:
                 current_date=as_of_date,
                 thinking_enabled=True,
             )
-            gate = apply_risk_gate(pkg, "short", short_result.get("score", 50))
-            if gate.score_cap is not None:
-                short_result["score"] = min(short_result["score"], gate.score_cap)
-            short_result["risk_gate"] = {
-                "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
-                "score_cap": gate.score_cap, "abstain": gate.abstain,
-                "data_quality_score": gate.data_quality_score,
-            }
+            short_result = _attach_runtime_score_contract(short_result, signal_packs, "short")
+            short_assessment = assess_score_payload(
+                short_result, core_fields=("score",), legacy_is_invalid=True
+            )
+            if short_assessment.usable:
+                gate = apply_risk_gate(pkg, "short", short_assessment.require_valid())
+                if gate.score_cap is not None:
+                    short_result["score"] = min(short_result["score"], gate.score_cap)
+                short_result["risk_gate"] = {
+                    "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
+                    "score_cap": gate.score_cap, "abstain": gate.abstain,
+                    "data_quality_score": gate.data_quality_score,
+                }
+                short_result = _attach_runtime_score_contract(short_result, signal_packs, "short")
 
             # Medium-term scorer (all 7 agents)
             medium_result = await medium_term_scorer(
@@ -1069,14 +1087,20 @@ class EvalOrchestrator:
                 current_date=as_of_date,
                 thinking_enabled=True,
             )
-            gate = apply_risk_gate(pkg, "medium", medium_result.get("score", 50))
-            if gate.score_cap is not None:
-                medium_result["score"] = min(medium_result["score"], gate.score_cap)
-            medium_result["risk_gate"] = {
-                "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
-                "score_cap": gate.score_cap, "abstain": gate.abstain,
-                "data_quality_score": gate.data_quality_score,
-            }
+            medium_result = _attach_runtime_score_contract(medium_result, signal_packs, "medium")
+            medium_assessment = assess_score_payload(
+                medium_result, core_fields=("score",), legacy_is_invalid=True
+            )
+            if medium_assessment.usable:
+                gate = apply_risk_gate(pkg, "medium", medium_assessment.require_valid())
+                if gate.score_cap is not None:
+                    medium_result["score"] = min(medium_result["score"], gate.score_cap)
+                medium_result["risk_gate"] = {
+                    "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
+                    "score_cap": gate.score_cap, "abstain": gate.abstain,
+                    "data_quality_score": gate.data_quality_score,
+                }
+                medium_result = _attach_runtime_score_contract(medium_result, signal_packs, "medium")
 
             # Long-term scorer (all 7 agents)
             long_result = await long_term_scorer(
@@ -1092,14 +1116,20 @@ class EvalOrchestrator:
                 current_date=as_of_date,
                 thinking_enabled=True,
             )
-            gate = apply_risk_gate(pkg, "long", long_result.get("score", 50))
-            if gate.score_cap is not None:
-                long_result["score"] = min(long_result["score"], gate.score_cap)
-            long_result["risk_gate"] = {
-                "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
-                "score_cap": gate.score_cap, "abstain": gate.abstain,
-                "data_quality_score": gate.data_quality_score,
-            }
+            long_result = _attach_runtime_score_contract(long_result, signal_packs, "long")
+            long_assessment = assess_score_payload(
+                long_result, core_fields=("score",), legacy_is_invalid=True
+            )
+            if long_assessment.usable:
+                gate = apply_risk_gate(pkg, "long", long_assessment.require_valid())
+                if gate.score_cap is not None:
+                    long_result["score"] = min(long_result["score"], gate.score_cap)
+                long_result["risk_gate"] = {
+                    "risk_level": gate.risk_level, "risk_flags": gate.risk_flags_found,
+                    "score_cap": gate.score_cap, "abstain": gate.abstain,
+                    "data_quality_score": gate.data_quality_score,
+                }
+                long_result = _attach_runtime_score_contract(long_result, signal_packs, "long")
 
             # 写scorer缓存（1天TTL）
             for scorer_name, scorer_result in [
@@ -1107,8 +1137,16 @@ class EvalOrchestrator:
                 ("medium_term_scorer", medium_result),
                 ("long_term_scorer", long_result),
             ]:
-                write_cache(scorer_name, stock_code, as_of_date,
-                           json.dumps(scorer_result, ensure_ascii=False, default=str))
+                assessment = assess_score_payload(
+                    scorer_result, core_fields=("score",), legacy_is_invalid=True
+                )
+                if assessment.usable:
+                    write_cache(
+                        scorer_name,
+                        stock_code,
+                        as_of_date,
+                        json.dumps(scorer_result, ensure_ascii=False, default=str),
+                    )
 
             logger.info("Scorers completed for %s from cached agents: short=%s medium=%s long=%s",
                        stock_code,
@@ -1127,6 +1165,10 @@ class EvalOrchestrator:
                 "_scorer_cache_hit": False,
             }
 
+        except ScoreAssessmentSchemaError:
+            # Parsed schema drift is a programming/producer contract defect and
+            # must be visible to the caller rather than flattened to invalid.
+            raise
         except Exception as e:
             logger.error("Failed to run scorers from cached signal_packs for %s: %s",
                         stock_code, e, exc_info=True)
@@ -1135,10 +1177,73 @@ class EvalOrchestrator:
                 "as_of_date": as_of_date,
                 "signal_packs": signal_packs,
                 "analysis_texts": analysis_texts,
-                f"{term}_term_score": {"score": 50.0, "_scorer_failed": True},
+                f"{term}_term_score": {
+                    "validity": "invalid",
+                    "coverage": 0.0,
+                    "missing_core_fields": ["score"],
+                    "missing_optional_fields": [],
+                    "error_type": "scorer_failed",
+                    "error_message": str(e),
+                    "_scorer_failed": True,
+                },
                 "_from_agent_cache": True,
                 "_scorer_failed": True,
             }
+
+    @staticmethod
+    def _is_cacheable_signal_pack(payload: Any) -> bool:
+        """Do not make explicit agent failures look fresh on the next run."""
+        return (
+            isinstance(payload, dict)
+            and bool(payload)
+            and not payload.get("error")
+            and str(payload.get("status", "")).lower()
+            not in {"error", "failed", "timeout", "invalid"}
+            and str(payload.get("validity", "valid")).lower()
+            not in {"invalid", "error", "failed"}
+        )
+
+    @staticmethod
+    def _validated_pool_score(payload: Dict[str, Any], current_date: str) -> Optional[float]:
+        """Return only an explicitly valid pool score with a recent timestamp."""
+        from src.eval.score_assessment import (
+            ScoreAssessmentSchemaError,
+            assess_score_payload,
+        )
+
+        normalized = dict(payload)
+        if "score" not in normalized and "final_score" in normalized:
+            normalized["score"] = normalized["final_score"]
+        try:
+            assessment = assess_score_payload(
+                normalized, core_fields=("score",), legacy_is_invalid=True
+            )
+        except ScoreAssessmentSchemaError as exc:
+            logger.error(
+                "Pool score schema drift for %s: %s", payload.get("code", ""), exc
+            )
+            return None
+        if not assessment.usable:
+            return None
+
+        timestamp = (
+            payload.get("scored_at")
+            or payload.get("score_as_of")
+            or payload.get("as_of_date")
+        )
+        if not isinstance(timestamp, str) or not timestamp.strip():
+            return None
+        try:
+            scored_at = datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00"))
+            current = datetime.strptime(current_date, "%Y-%m-%d")
+            if scored_at.tzinfo is not None:
+                scored_at = scored_at.replace(tzinfo=None)
+            age_days = (current.date() - scored_at.date()).days
+        except (TypeError, ValueError):
+            return None
+        if age_days < 0 or age_days > 7:
+            return None
+        return assessment.require_valid()
 
     @staticmethod
     def _get_scoring_frequency_tier(pool_scores: Dict[str, float],
@@ -1532,13 +1637,19 @@ class EvalOrchestrator:
                 pool_stocks = self.pool_manager.get_pool_with_scores(term)
                 pool_size = len(pool_stocks)
 
-                # 计算 low_score_pct
-                low_score_count = sum(
-                    1 for s in pool_stocks
-                    if (isinstance(s, dict)
-                        and s.get("final_score", s.get("score", 50)) < 50)
+                # 仅以显式 valid 且新鲜的评分计算低分比例；无效评分不是50分。
+                valid_pool_scores = [
+                    score
+                    for stock in pool_stocks
+                    if isinstance(stock, dict)
+                    for score in [self._validated_pool_score(stock, current_date)]
+                    if score is not None
+                ]
+                low_score_count = sum(score < 50 for score in valid_pool_scores)
+                low_score_pct = (
+                    low_score_count / len(valid_pool_scores) * 100
+                    if valid_pool_scores else 0.0
                 )
-                low_score_pct = (low_score_count / max(pool_size, 1)) * 100
 
                 # 计算 not_held_pct（从各线路持仓聚合）
                 pool_codes = [

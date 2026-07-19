@@ -1,12 +1,13 @@
 """
 精筛池管理器 — 管理短/中/长线三个精筛股票池的创建、更新、查询。
 """
-import json
 import logging
 import os
 from copy import deepcopy
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+
+from src.eval.refined_pool_repository import RefinedPoolRepository
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +35,18 @@ class PoolManager:
     """精筛池管理器"""
 
     def __init__(self):
-        os.makedirs(POOL_DIR, exist_ok=True)
+        # Resolve the repository from POOL_FILE at construction time so tests and
+        # deployments can continue monkeypatching/redirecting the legacy path.
+        os.makedirs(os.path.dirname(POOL_FILE) or POOL_DIR, exist_ok=True)
+        self.repository = RefinedPoolRepository(POOL_FILE)
+        self._generation = 0
         self.pools = self._load()
 
     def _load(self) -> Dict[str, Any]:
         if os.path.exists(POOL_FILE):
             try:
-                with open(POOL_FILE, "r", encoding="utf-8-sig") as f:
-                    data = json.load(f)
+                data = self.repository.read()
+                self._generation = self.repository.generation(data)
                 self._migrate_blacklist(data)
                 return data
             except Exception as e:
@@ -88,8 +93,10 @@ class PoolManager:
 
     def _save(self):
         self.pools["updated_at"] = datetime.now().isoformat()
-        with open(POOL_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.pools, f, ensure_ascii=False, indent=2)
+        self.pools = self.repository.publish(
+            self.pools, expected_generation=self._generation
+        )
+        self._generation = self.repository.generation(self.pools)
 
     def get_pool(self, term: str) -> List[str]:
         """获取精筛池股票列表"""

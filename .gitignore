@@ -52,12 +52,14 @@ fund_pool.json
 .claude/
 .superpowers/
 CLAUDE.md
+.slim/deepwork/
 
 # ─── 已完成的过程性文件 ──────────────────────────────────
 已经完成的过程性文件/
 
 # ─── 开发计划文档（不纳入版本控制）─────────────────────────
 两版本开发计划蓝图.md
+终极优化策略.md
 docs/superpowers/
 Finance/Financial-MCP-Agent/docs/superpowers/
 Finance/Financial-MCP-Agent/src/BLUEPRINT.md
@@ -79,4 +81,3 @@ Thumbs.db
 
 # ─── 开发用临时脚本(本地保留,不纳入版本控制)────────────────
 Finance/Financial-MCP-Agent/test_extraction.py
-

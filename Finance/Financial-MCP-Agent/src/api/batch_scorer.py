@@ -1016,51 +1016,89 @@ def parse_batch_response(response_text: str, custom_levels: list = None) -> list
     Returns:
         [{code, level, confidence, reason, risk, ...}, ...]
     """
-    if not response_text or not response_text.strip():
+    if not isinstance(response_text, str):
+        raise BatchResponseSchemaError("LLM response must be text")
+    if not response_text.strip():
         return []
+    if custom_levels is not None and (
+        not isinstance(custom_levels, list)
+        or not custom_levels
+        or any(not isinstance(level, str) or not level for level in custom_levels)
+    ):
+        raise BatchResponseSchemaError("custom_levels must be a non-empty string list")
 
-    # 提取 JSON 数组 (使用平衡括号匹配避免贪婪捕获)
+    # Parse once as returned.  On a syntax failure, perform exactly one
+    # deterministic repair: extract the outermost JSON array and parse it once.
+    # Do not progressively truncate until something happens to parse.
     text = response_text.strip()
-    start = text.find('[')
-    if start == -1:
-        return []
-
-    # 从末尾向前尝试不同截断点，找到有效 JSON 数组
-    raw = None
-    for end in range(len(text), start, -1):
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as original_error:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start < 0 or end <= start:
+            raise BatchResponseSyntaxError(
+                f"LLM response is not a JSON array: {original_error.msg}"
+            ) from original_error
+        repaired = text[start:end + 1]
+        if repaired == text:
+            raise BatchResponseSyntaxError(
+                f"LLM response is malformed JSON: {original_error.msg}"
+            ) from original_error
         try:
-            candidate = text[start:end]
-            parsed = json.loads(candidate)
-            if isinstance(parsed, list):
-                raw = parsed
-                break
-        except json.JSONDecodeError:
-            continue
-    if raw is None:
-        return []
+            raw = json.loads(repaired)
+        except json.JSONDecodeError as repair_error:
+            raise BatchResponseSyntaxError(
+                f"single deterministic JSON repair failed: {repair_error.msg}"
+            ) from repair_error
 
     if not isinstance(raw, list):
-        return []
+        raise BatchResponseSchemaError("LLM response root must be a JSON array")
 
     results = []
     for item in raw:
         if not isinstance(item, dict):
-            continue
-        code = item.get("code", "").strip()
+            raise BatchResponseSchemaError("each LLM response item must be an object")
+        code_value = item.get("code", "")
+        if not isinstance(code_value, str):
+            raise BatchResponseSchemaError("response item code must be a string")
+        code = code_value.strip()
         if not code or not VALID_CODES.match(code):
             continue
 
-        level = item.get("level", "中性").strip()
+        level_value = item.get("level")
+        level = level_value.strip() if isinstance(level_value, str) else ""
         _valid_levels = custom_levels if custom_levels is not None else LEVELS
         if level not in _valid_levels:
-            level = _valid_levels[-2] if len(_valid_levels) >= 2 else "中性"  # default to second-to-last (观望/回避)
+            results.append({
+                "code": code,
+                "level": None,
+                "confidence": None,
+                "reason": "LLM返回的评级缺失或不符合评分契约",
+                "risk": "",
+                "validity": "invalid",
+                "coverage": 0.0,
+                "missing_core_fields": ["level"],
+                "missing_optional_fields": [],
+                "error_code": "invalid_level",
+            })
+            continue
 
-        confidence = item.get("confidence", "中").strip()
+        confidence_value = item.get("confidence", "中")
+        if not isinstance(confidence_value, str):
+            raise BatchResponseSchemaError("response item confidence must be a string")
+        confidence = confidence_value.strip()
         if confidence not in ("高", "中", "低"):
-            confidence = "中"
+            raise BatchResponseSchemaError(
+                "response item confidence must be 高/中/低"
+            )
 
-        reason = item.get("reason", "").strip()
-        risk = item.get("risk", "").strip()
+        reason_value = item.get("reason", "")
+        risk_value = item.get("risk", "")
+        if not isinstance(reason_value, str) or not isinstance(risk_value, str):
+            raise BatchResponseSchemaError("response item reason/risk must be strings")
+        reason = reason_value.strip()
+        risk = risk_value.strip()
 
         results.append({
             "code": code,
@@ -1068,9 +1106,95 @@ def parse_batch_response(response_text: str, custom_levels: list = None) -> list
             "confidence": confidence,
             "reason": reason[:150],
             "risk": risk[:150],
+            "validity": "valid",
+            "coverage": 1.0,
+            "missing_core_fields": [],
+            "missing_optional_fields": [],
         })
 
     return results
+
+
+class BatchResponseError(ValueError):
+    """Base error for the batch-LLM output boundary."""
+
+
+class BatchResponseSyntaxError(BatchResponseError):
+    """The single deterministic JSON repair could not recover the output."""
+
+
+class BatchResponseSchemaError(BatchResponseError):
+    """Parsed output violates the declared response schema."""
+
+
+def _is_known_provider_failure(error: Exception) -> bool:
+    """Classify only recognizable transport/provider failures as invalid data."""
+    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+        return True
+    module = type(error).__module__.lower()
+    if module.startswith(("httpx", "httpcore", "openai")):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        "provider unavailable",
+        "service unavailable",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "rate limit",
+        "too many requests",
+        "upstream timeout",
+        "gateway timeout",
+        "api unavailable",
+    ))
+
+
+def _batch_core_data_gaps(data: Any, horizon: str) -> List[str]:
+    """Return missing evidence domains that make an LLM score non-actionable."""
+    if not isinstance(data, dict) or data.get("error"):
+        return ["market_data", "financial_data"]
+
+    price_changes = data.get("price_changes")
+    has_market = any(
+        data.get(key) not in (None, "", [], {})
+        for key in ("last_price", "pct_chg", "turnover_rate")
+    ) or (isinstance(price_changes, dict) and bool(price_changes))
+    has_financial = any(
+        data.get(key) not in (None, "", [], {})
+        for key in (
+            "pe", "pb", "ps", "roe", "gross_margin", "net_margin",
+            "revenue_growth", "profit_growth", "debt_ratio", "market_cap",
+        )
+    )
+
+    gaps: List[str] = []
+    if not has_market:
+        gaps.append("market_data")
+    if horizon in {"medium", "long", "all"} and not has_financial:
+        gaps.append("financial_data")
+    return gaps
+
+
+def _invalid_batch_score(
+    code: str,
+    error_code: str,
+    reason: str,
+    *,
+    missing_core_fields: Optional[List[str]] = None,
+) -> dict:
+    """Build an observable failure result without inventing an investment view."""
+    return {
+        "code": code,
+        "level": None,
+        "confidence": None,
+        "reason": reason,
+        "risk": "",
+        "validity": "invalid",
+        "coverage": 0.0,
+        "missing_core_fields": missing_core_fields or ["level"],
+        "missing_optional_fields": [],
+        "error_code": error_code,
+    }
 
 
 async def score_batch(
@@ -1094,8 +1218,23 @@ async def score_batch(
     Returns:
         stocks 列表中添加 "score" 字段
     """
-    # 过滤只保留数据获取成功的股票
-    valid = [s for s in stocks if s.get("status") == "fetched" and s.get("data")]
+    # 过滤只保留核心证据可用的股票。HTTP/Tushare 全部失败时，旧实现仍可能
+    # 留下 status=fetched 的壳对象；这里必须在 LLM 之前 fail closed。
+    valid = []
+    for stock in stocks:
+        if stock.get("status") != "fetched":
+            continue
+        gaps = _batch_core_data_gaps(stock.get("data"), horizon)
+        if gaps:
+            stock["status"] = "data_invalid"
+            stock["score"] = _invalid_batch_score(
+                stock.get("code", ""),
+                "missing_core_data",
+                f"核心数据不可用: {', '.join(gaps)}",
+                missing_core_fields=gaps,
+            )
+            continue
+        valid.append(stock)
     if not valid:
         logger.warning("没有可打分的股票（所有数据获取均失败）")
         return stocks
@@ -1173,50 +1312,67 @@ async def score_batch(
                     for s in chunk:
                         code = s.get("code", "")
                         if code in score_map:
-                            s["score"] = score_map[code]
-                            s["scored_at"] = datetime.now().isoformat()
+                            parsed_score = score_map[code]
+                            if parsed_score.get("validity", "valid") == "valid":
+                                parsed_score["validity"] = "valid"
+                                s["score"] = parsed_score
+                                s["scored_at"] = datetime.now().isoformat()
+                            else:
+                                s["score"] = _invalid_batch_score(
+                                    code,
+                                    parsed_score.get("error_code", "invalid_llm_item"),
+                                    parsed_score.get("reason", "LLM返回项目不符合评分契约"),
+                                )
                         else:
-                            s["score"] = {
-                                "code": code, "level": "中性",
-                                "confidence": "低",
-                                "reason": "LLM未返回该股票结果",
-                                "risk": ""
-                            }
+                            s["score"] = _invalid_batch_score(
+                                code, "missing_llm_item", "LLM未返回该股票结果"
+                            )
                         async with score_lock:
                             scored_count += 1
                             current = scored_count
                 else:
                     for s in chunk:
-                        s["score"] = {
-                            "code": s.get("code", ""), "level": "中性",
-                            "confidence": "低",
-                            "reason": "LLM响应为空",
-                            "risk": ""
-                        }
+                        s["score"] = _invalid_batch_score(
+                            s.get("code", ""), "empty_llm_response", "LLM响应为空"
+                        )
                         async with score_lock:
                             scored_count += 1
                             current = scored_count
 
             except asyncio.TimeoutError:
                 for s in chunk:
-                    s["score"] = {
-                        "code": s.get("code", ""), "level": "中性",
-                        "confidence": "低",
-                        "reason": "打分超时",
-                        "risk": ""
-                    }
+                    s["score"] = _invalid_batch_score(
+                        s.get("code", ""), "llm_timeout", "打分超时"
+                    )
                     async with score_lock:
                         scored_count += 1
                         current = scored_count
-            except Exception as e:
-                logger.error(f"批次打分失败: {e}")
+            except BatchResponseSyntaxError as e:
+                logger.warning("LLM批次响应经过一次修复后仍无法解析: %s", e)
                 for s in chunk:
-                    s["score"] = {
-                        "code": s.get("code", ""), "level": "中性",
-                        "confidence": "低",
-                        "reason": f"打分异常: {str(e)[:50]}",
-                        "risk": ""
-                    }
+                    s["score"] = _invalid_batch_score(
+                        s.get("code", ""),
+                        "llm_output_invalid",
+                        f"LLM输出格式无效: {str(e)[:80]}",
+                    )
+                    async with score_lock:
+                        scored_count += 1
+                        current = scored_count
+            except BatchResponseSchemaError:
+                # A parsed-but-wrong shape is producer/schema drift, not an
+                # investment abstention.  Surface it for alerting and repair.
+                raise
+            except Exception as e:
+                if not _is_known_provider_failure(e):
+                    # Programming/configuration errors must fail loudly.
+                    raise
+                logger.error("批次模型供应商调用失败: %s", e)
+                for s in chunk:
+                    s["score"] = _invalid_batch_score(
+                        s.get("code", ""),
+                        "llm_provider_error",
+                        f"模型供应商不可用: {str(e)[:80]}",
+                    )
                     async with score_lock:
                         scored_count += 1
                         current = scored_count
@@ -1246,7 +1402,11 @@ async def score_batch(
 
     await asyncio.gather(*[_score_with_log(c) for c in chunks])
 
-    total_scored = sum(1 for s in stocks if s.get("score"))
+    total_scored = sum(
+        1 for s in stocks
+        if isinstance(s.get("score"), dict)
+        and s["score"].get("validity") == "valid"
+    )
     logger.info(
         f"{SUCCESS_ICON} 批量LLM打分完成: {total_scored}/{total_valid} 只, "
         f"共 {total_chunks} 批次"

@@ -78,7 +78,10 @@ class PredictionSnapshot:
     name: str = ""                          # 公司名称
     term: str = ""                          # short/medium/long
     as_of_date: str = ""                    # YYYY-MM-DD
-    pit_mode: str = "exact"                 # exact/best_effort/partial/unsupported
+    # Fail closed for records written before the PIT contract existed.  A
+    # historical row is only exact when the producer explicitly says so and
+    # supplies the context/snapshot identity below.
+    pit_mode: str = "legacy_non_pit"        # exact/best_effort/unsupported/legacy_non_pit
     eval_mode: str = "real"                 # real/backtest
     score: float = 0.0                      # 评分
     action: str = ""                        # buy/sell/hold
@@ -87,6 +90,14 @@ class PredictionSnapshot:
     decision_pack_json: str = ""            # DecisionPack JSON
     model_profile: str = ""
     version_hash: str = ""
+    score_validity: str = "invalid"         # valid/abstain/invalid
+    coverage: float = 0.0
+    missing_core_fields: List[str] = field(default_factory=list)
+    pit_schema_version: str = ""
+    context_fingerprint: str = ""
+    data_snapshot_id: str = ""
+    experiment_type: str = ""
+    agent_contribution_eligible: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d = {}
@@ -107,6 +118,14 @@ class PredictionSnapshot:
         d["decision_pack_json"] = self.decision_pack_json
         d["model_profile"] = self.model_profile
         d["version_hash"] = self.version_hash
+        d["score_validity"] = self.score_validity
+        d["coverage"] = self.coverage
+        d["missing_core_fields"] = list(self.missing_core_fields)
+        d["pit_schema_version"] = self.pit_schema_version
+        d["context_fingerprint"] = self.context_fingerprint
+        d["data_snapshot_id"] = self.data_snapshot_id
+        d["experiment_type"] = self.experiment_type
+        d["agent_contribution_eligible"] = self.agent_contribution_eligible
         return d
 
     @staticmethod
@@ -114,6 +133,27 @@ class PredictionSnapshot:
         def _f(v, d=0.0):
             try: return float(v)
             except: return d
+        raw_pit_mode = str(data.get("pit_mode", "legacy_non_pit"))
+        score_validity = str(data.get("score_validity", "invalid"))
+        fingerprint = str(data.get("context_fingerprint", "")).strip().lower()
+        snapshot_ref = str(data.get("data_snapshot_id", "")).strip().lower()
+        snapshot_digest = snapshot_ref.split(":", 1)[-1]
+        is_hex_digest = lambda value: (
+            len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+        )
+        has_strict_pit_identity = (
+            str(data.get("pit_schema_version", "")) == "pit_v1"
+            and is_hex_digest(fingerprint)
+            and snapshot_ref.startswith("sha256:")
+            and is_hex_digest(snapshot_digest)
+        )
+        # Older rows often persisted pit_mode="exact" because it used to be
+        # the dataclass default.  Without the new immutable identity and
+        # explicit validity contract that string is not evidence of PIT.
+        if raw_pit_mode == "exact" and (
+            not has_strict_pit_identity or score_validity != "valid"
+        ):
+            raw_pit_mode = "legacy_non_pit"
         return PredictionSnapshot(
             snapshot_id=str(data.get("snapshot_id", "")),
             batch_id=str(data.get("batch_id", "")),
@@ -123,7 +163,7 @@ class PredictionSnapshot:
             name=str(data.get("name", "")),
             term=str(data.get("term", "")),
             as_of_date=str(data.get("as_of_date", "")),
-            pit_mode=str(data.get("pit_mode", "exact")),
+            pit_mode=raw_pit_mode,
             eval_mode=str(data.get("eval_mode", "real")),
             score=_f(data.get("score")),
             action=str(data.get("action", "")),
@@ -132,6 +172,15 @@ class PredictionSnapshot:
             decision_pack_json=str(data.get("decision_pack_json", "")),
             model_profile=str(data.get("model_profile", "")),
             version_hash=str(data.get("version_hash", "")),
+            score_validity=score_validity,
+            coverage=_f(data.get("coverage")),
+            missing_core_fields=[str(v) for v in data.get("missing_core_fields", [])
+                                 if str(v)],
+            pit_schema_version=str(data.get("pit_schema_version", "")),
+            context_fingerprint=str(data.get("context_fingerprint", "")),
+            data_snapshot_id=str(data.get("data_snapshot_id", "")),
+            experiment_type=str(data.get("experiment_type", "")),
+            agent_contribution_eligible=bool(data.get("agent_contribution_eligible", False)),
         )
 
 

@@ -15,6 +15,32 @@ from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAI
 logger = setup_logger(__name__)
 
 
+def _score_cache_contract(pkg: Any, gate: Any, required_agents: int) -> Dict[str, Any]:
+    """Attach provenance needed before a persisted score may be reused elsewhere."""
+    available = len(getattr(pkg, "available_agents", []) or [])
+    coverage = min(1.0, available / required_agents) if required_agents else 0.0
+    if getattr(gate, "abstain", False):
+        return {
+            "validity": "abstain",
+            "coverage": coverage,
+            "missing_core_fields": [],
+            "missing_optional_fields": list(getattr(pkg, "missing_agents", []) or []),
+        }
+    if available == 0:
+        return {
+            "validity": "invalid",
+            "coverage": 0.0,
+            "missing_core_fields": ["analysis_evidence"],
+            "missing_optional_fields": [],
+        }
+    return {
+        "validity": "valid",
+        "coverage": coverage,
+        "missing_core_fields": [],
+        "missing_optional_fields": list(getattr(pkg, "missing_agents", []) or []),
+    }
+
+
 async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
     from src.agents.short_term_scorer import short_term_scorer
     from src.utils.analysis_package_builder import build_analysis_package
@@ -81,6 +107,7 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
         # 写入缓存 (1天TTL，与子Agent最短TTL一致)
         if not skip_cache and stock_code and as_of_date:
             write_cache("short_term_scorer", stock_code, as_of_date, json.dumps({
+                **_score_cache_contract(pkg, gate, 4),
                 "score": result["score"],
                 "reasoning": result.get("reasoning", ""),
                 "recommendation": result.get("recommendation", ""),
@@ -166,6 +193,7 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
 
         if not skip_cache and stock_code and as_of_date:
             write_cache("medium_term_scorer", stock_code, as_of_date, json.dumps({
+                **_score_cache_contract(pkg, gate, 7),
                 "score": result["score"],
                 "reasoning": result.get("reasoning", ""),
                 "rating": result.get("rating", ""),
@@ -252,6 +280,7 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
 
         if not skip_cache and stock_code and as_of_date:
             write_cache("long_term_scorer", stock_code, as_of_date, json.dumps({
+                **_score_cache_contract(pkg, gate, 7),
                 "score": result["score"],
                 "reasoning": result.get("reasoning", ""),
                 "rating": result.get("rating", ""),

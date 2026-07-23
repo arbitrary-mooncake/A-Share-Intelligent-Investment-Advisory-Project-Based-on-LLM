@@ -8,6 +8,8 @@ IndustryKnowledge: A股行业分类 + 各行业估值基准 + 打分自适应规
 
 数据截至2026年4月，基于申万一级行业分类。
 """
+import re
+import unicodedata
 from typing import Dict, Any, Optional
 
 # ============================================================================
@@ -645,15 +647,40 @@ def identify_industry(company_name: str, analysis_text: str = "") -> Optional[st
     Returns:
         行业名称（申万一级行业），如果无法识别返回None
     """
-    combined = company_name + " " + analysis_text
+    def _normalize(text: str) -> str:
+        """统一全角/大小写并移除空白和标点，避免格式差异影响匹配。"""
+        normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+        return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
 
-    # 精确匹配优先（检查公司名称是否包含行业关键词）
+    company = _normalize(company_name)
+    analysis = _normalize(analysis_text)
+    scores: Dict[str, int] = {}
+
+    # 每个关键词最多计一次。关键词长度既是一个简单的强词代理，也能让
+    # “新能源车”优先于其包含的较短通用词“新能源”，避免依赖字典顺序。
     for industry, keywords in INDUSTRY_KEYWORDS.items():
-        for kw in keywords:
-            if kw.lower() in combined.lower():
-                return industry
+        score = 0
+        seen_keywords = set()
+        for keyword in keywords:
+            normalized_keyword = _normalize(keyword)
+            if not normalized_keyword or normalized_keyword in seen_keywords:
+                continue
+            seen_keywords.add(normalized_keyword)
+            keyword_weight = max(1, len(normalized_keyword))
+            if normalized_keyword in company:
+                # 公司名中的行业词比分析文本中的提及更直接，但同一词仍只计一次。
+                score += keyword_weight * 3
+            elif normalized_keyword in analysis:
+                score += keyword_weight
+        scores[industry] = score
 
-    return None
+    max_score = max(scores.values(), default=0)
+    if max_score <= 0:
+        return None
+
+    winners = [industry for industry, score in scores.items() if score == max_score]
+    # 平局时返回 None，避免把不确定的行业归因到字典中排在前面的行业。
+    return winners[0] if len(winners) == 1 else None
 
 
 def get_industry_info(industry: str) -> Optional[Dict[str, Any]]:

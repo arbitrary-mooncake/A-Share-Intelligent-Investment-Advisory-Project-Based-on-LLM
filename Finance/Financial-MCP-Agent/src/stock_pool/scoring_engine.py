@@ -189,6 +189,7 @@ class ScoringEngine:
         if term in self._term_workflows:
             return self._term_workflows[term]
 
+        build_started_at = time.perf_counter()
         from src.agents.scoring_nodes import (
             short_term_scorer_node,
             medium_term_scorer_node,
@@ -219,6 +220,11 @@ class ScoringEngine:
         workflow.add_edge(scorer_name, END)
 
         self._term_workflows[term] = workflow.compile()
+        scorer_type = "deterministic" if os.getenv("DETERMINISTIC_SCORER_ENABLED", "0").strip() == "1" else "llm"
+        logger.info(
+            f"期限子图构建完成 term={term} scorer_type={scorer_type} status=ready "
+            f"nodes={len(agent_nodes) + 2} elapsed_ms={(time.perf_counter() - build_started_at) * 1000:.1f}"
+        )
         return self._term_workflows[term]
 
     @staticmethod

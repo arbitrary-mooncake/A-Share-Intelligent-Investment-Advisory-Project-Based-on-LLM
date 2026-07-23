@@ -66,6 +66,8 @@ async def prefetch_term_bundle(
     is_etf: bool = False,
 ) -> Optional[Dict[str, str]]:
     """按期限统一预取数据并预热共享工具缓存。失败返回 None，绝不抛出。"""
+    # 每次请求先清空上一次 ContextVar 副本，避免本次预取失败时误用旧快照。
+    _run_bundle.set(None)
     if not prefetch_enabled():
         return None
     try:
@@ -79,20 +81,41 @@ async def prefetch_term_bundle(
             tools = await get_mcp_tools(tool_filter=tool_names)
         except Exception as e:
             logger.warning(f"DataGateway: 获取 MCP 工具失败，跳过预取: {e}")
+            # 工具发现阶段整体失败时也要留下按工具名归类的缺口，
+            # 但不记录请求参数、原始返回或可能包含密钥的内容。
+            logger.info(
+                f"DataGateway: 预取未命中 {len(tool_names)} 类工具 "
+                f"（call_failed={sorted(tool_names)}）"
+            )
             return None
         tool_map = {t.name: t for t in tools}
 
         bundle: Dict[str, str] = {}
+        missed: Dict[str, List[str]] = {
+            "tool_unavailable": [],
+            "call_failed": [],
+            "empty_or_short": [],
+        }
         sem = asyncio.Semaphore(_PREFETCH_CONCURRENCY)
+
+        def _record_miss(category: str, tool_name: str) -> None:
+            # 只记录工具名和分类，不把参数、原始返回或密钥写入日志。
+            if tool_name not in missed[category]:
+                missed[category].append(tool_name)
 
         async def _fetch_one(tool_name: str, kwargs: Dict[str, Any]) -> None:
             key = _make_cache_key(tool_name, kwargs)
-            cached = await get_cached_tool_result(tool_name, kwargs)
+            try:
+                cached = await get_cached_tool_result(tool_name, kwargs)
+            except Exception:
+                _record_miss("call_failed", tool_name)
+                return
             if cached:
                 bundle[key] = cached
                 return
             tool = tool_map.get(tool_name)
             if tool is None:
+                _record_miss("tool_unavailable", tool_name)
                 return
             async with sem:
                 try:
@@ -103,8 +126,11 @@ async def prefetch_term_bundle(
                     if len(text) > _MIN_RESULT_LEN:
                         await set_cached_tool_result(tool_name, kwargs, text)
                         bundle[key] = text
+                    else:
+                        _record_miss("empty_or_short", tool_name)
                 except Exception:
                     # 单项失败不预热，Agent 走原有取数+重试路径
+                    _record_miss("call_failed", tool_name)
                     return
 
         await asyncio.gather(
@@ -116,6 +142,14 @@ async def prefetch_term_bundle(
             f"DataGateway: 预取完成 term={term} code={stock_code} "
             f"spec={len(spec)} 项, 命中 {len(bundle)} 项"
         )
+        missed_total = sum(len(items) for items in missed.values())
+        if missed_total:
+            missed_summary = ", ".join(
+                f"{category}={sorted(items)}"
+                for category, items in missed.items()
+                if items
+            )
+            logger.info(f"DataGateway: 预取未命中 {missed_total} 类工具（{missed_summary}）")
         return bundle
     except Exception as e:
         logger.warning(f"DataGateway: 预取异常（不影响主流程）: {e}")

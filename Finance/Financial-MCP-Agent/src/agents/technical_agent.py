@@ -4,6 +4,8 @@ TechnicalAnalysis Agent: Performs technical analysis of a stock using ReAct Agen
 """
 import asyncio
 import json
+import math
+import re
 from typing import Dict, Any, List, Optional
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
@@ -95,12 +97,140 @@ def _compute_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: i
     return dif, dea, macd_bar
 
 
-def _build_indicator_summary(kline_json_str: str, stock_code: str) -> str:
-    """从K线JSON数据计算技术指标摘要，返回格式化字符串"""
+_KLINE_FIELD_ALIASES = {
+    "trade_date": ("trade_date", "date", "日期", "交易日期"),
+    "open": ("open", "开盘价", "开盘"),
+    "high": ("high", "最高价", "最高"),
+    "low": ("low", "最低价", "最低"),
+    "close": ("close", "收盘价", "收盘"),
+    "vol": ("vol", "volume", "成交量"),
+}
+
+
+def _normalize_kline_field(value: Any) -> str:
+    """归一化 K 线字段名，兼容下划线、空格和中英文列名。"""
+    normalized = str(value or "").strip().casefold()
+    return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
+
+
+def _parse_kline_number(value: Any) -> Optional[float]:
+    """解析 Tushare/Markdown 中的数值；缺失占位符返回 None。"""
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if text.casefold() in {"", "--", "-", "nan", "none", "null", "n/a", "na"}:
+        return None
+    if text.endswith("%"):
+        text = text[:-1].strip()
     try:
-        data = json.loads(kline_json_str)
-        if not isinstance(data, list) or len(data) < 30:
+        parsed = float(text)
+        return parsed if math.isfinite(parsed) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _kline_row_value(row: Dict[str, Any], field: str) -> Any:
+    aliases = {_normalize_kline_field(alias) for alias in _KLINE_FIELD_ALIASES[field]}
+    for key, value in row.items():
+        if _normalize_kline_field(key) in aliases:
+            return value
+    return None
+
+
+def _rows_from_kline_json(payload: Any) -> List[Dict[str, Any]]:
+    """提取 JSON 列表、fields/items 或 data/result/rows 包装中的行。"""
+    if isinstance(payload, str):
+        text = payload.strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+        if fenced:
+            text = fenced.group(1).strip()
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+
+    if not isinstance(payload, dict):
+        return []
+
+    fields = payload.get("fields")
+    items = payload.get("items")
+    if isinstance(fields, list) and isinstance(items, list):
+        if all(isinstance(row, dict) for row in items):
+            return items
+        return [dict(zip(fields, row)) for row in items if isinstance(row, (list, tuple))]
+
+    for key in ("data", "result", "rows"):
+        nested = payload.get(key)
+        if nested is not None:
+            rows = _rows_from_kline_json(nested)
+            if rows:
+                return rows
+    return []
+
+
+def _rows_from_kline_markdown(payload: Any) -> List[Dict[str, Any]]:
+    """解析 MCP 工具返回的 Markdown 表格。"""
+    if not isinstance(payload, str):
+        return []
+    lines = payload.splitlines()
+    for index, line in enumerate(lines):
+        if "|" not in line:
+            continue
+        headers = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+        if not headers or not any(headers):
+            continue
+        if index + 1 >= len(lines) or "|" not in lines[index + 1]:
+            continue
+        separator = [cell.strip().replace(" ", "") for cell in lines[index + 1].strip().strip("|").split("|")]
+        if len(separator) != len(headers) or not all(re.fullmatch(r":?-{3,}:?", cell) for cell in separator):
+            continue
+
+        rows: List[Dict[str, Any]] = []
+        for row_line in lines[index + 2:]:
+            if "|" not in row_line:
+                break
+            cells = [cell.strip().strip("`") for cell in row_line.strip().strip("|").split("|")]
+            if len(cells) != len(headers):
+                continue
+            rows.append(dict(zip(headers, cells)))
+        return rows
+    return []
+
+
+def _parse_kline_rows(payload: Any) -> List[Dict[str, Any]]:
+    """统一解析 K 线工具的 JSON/Markdown 返回结构。"""
+    rows = _rows_from_kline_json(payload)
+    if rows:
+        return rows
+    return _rows_from_kline_markdown(payload)
+
+
+def _build_indicator_summary(kline_json_str: str, stock_code: str) -> str:
+    """从 K 线 JSON 或 MCP Markdown 数据计算技术指标摘要。"""
+    try:
+        data = _parse_kline_rows(kline_json_str)
+        if len(data) < 30:
+            logger.warning(
+                f"技术指标预计算跳过: {stock_code or 'Unknown'} 有效K线不足 "
+                f"（{len(data)}/30），将按数据不可用安全降级"
+            )
             return ""
+
+        # Tushare 日线通常按日期倒序返回；统一为旧→新，保证最新值位于末尾。
+        dated_rows = [
+            row for row in data
+            if re.sub(r"[^0-9]", "", str(_kline_row_value(row, "trade_date") or ""))
+        ]
+        if len(dated_rows) >= 2:
+            data = sorted(
+                data,
+                key=lambda row: re.sub(
+                    r"[^0-9]", "", str(_kline_row_value(row, "trade_date") or "")
+                ),
+            )
 
         closes = []
         highs = []
@@ -110,14 +240,16 @@ def _build_indicator_summary(kline_json_str: str, stock_code: str) -> str:
         opens = []
 
         for row in data:
+            if not isinstance(row, dict):
+                continue
             try:
-                close_val = float(row.get("close", row.get("收盘价", 0)))
-                high_val = float(row.get("high", row.get("最高价", 0)))
-                low_val = float(row.get("low", row.get("最低价", 0)))
-                vol_val = float(row.get("vol", row.get("成交量", 0)))
-                open_val = float(row.get("open", row.get("开盘价", 0)))
-                date_val = str(row.get("trade_date", row.get("日期", "")))
-                if close_val > 0:
+                close_val = _parse_kline_number(_kline_row_value(row, "close"))
+                if close_val is not None and close_val > 0:
+                    high_val = _parse_kline_number(_kline_row_value(row, "high")) or 0.0
+                    low_val = _parse_kline_number(_kline_row_value(row, "low")) or 0.0
+                    vol_val = _parse_kline_number(_kline_row_value(row, "vol")) or 0.0
+                    open_val = _parse_kline_number(_kline_row_value(row, "open")) or 0.0
+                    date_val = str(_kline_row_value(row, "trade_date") or "")
                     closes.append(close_val)
                     highs.append(high_val)
                     lows.append(low_val)
@@ -128,6 +260,10 @@ def _build_indicator_summary(kline_json_str: str, stock_code: str) -> str:
                 continue
 
         if len(closes) < 30:
+            logger.warning(
+                f"技术指标预计算跳过: {stock_code or 'Unknown'} 可用收盘价不足 "
+                f"（{len(closes)}/30），将按数据不可用安全降级"
+            )
             return ""
 
         # 计算均线
@@ -185,12 +321,12 @@ def _build_indicator_summary(kline_json_str: str, stock_code: str) -> str:
             f"  - 与MA5关系: {'上方' if last_ma5 and last_close > last_ma5 else '下方' if last_ma5 else 'N/A'}",
             f"  - 与MA20关系: {'上方' if last_ma20 and last_close > last_ma20 else '下方' if last_ma20 else 'N/A'}",
             f"  - 与MA60关系: {'上方' if last_ma60 and last_close > last_ma60 else '下方' if last_ma60 else 'N/A'}",
-            f"- 均线排列: {'多头' if last_ma5 and last_ma20 and last_ma5 > last_ma20 and last_ma20 > last_ma60 else '交叉/空头'}",
+            f"- 均线排列: {'多头' if last_ma5 is not None and last_ma20 is not None and last_ma60 is not None and last_ma5 > last_ma20 and last_ma20 > last_ma60 else '交叉/空头'}",
             "",
             "### MACD指标",
             f"- DIF = {last_dif} | DEA = {last_dea} | MACD柱 = {last_macd}",
-            f"- MACD状态: {'金叉/多头' if last_dif and last_dea and last_dif > last_dea else '死叉/空头' if last_dif and last_dea else 'N/A'}",
-            f"- 柱状线: {'红柱(多头)' if last_macd and last_macd > 0 else '绿柱(空头)' if last_macd and last_macd < 0 else 'N/A'}",
+            f"- MACD状态: {'金叉/多头' if last_dif is not None and last_dea is not None and last_dif > last_dea else '死叉/空头' if last_dif is not None and last_dea is not None else 'N/A'}",
+            f"- 柱状线: {'红柱(多头)' if last_macd is not None and last_macd > 0 else '绿柱(空头)' if last_macd is not None and last_macd < 0 else 'N/A'}",
             "",
             "### RSI指标",
             f"- RSI(6) = {last_rsi6} | RSI(14) = {last_rsi14}",

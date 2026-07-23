@@ -115,6 +115,10 @@ async def event_analyst_agent(state: AgentState) -> AgentState:
     skip_cache = current_data.get("skip_cache", False)
     cache_date = current_data.get("current_date", "")
     cache_code = current_data.get("stock_code", "")
+    agent_start_time = time.time()
+    execution_logger.log_agent_start(
+        agent_name, {"stock_code": cache_code, "company_name": current_data.get("company_name", "")}
+    )
 
     if not skip_cache and cache_date and cache_code:
         cached = read_cache("event_analysis", cache_code, cache_date)
@@ -129,6 +133,10 @@ async def event_analyst_agent(state: AgentState) -> AgentState:
                 current_data["event_signal_pack"] = cached_sp
             else:
                 current_data["event_signal_pack"] = _extract_signal_pack(cached, "event", cache_date)
+            execution_logger.log_agent_complete(
+                agent_name, {"cached": True, "analysis_length": len(cached)},
+                time.time() - agent_start_time, True,
+            )
             return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "事件分析已完成（缓存）"}], "metadata": current_metadata}
 
     stock_code = current_data.get("stock_code", "")
@@ -136,9 +144,6 @@ async def event_analyst_agent(state: AgentState) -> AgentState:
     current_time_info = current_data.get("current_time_info", "")
     current_date = current_data.get("current_date", "")
     clean_code = _extract_code(stock_code) if stock_code else ""
-
-    agent_start_time = time.time()
-    execution_logger.log_agent_start(agent_name, {"stock_code": stock_code, "company_name": company_name})
 
     try:
         model_cfg = get_model_config_for_agent("event_analyst", current_data)
@@ -237,13 +242,27 @@ JSON含: bias, confidence, key_points(≤5条), signals(≤8条,含factor/catego
                 from src.utils.cache_utils import write_signal_pack_cache
                 write_signal_pack_cache("event_analysis", cache_code, cache_date, current_data["event_signal_pack"])
         current_metadata["event_agent_executed"] = True
+        execution_logger.log_agent_complete(
+            agent_name,
+            {"analysis_length": len(final_output), "signal_count": len(signal_pack.get("signals", [])) if isinstance(signal_pack, dict) else 0},
+            time.time() - agent_start_time,
+            True,
+        )
 
         return {"data": current_data, "messages": current_messages + [{"role": "assistant", "content": "事件分析已完成"}], "metadata": current_metadata}
 
+    except asyncio.CancelledError:
+        execution_logger.log_agent_complete(
+            agent_name, {"cancelled": True}, time.time() - agent_start_time, False, "cancelled"
+        )
+        raise
     except Exception as e:
         logger.error(f"{ERROR_ICON} EventAnalyst 失败: {e}", exc_info=True)
         current_data["event_analysis"] = f"事件分析失败: {str(e)}"
         current_data["event_analysis_error"] = str(e)
         current_data["event_signal_pack"] = text_to_signal_pack(current_data.get("event_analysis", ""), "event", current_date)
         current_metadata["event_agent_error"] = str(e)
+        execution_logger.log_agent_complete(
+            agent_name, {"error": str(e)}, time.time() - agent_start_time, False, str(e)
+        )
         return {"data": current_data, "messages": current_messages, "metadata": current_metadata}

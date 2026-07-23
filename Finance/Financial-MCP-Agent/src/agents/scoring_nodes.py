@@ -11,6 +11,7 @@ Scoring Nodes: LangGraph wrapper for 3 scoring agents (v2 — structured evidenc
 """
 import json
 import os
+import time
 from typing import Dict, Any
 
 from src.utils.state_definition import AgentState
@@ -26,26 +27,43 @@ def _deterministic_scorer_enabled() -> bool:
 
 async def _run_deterministic_scorer(
     term: str, pkg: Any, stock_code: str, company_name: str, is_etf: bool,
+    run_id: str = "",
 ) -> Dict[str, Any]:
     """确定性打分路径：代码公式 + 冲突仲裁（有界折扣）+ 可选 LLM 解释。"""
-    from src.utils.deterministic_scorer import (
-        collect_signals, detect_material_conflicts, compute_score,
+    started_at = time.perf_counter()
+    status = "failed"
+    result: Dict[str, Any] = {}
+    logger.info(
+        f"确定性打分入口 term={term} stock_code={stock_code or 'unknown'} "
+        f"run_id={run_id or 'unknown'} scorer_type=deterministic"
     )
-    from src.utils.conflict_arbitration import arbitrate_conflicts
+    try:
+        from src.utils.deterministic_scorer import (
+            collect_signals, detect_material_conflicts, compute_score,
+        )
+        from src.utils.conflict_arbitration import arbitrate_conflicts
 
-    signals = collect_signals(pkg)
-    conflicts = detect_material_conflicts(signals)
-    arbitration_on = os.getenv("CONFLICT_ARBITRATION_ENABLED", "1").strip() != "0"
-    discounts = await arbitrate_conflicts(conflicts, enabled=arbitration_on)
-    result = compute_score(term, signals, pkg, is_etf=is_etf, signal_discounts=discounts)
+        signals = collect_signals(pkg)
+        conflicts = detect_material_conflicts(signals)
+        arbitration_on = os.getenv("CONFLICT_ARBITRATION_ENABLED", "1").strip() != "0"
+        discounts = await arbitrate_conflicts(conflicts, enabled=arbitration_on)
+        result = compute_score(term, signals, pkg, is_etf=is_etf, signal_discounts=discounts)
 
-    from src.utils.score_explanation import explanation_enabled, generate_score_explanation
-    if explanation_enabled():
-        result["reasoning"] = await generate_score_explanation(term, result, pkg, company_name)
+        from src.utils.score_explanation import explanation_enabled, generate_score_explanation
+        if explanation_enabled():
+            result["reasoning"] = await generate_score_explanation(term, result, pkg, company_name)
 
-    if conflicts:
-        logger.info(f"确定性打分[{term}]: {len(conflicts)} 组实质冲突, {len(discounts)} 条信号折扣")
-    return result
+        if conflicts:
+            logger.info(f"确定性打分[{term}]: {len(conflicts)} 组实质冲突, {len(discounts)} 条信号折扣")
+        status = "success"
+        return result
+    finally:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(
+            f"确定性打分出口 term={term} stock_code={stock_code or 'unknown'} "
+            f"run_id={run_id or 'unknown'} scorer_type=deterministic status={status} "
+            f"elapsed_ms={elapsed_ms:.1f} score={result.get('score', 'n/a')}"
+        )
 
 
 def _score_cache_contract(pkg: Any, gate: Any, required_agents: int) -> Dict[str, Any]:
@@ -113,6 +131,7 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
         if _deterministic_scorer_enabled():
             result = await _run_deterministic_scorer(
                 "short", pkg, stock_code, company_name, data.get("is_etf", False),
+                run_id=data.get("analysis_timestamp", ""),
             )
         else:
             result = await short_term_scorer(
@@ -202,6 +221,7 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
         if _deterministic_scorer_enabled():
             result = await _run_deterministic_scorer(
                 "medium", pkg, stock_code, company_name, data.get("is_etf", False),
+                run_id=data.get("analysis_timestamp", ""),
             )
         else:
             result = await medium_term_scorer(
@@ -294,6 +314,7 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
         if _deterministic_scorer_enabled():
             result = await _run_deterministic_scorer(
                 "long", pkg, stock_code, company_name, data.get("is_etf", False),
+                run_id=data.get("analysis_timestamp", ""),
             )
         else:
             result = await long_term_scorer(

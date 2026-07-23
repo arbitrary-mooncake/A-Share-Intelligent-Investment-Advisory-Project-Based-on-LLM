@@ -4,9 +4,11 @@ Phase 1: asyncio.gather 并行获取白名单全部 16 个工具的数据
 Phase 2: 将所有原始数据喂给 LLM 一次性完成估值分析（thinking 开启）
 """
 import asyncio
+import json
+import re
 import time
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from openai import AsyncOpenAI
 import httpx
@@ -89,41 +91,84 @@ def _get_recent_quarters(date_str: str, count: int = 2) -> List[Dict[str, Any]]:
     return quarters
 
 
-def _extract_signal_pack_from_llm(llm_output: str, agent_name: str, as_of_date: str) -> dict:
-    """
-    从LLM输出中提取signal_pack JSON。
-    三层fallback: JSON解析 → 正则提取 → 文本推断
-    """
-    import json as _json
-    import re as _re
+def _extract_structured_signal_pack(
+    llm_output: str, agent_name: str, as_of_date: str
+) -> Optional[dict]:
+    """只提取合法结构化 signal_pack，失败返回 None，不做文本推断。"""
+    # 第一层：优先读取明确的 SIGNAL_PACK 标签。
+    tag_match = re.search(r"<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>", llm_output)
+    candidates = [tag_match.group(1)] if tag_match else []
 
-    # 第一层: <SIGNAL_PACK> 标签
-    tag_match = _re.search(r'<SIGNAL_PACK>\s*(\{[\s\S]*?\})\s*</SIGNAL_PACK>', llm_output)
-    if tag_match:
-        try:
-            sp = _json.loads(tag_match.group(1))
-            sp["agent_name"] = agent_name
-            sp["as_of_date"] = as_of_date
-            sp.setdefault("analysis_text", llm_output[:500])
-            sp.setdefault("data_quality_score", 0.7)
-            return sp
-        except (_json.JSONDecodeError, ValueError):
-            pass
-
-    # 第二层: 从文本中找包含bias和signals的JSON
-    json_match = _re.search(r'\{[\s\S]*"bias"[\s\S]*"signals"[\s\S]*\}', llm_output)
+    # 第二层：兼容未带标签但包含核心字段的 JSON。
+    json_match = re.search(r'\{[\s\S]*"bias"[\s\S]*"signals"[\s\S]*\}', llm_output)
     if json_match:
-        try:
-            sp = _json.loads(json_match.group(0))
-            sp["agent_name"] = agent_name
-            sp["as_of_date"] = as_of_date
-            sp.setdefault("analysis_text", llm_output[:500])
-            sp.setdefault("data_quality_score", 0.5)
-            return sp
-        except (_json.JSONDecodeError, ValueError):
-            pass
+        candidates.append(json_match.group(0))
 
-    # 第三层: 纯文本推断
+    for candidate in candidates:
+        try:
+            sp = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if (
+            not isinstance(sp, dict)
+            or not isinstance(sp.get("bias"), str)
+            or not isinstance(sp.get("signals"), list)
+        ):
+            continue
+        sp["agent_name"] = agent_name
+        sp["as_of_date"] = as_of_date
+        sp.setdefault("analysis_text", llm_output[:500])
+        sp.setdefault("data_quality_score", 0.7 if tag_match else 0.5)
+        return sp
+    return None
+
+
+def _extract_signal_pack_from_llm(llm_output: str, agent_name: str, as_of_date: str) -> dict:
+    """从 LLM 输出提取 signal_pack；结构化失败时保留文本兜底。"""
+    structured = _extract_structured_signal_pack(llm_output, agent_name, as_of_date)
+    if structured is not None:
+        return structured
+
+    # 第三层：纯文本推断
+    from src.utils.analysis_package_builder import text_to_signal_pack
+    return text_to_signal_pack(llm_output, agent_name, as_of_date)
+
+
+async def _extract_or_repair_signal_pack(
+    llm: Any, llm_output: str, agent_name: str, as_of_date: str
+) -> dict:
+    """最多进行一次纯 JSON 修复，失败后回退到原分析文本。"""
+    structured = _extract_structured_signal_pack(llm_output, agent_name, as_of_date)
+    if structured is not None:
+        return structured
+
+    logger.warning("ValueAgent: SIGNAL_PACK 缺失或无效，尝试一次结构化修复")
+    repair_prompt = f"""你是结构化输出修复器。请只根据下面已有的估值分析文本，输出一个合法 JSON，且必须包含 bias 和 signals 两个字段；不要补造原文没有的事实，不要输出 Markdown、解释或额外字段。
+
+原始分析文本：
+{llm_output[:6000]}
+"""
+    try:
+        repair_response = await asyncio.wait_for(
+            llm.ainvoke([
+                {"role": "system", "content": "你只负责修复 JSON 结构，不重新获取数据。"},
+                {"role": "user", "content": repair_prompt},
+            ]),
+            timeout=min(float(LLM_TIMEOUT), 60.0),
+        )
+        repair_output = (
+            repair_response.content.strip()
+            if hasattr(repair_response, "content")
+            else str(repair_response)
+        )
+        structured = _extract_structured_signal_pack(repair_output, agent_name, as_of_date)
+        if structured is not None:
+            logger.info("ValueAgent: SIGNAL_PACK 结构化修复成功")
+            return structured
+        logger.warning("ValueAgent: SIGNAL_PACK 结构化修复仍无效，使用文本兜底")
+    except Exception as repair_err:
+        logger.warning(f"ValueAgent: SIGNAL_PACK 结构化修复失败，使用文本兜底: {repair_err}")
+
     from src.utils.analysis_package_builder import text_to_signal_pack
     return text_to_signal_pack(llm_output, agent_name, as_of_date)
 
@@ -611,8 +656,10 @@ ETF基本信息：
                 timeout=float(LLM_TIMEOUT)
             )
             final_output = response.content.strip() if hasattr(response, 'content') else str(response)
-            # 提取 signal_pack
-            value_signal_pack = _extract_signal_pack_from_llm(final_output, "value", current_date)
+            # 缺失时只做一次纯解析修复，不重新取数或运行 Agent。
+            value_signal_pack = await _extract_or_repair_signal_pack(
+                llm, final_output, "value", current_date
+            )
             current_data["value_signal_pack"] = value_signal_pack
             phase2_elapsed = time.time() - phase2_start
             logger.info(f"ValueAgent: Phase 2 完成 ({phase2_elapsed:.1f}s, {len(final_output)} 字符)")

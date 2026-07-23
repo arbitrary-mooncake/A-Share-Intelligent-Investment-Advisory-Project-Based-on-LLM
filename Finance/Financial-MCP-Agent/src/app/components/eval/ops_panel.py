@@ -78,6 +78,9 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
         st.caption("\U0001f446 根据最新数据重评分→选股→生成调仓订单→执行交易，但不结算当日收益。适合盘中调整持仓时使用。")
 
     st.markdown("---")
+    # 进度插槽：精筛池更新的状态框/进度条渲染在操作区正上方（全宽），
+    # 避免挤在半宽列内、贴近用户操作位置。
+    pool_prog_slot = st.empty()
     col3, col4 = st.columns(2)
 
     with col3:
@@ -92,88 +95,89 @@ def render_ops_panel(orch, eval_ready: bool) -> None:
                                       help="精筛候选股数（参考值，实际由四层管线按1:1.2差额机制自动决定）。")
         if st.button("\U0001f3af 更新精筛池", use_container_width=True, type="primary"):
             if eval_ready:
-                status_box = st.status("四层管线初始化...", expanded=True)
-                progress_bar = st.progress(0, text="Layer 0 硬筛...")
-                cancel_col1, cancel_col2 = st.columns([1, 4])
-                from src.eval.job_manager import JobManager, JobStatus
-                jm = JobManager()
+                with pool_prog_slot.container():
+                    status_box = st.status("四层管线初始化...", expanded=True)
+                    progress_bar = st.progress(0, text="Layer 0 硬筛...")
+                    cancel_col1, cancel_col2 = st.columns([1, 4])
+                    from src.eval.job_manager import JobManager, JobStatus
+                    jm = JobManager()
 
-                try:
-                    existing = jm.find_running(pool_term)
-                    if existing:
-                        job_id = existing["job_id"]
-                        st.info(
-                            f"已有正在跑的更新 ({existing.get('started_at', '')}), 自动 attach"
-                        )
-                    else:
-                        job_id = jm.start_job(pool_term)
-
-                    st.session_state[f"pool_job_{pool_term}"] = job_id
-
-                    # ── Gap #23: 取消按钮（放在 while 循环外部，确保 Streamlit 能捕获点击）──
-                    cancel_key = f"cancel_pool_{pool_term}"
-                    with cancel_col1:
-                        if st.button("⏹ 取消", key=f"cancel_btn_pool_{pool_term}", use_container_width=True):
-                            st.session_state[cancel_key] = True
-                            st.rerun()
-
-                    # 轮询进度
-                    cancelled = False
-                    while True:
-                        # 检查取消请求（必须在循环顶部，绕过阻塞）
-                        if st.session_state.get(cancel_key):
-                            jm.cancel(job_id)
-                            st.session_state[cancel_key] = False
-                            status_box.update(label="更新已取消", state="complete")
-                            progress_bar.progress(100, text="已取消")
-                            st.warning("精筛池更新已被用户取消。")
-                            break
-                        job = jm.poll(job_id)
-                        if not job:
-                            st.error("任务信息丢失")
-                            break
-
-                        status = job.get("status")
-                        prog = job.get("progress") or {}
-                        pct = prog.get("overall_pct", 0) / 100.0
-                        eta = prog.get("eta_str", "计算中...")
-                        stall = prog.get("stall_s", 0)
-
-                        progress_bar.progress(
-                            min(pct, 1.0),
-                            f"总进度 {pct*100:.0f}% | ETA: {eta}"
-                            + (f" | ⚠️ 卡顿{stall:.0f}s" if stall > 60 else "")
-                        )
-                        status_box.update(
-                            label=f"running: {prog.get('current_stage_msg', '')[:60]}",
-                            state="running",
-                        )
-
-                        if status == JobStatus.COMPLETED.value:
-                            progress_bar.progress(1.0, text="完成!")
-                            status_box.update(label="精筛池更新完成", state="complete")
-                            st.success(
-                                f"精筛池[{pool_term}]更新完成！"
-                                f"共{job.get('progress', {}).get('result', {}).get('final_pool_size', 0)}只"
+                    try:
+                        existing = jm.find_running(pool_term)
+                        if existing:
+                            job_id = existing["job_id"]
+                            st.info(
+                                f"已有正在跑的更新 ({existing.get('started_at', '')}), 自动 attach"
                             )
-                            st.rerun()
-                        if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value, JobStatus.CANCELLED.value):
-                            if status == JobStatus.CANCELLED.value:
+                        else:
+                            job_id = jm.start_job(pool_term)
+
+                        st.session_state[f"pool_job_{pool_term}"] = job_id
+
+                        # ── Gap #23: 取消按钮（放在 while 循环外部，确保 Streamlit 能捕获点击）──
+                        cancel_key = f"cancel_pool_{pool_term}"
+                        with cancel_col1:
+                            if st.button("⏹ 取消", key=f"cancel_btn_pool_{pool_term}", use_container_width=True):
+                                st.session_state[cancel_key] = True
+                                st.rerun()
+
+                        # 轮询进度
+                        cancelled = False
+                        while True:
+                            # 检查取消请求（必须在循环顶部，绕过阻塞）
+                            if st.session_state.get(cancel_key):
+                                jm.cancel(job_id)
+                                st.session_state[cancel_key] = False
                                 status_box.update(label="更新已取消", state="complete")
                                 progress_bar.progress(100, text="已取消")
                                 st.warning("精筛池更新已被用户取消。")
-                            else:
-                                status_box.update(label="更新失败", state="error")
-                                st.error(job.get("error") or f"任务状态: {status}")
-                                with st.expander("📋 Worker 日志", expanded=False):
-                                    st.code(jm.read_log(job_id, tail=200), language="log")
-                            break
+                                break
+                            job = jm.poll(job_id)
+                            if not job:
+                                st.error("任务信息丢失")
+                                break
 
-                        time.sleep(1.0)
-                except Exception as e:
-                    progress_bar.progress(100, text="失败")
-                    status_box.update(label="更新失败", state="error")
-                    st.error(f"精筛池更新启动失败: {e}")
+                            status = job.get("status")
+                            prog = job.get("progress") or {}
+                            pct = prog.get("overall_pct", 0) / 100.0
+                            eta = prog.get("eta_str", "计算中...")
+                            stall = prog.get("stall_s", 0)
+
+                            progress_bar.progress(
+                                min(pct, 1.0),
+                                f"总进度 {pct*100:.0f}% | ETA: {eta}"
+                                + (f" | ⚠️ 卡顿{stall:.0f}s" if stall > 60 else "")
+                            )
+                            status_box.update(
+                                label=f"running: {prog.get('current_stage_msg', '')[:60]}",
+                                state="running",
+                            )
+
+                            if status == JobStatus.COMPLETED.value:
+                                progress_bar.progress(1.0, text="完成!")
+                                status_box.update(label="精筛池更新完成", state="complete")
+                                st.success(
+                                    f"精筛池[{pool_term}]更新完成！"
+                                    f"共{job.get('progress', {}).get('result', {}).get('final_pool_size', 0)}只"
+                                )
+                                st.rerun()
+                            if status in (JobStatus.FAILED.value, JobStatus.ORPHANED.value, JobStatus.CANCELLED.value):
+                                if status == JobStatus.CANCELLED.value:
+                                    status_box.update(label="更新已取消", state="complete")
+                                    progress_bar.progress(100, text="已取消")
+                                    st.warning("精筛池更新已被用户取消。")
+                                else:
+                                    status_box.update(label="更新失败", state="error")
+                                    st.error(job.get("error") or f"任务状态: {status}")
+                                    with st.expander("📋 Worker 日志", expanded=False):
+                                        st.code(jm.read_log(job_id, tail=200), language="log")
+                                break
+
+                            time.sleep(1.0)
+                    except Exception as e:
+                        progress_bar.progress(100, text="失败")
+                        status_box.update(label="更新失败", state="error")
+                        st.error(f"精筛池更新启动失败: {e}")
         st.caption(
             "\U0001f446 四层筛选管线（总纲§4.1, V3 流式 + L2 pre-fetch 复用）:\n\n"
             "**Layer 0 硬筛**: 去ST/新股/BJ/B股/近20日日均成交额<2000万 → ~4500只\n"

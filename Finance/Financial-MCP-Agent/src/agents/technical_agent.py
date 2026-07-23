@@ -346,11 +346,16 @@ async def technical_agent(state: AgentState) -> AgentState:
             tool_map = {t.name: t for t in mcp_tools}
             if "tushare_kline" in tool_map:
                 try:
-                    kline_result = await asyncio.wait_for(
-                        tool_map["tushare_kline"].ainvoke({"code": clean_code, "days": 250}),
-                        timeout=30.0,
-                    )
-                    kline_str = str(kline_result) if kline_result else ""
+                    # 4.1 DataGateway：预计算 kline 优先命中统一预取（该调用不走工具缓存）
+                    from src.data.data_gateway import get_prefetched
+                    _kline_kwargs = {"code": clean_code, "days": 250}
+                    kline_str = get_prefetched("tushare_kline", _kline_kwargs) or ""
+                    if not kline_str:
+                        kline_result = await asyncio.wait_for(
+                            tool_map["tushare_kline"].ainvoke(_kline_kwargs),
+                            timeout=30.0,
+                        )
+                        kline_str = str(kline_result) if kline_result else ""
                     indicator_summary = _build_indicator_summary(kline_str, stock_code)
                     if indicator_summary:
                         logger.info(f"{SUCCESS_ICON} TechnicalAgent: 预计算指标完成 ({len(indicator_summary)} 字符)")
@@ -432,6 +437,8 @@ async def technical_agent(state: AgentState) -> AgentState:
 ⛔ 结构化输出要求：
 在完成上述分析的「🔍 分析判断区」之后，请额外输出一个 JSON block：
 
+每条 signal 必须额外包含 "category" 字段，从以下枚举中选择最贴切的一项：fundamentals_growth(业绩成长), fundamentals_profit_quality(盈利质量), valuation(估值), balance_sheet(资产负债), cashflow(现金流), governance(公司治理), capital_flow(资金流向), technical_trend(技术趋势), sentiment(舆情情绪), catalyst_event(事件催化), dividend(分红回报), ownership(股权结构), industry_policy(行业政策), liquidity(流动性/量价), risk_flag(风险事件), other(无法归类)。
+
 <SIGNAL_PACK>
 {{
     "bias": "bullish"|"neutral"|"bearish",
@@ -442,6 +449,7 @@ async def technical_agent(state: AgentState) -> AgentState:
             "factor": "因子名(如:均线多头排列/MACD金叉/量价背离)",
             "direction": 1|-1|0,
             "strength": 0-100,
+            "category": "信号类目(见上方枚举)",
             "time_horizon": ["short","medium"],
             "source_level": "structured",
             "risk_flags": [],

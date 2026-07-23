@@ -48,6 +48,8 @@ AGENT_MODEL_SUFFIX: Dict[str, str] = {
     "quality_risk_analyst": "",             # Model 1: MiMo-V2.5-Pro — 财务质量/治理风险深度分析
     "moneyflow_analyst": "_3",           # Model 3: Qwen3.7-Plus — 资金面/量价确认
     "short_term_scorer": "_3",
+    "conflict_arbiter": "_3",            # Model 3: Qwen3.7-Plus — 冲突仲裁（4.3，不开 thinking）
+    "score_explainer": "_3",             # Model 3: Qwen3.7-Plus — 打分解释（4.3，懒加载）
     "fund_manager_agent": "_3",
     "fund_event_agent": "_3",
     "fund_fee_agent": "_3",           # Qwen3.7-Plus — structured fee analysis

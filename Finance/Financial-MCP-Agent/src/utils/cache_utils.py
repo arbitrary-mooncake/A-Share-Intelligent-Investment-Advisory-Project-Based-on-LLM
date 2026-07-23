@@ -187,6 +187,15 @@ def read_signal_pack_cache(agent_name: str, stock_code: str, date_str: str) -> d
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # 4.9-1 兜底路径：schema 版本不符（旧格式无 category）按 miss 处理，
+        # 让 Agent 正常重跑并写回新格式；回填脚本会给旧缓存补 category 并打上版本戳。
+        from src.utils.analysis_schema import SIGNAL_PACK_SCHEMA_VERSION
+        try:
+            version = int(data.get("_schema_version", 1))
+        except (ValueError, TypeError):
+            version = 1
+        if version < SIGNAL_PACK_SCHEMA_VERSION:
+            return None
         return data
     except Exception:
         return None
@@ -199,6 +208,9 @@ def write_signal_pack_cache(agent_name: str, stock_code: str, date_str: str, sig
     suffix = _get_filename_suffix()
     cache_path = os.path.join(cache_dir, f"{agent_name}_signal_pack_{safe_code}_{date_str}{suffix}.json")
     try:
+        from src.utils.analysis_schema import SIGNAL_PACK_SCHEMA_VERSION
+        if isinstance(signal_pack, dict):
+            signal_pack["_schema_version"] = SIGNAL_PACK_SCHEMA_VERSION
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(signal_pack, f, ensure_ascii=False, default=str)
     except Exception:

@@ -14,6 +14,7 @@ from src.utils.analysis_schema import (
     SourceLevel, SOURCE_PRIORITY,
     FALLBACK_SIGNAL_PACK,
     AnalysisPackage,
+    SIGNAL_CATEGORIES,
 )
 
 
@@ -118,6 +119,15 @@ def normalize_signal_pack(sp: Dict[str, Any]) -> Dict[str, Any]:
     for sig in sp.get("signals", []):
         if not isinstance(sig, dict):
             continue
+
+        # category 枚举校验（4.3）：非法值归入 other；缺失保持缺失
+        # （旧缓存无 category 的信号不参与冲突归组，自然跳过）
+        cat = sig.get("category")
+        if cat is not None:
+            if not isinstance(cat, str) or cat.strip() not in SIGNAL_CATEGORIES:
+                sig["category"] = "other"
+            else:
+                sig["category"] = cat.strip()
 
         d = sig.get("direction", 0)
         if isinstance(d, str):

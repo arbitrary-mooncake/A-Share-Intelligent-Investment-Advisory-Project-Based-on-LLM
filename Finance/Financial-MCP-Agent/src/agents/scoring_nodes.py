@@ -5,14 +5,47 @@ Scoring Nodes: LangGraph wrapper for 3 scoring agents (v2 — structured evidenc
   - short_term: technical + news + event + moneyflow
   - medium_term + long_term: all 7 analysis agents
   - 每个node先构建AnalysisPackage → 传给scorer → apply risk_gate
+
+  - 4.3 确定性打分: DETERMINISTIC_SCORER_ENABLED=1 时 scorer 由纯函数计算
+    （冲突仲裁+解释懒加载），默认 0 保持 LLM scorer 路径不变
 """
 import json
+import os
 from typing import Dict, Any
 
 from src.utils.state_definition import AgentState
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 
 logger = setup_logger(__name__)
+
+
+def _deterministic_scorer_enabled() -> bool:
+    """4.3 确定性 scorer 开关（默认关=LLM 路径，离线比对达标后才应开启）。"""
+    return os.getenv("DETERMINISTIC_SCORER_ENABLED", "0").strip() == "1"
+
+
+async def _run_deterministic_scorer(
+    term: str, pkg: Any, stock_code: str, company_name: str, is_etf: bool,
+) -> Dict[str, Any]:
+    """确定性打分路径：代码公式 + 冲突仲裁（有界折扣）+ 可选 LLM 解释。"""
+    from src.utils.deterministic_scorer import (
+        collect_signals, detect_material_conflicts, compute_score,
+    )
+    from src.utils.conflict_arbitration import arbitrate_conflicts
+
+    signals = collect_signals(pkg)
+    conflicts = detect_material_conflicts(signals)
+    arbitration_on = os.getenv("CONFLICT_ARBITRATION_ENABLED", "1").strip() != "0"
+    discounts = await arbitrate_conflicts(conflicts, enabled=arbitration_on)
+    result = compute_score(term, signals, pkg, is_etf=is_etf, signal_discounts=discounts)
+
+    from src.utils.score_explanation import explanation_enabled, generate_score_explanation
+    if explanation_enabled():
+        result["reasoning"] = await generate_score_explanation(term, result, pkg, company_name)
+
+    if conflicts:
+        logger.info(f"确定性打分[{term}]: {len(conflicts)} 组实质冲突, {len(discounts)} 条信号折扣")
+    return result
 
 
 def _score_cache_contract(pkg: Any, gate: Any, required_agents: int) -> Dict[str, Any]:
@@ -77,21 +110,26 @@ async def short_term_scorer_node(state: AgentState) -> Dict[str, Any]:
 
         pkg = build_analysis_package(data, as_of_date)
 
-        result = await short_term_scorer(
-            stock_code=stock_code, company_name=company_name,
-            technical_analysis=data.get("technical_analysis", ""),
-            news_analysis=data.get("news_analysis", ""),
-            event_analysis=data.get("event_analysis", ""),
-            moneyflow_analysis=data.get("moneyflow_analysis", ""),
-            analysis_package=pkg,
-            current_time_info=data.get("current_time_info", ""),
-            current_date=as_of_date,
-            query=data.get("query", ""),
-            model_name=data.get("model_name", ""),
-            model_api_key=data.get("model_api_key", ""),
-            model_base_url=data.get("model_base_url", ""),
-            thinking_enabled=data.get("thinking_enabled", True),
-        )
+        if _deterministic_scorer_enabled():
+            result = await _run_deterministic_scorer(
+                "short", pkg, stock_code, company_name, data.get("is_etf", False),
+            )
+        else:
+            result = await short_term_scorer(
+                stock_code=stock_code, company_name=company_name,
+                technical_analysis=data.get("technical_analysis", ""),
+                news_analysis=data.get("news_analysis", ""),
+                event_analysis=data.get("event_analysis", ""),
+                moneyflow_analysis=data.get("moneyflow_analysis", ""),
+                analysis_package=pkg,
+                current_time_info=data.get("current_time_info", ""),
+                current_date=as_of_date,
+                query=data.get("query", ""),
+                model_name=data.get("model_name", ""),
+                model_api_key=data.get("model_api_key", ""),
+                model_base_url=data.get("model_base_url", ""),
+                thinking_enabled=data.get("thinking_enabled", True),
+            )
 
         gate = apply_risk_gate(pkg, "short", result["score"])
         if gate.score_cap is not None:
@@ -161,24 +199,29 @@ async def medium_term_scorer_node(state: AgentState) -> Dict[str, Any]:
 
         pkg = build_analysis_package(data, as_of_date)
 
-        result = await medium_term_scorer(
-            stock_code=stock_code, company_name=company_name,
-            fundamental_analysis=data.get("fundamental_analysis", ""),
-            technical_analysis=data.get("technical_analysis", ""),
-            value_analysis=data.get("value_analysis", ""),
-            news_analysis=data.get("news_analysis", ""),
-            event_analysis=data.get("event_analysis", ""),
-            quality_risk_analysis=data.get("quality_risk_analysis", ""),
-            moneyflow_analysis=data.get("moneyflow_analysis", ""),
-            analysis_package=pkg,
-            current_time_info=data.get("current_time_info", ""),
-            current_date=as_of_date,
-            query=data.get("query", ""),
-            model_name=data.get("model_name", ""),
-            model_api_key=data.get("model_api_key", ""),
-            model_base_url=data.get("model_base_url", ""),
-            thinking_enabled=data.get("thinking_enabled", True),
-        )
+        if _deterministic_scorer_enabled():
+            result = await _run_deterministic_scorer(
+                "medium", pkg, stock_code, company_name, data.get("is_etf", False),
+            )
+        else:
+            result = await medium_term_scorer(
+                stock_code=stock_code, company_name=company_name,
+                fundamental_analysis=data.get("fundamental_analysis", ""),
+                technical_analysis=data.get("technical_analysis", ""),
+                value_analysis=data.get("value_analysis", ""),
+                news_analysis=data.get("news_analysis", ""),
+                event_analysis=data.get("event_analysis", ""),
+                quality_risk_analysis=data.get("quality_risk_analysis", ""),
+                moneyflow_analysis=data.get("moneyflow_analysis", ""),
+                analysis_package=pkg,
+                current_time_info=data.get("current_time_info", ""),
+                current_date=as_of_date,
+                query=data.get("query", ""),
+                model_name=data.get("model_name", ""),
+                model_api_key=data.get("model_api_key", ""),
+                model_base_url=data.get("model_base_url", ""),
+                thinking_enabled=data.get("thinking_enabled", True),
+            )
 
         gate = apply_risk_gate(pkg, "medium", result["score"])
         if gate.score_cap is not None:
@@ -248,24 +291,29 @@ async def long_term_scorer_node(state: AgentState) -> Dict[str, Any]:
 
         pkg = build_analysis_package(data, as_of_date)
 
-        result = await long_term_scorer(
-            stock_code=stock_code, company_name=company_name,
-            fundamental_analysis=data.get("fundamental_analysis", ""),
-            technical_analysis=data.get("technical_analysis", ""),
-            value_analysis=data.get("value_analysis", ""),
-            news_analysis=data.get("news_analysis", ""),
-            event_analysis=data.get("event_analysis", ""),
-            quality_risk_analysis=data.get("quality_risk_analysis", ""),
-            moneyflow_analysis=data.get("moneyflow_analysis", ""),
-            analysis_package=pkg,
-            current_time_info=data.get("current_time_info", ""),
-            current_date=as_of_date,
-            query=data.get("query", ""),
-            model_name=data.get("model_name", ""),
-            model_api_key=data.get("model_api_key", ""),
-            model_base_url=data.get("model_base_url", ""),
-            thinking_enabled=data.get("thinking_enabled", True),
-        )
+        if _deterministic_scorer_enabled():
+            result = await _run_deterministic_scorer(
+                "long", pkg, stock_code, company_name, data.get("is_etf", False),
+            )
+        else:
+            result = await long_term_scorer(
+                stock_code=stock_code, company_name=company_name,
+                fundamental_analysis=data.get("fundamental_analysis", ""),
+                technical_analysis=data.get("technical_analysis", ""),
+                value_analysis=data.get("value_analysis", ""),
+                news_analysis=data.get("news_analysis", ""),
+                event_analysis=data.get("event_analysis", ""),
+                quality_risk_analysis=data.get("quality_risk_analysis", ""),
+                moneyflow_analysis=data.get("moneyflow_analysis", ""),
+                analysis_package=pkg,
+                current_time_info=data.get("current_time_info", ""),
+                current_date=as_of_date,
+                query=data.get("query", ""),
+                model_name=data.get("model_name", ""),
+                model_api_key=data.get("model_api_key", ""),
+                model_base_url=data.get("model_base_url", ""),
+                thinking_enabled=data.get("thinking_enabled", True),
+            )
 
         gate = apply_risk_gate(pkg, "long", result["score"])
         if gate.score_cap is not None:

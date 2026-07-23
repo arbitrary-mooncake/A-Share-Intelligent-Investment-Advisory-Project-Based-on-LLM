@@ -22,7 +22,7 @@ from api_client import (
     trigger_report,
     poll_report_status,
 )
-from theme import inject_global_styles
+from theme import inject_global_styles, page_title
 
 # ──────────────────────────────────────────────
 # 页面配置
@@ -61,7 +61,7 @@ def handle_poll_report(task_id: str, on_progress=None):
 # ──────────────────────────────────────────────
 # 页面标题
 # ──────────────────────────────────────────────
-st.title("🔍 股票查询")
+page_title("🔍 股票查询")
 st.caption("输入股票代码或名称，快速获取分析或生成深度报告")
 
 

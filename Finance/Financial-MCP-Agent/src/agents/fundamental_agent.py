@@ -447,6 +447,8 @@ async def fundamental_agent(state: AgentState) -> AgentState:
 ⛔ 结构化输出要求：
 在完成上述分析的「🔍 分析判断区」之后，请额外输出一个 JSON block：
 
+每条 signal 必须额外包含 "category" 字段，从以下枚举中选择最贴切的一项：fundamentals_growth(业绩成长), fundamentals_profit_quality(盈利质量), valuation(估值), balance_sheet(资产负债), cashflow(现金流), governance(公司治理), capital_flow(资金流向), technical_trend(技术趋势), sentiment(舆情情绪), catalyst_event(事件催化), dividend(分红回报), ownership(股权结构), industry_policy(行业政策), liquidity(流动性/量价), risk_flag(风险事件), other(无法归类)。
+
 <SIGNAL_PACK>
 {{
     "bias": "bullish"|"neutral"|"bearish",
@@ -457,6 +459,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             "factor": "因子名(如:ROE持续性/现金流质量/负债率)",
             "direction": 1|-1|0,
             "strength": 0-100,
+            "category": "信号类目(见上方枚举)",
             "time_horizon": ["medium","long"],
             "source_level": "official_like"|"structured"|"derived",
             "risk_flags": [],

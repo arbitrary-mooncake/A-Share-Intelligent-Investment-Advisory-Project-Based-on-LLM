@@ -313,26 +313,6 @@ async def test_score_stock_pit_fallback_consistent():
     assert s1 == s2  # Deterministic
 
 
-def test_fallback_composite_score_range():
-    """Fallback scores should be in reasonable range."""
-    engine = ReplayBacktestEngine()
-    for code in ("sh.601888", "sz.000858", "sz.300750", "sh.688981"):
-        score = engine._fallback_composite_score(code, "2024-06-14")
-        assert 30 <= score <= 85
-
-
-def test_fallback_composite_score_different_segments():
-    """Different market segments should yield different baseline scores."""
-    engine = ReplayBacktestEngine()
-    sh_main = engine._fallback_composite_score("sh.601888", "2024-06-14")
-    sz_main = engine._fallback_composite_score("sz.000858", "2024-06-14")
-    gem = engine._fallback_composite_score("sz.300750", "2024-06-14")
-    star = engine._fallback_composite_score("sh.688981", "2024-06-14")
-    # All should be different (different market segments)
-    scores = {sh_main, sz_main, gem, star}
-    assert len(scores) >= 2  # At least some segments differ
-
-
 # ── Add: Ablation discount tests ──
 
 def test_apply_ablation_discount():

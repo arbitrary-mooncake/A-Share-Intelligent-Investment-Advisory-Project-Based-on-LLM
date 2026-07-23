@@ -211,7 +211,7 @@ async def moneyflow_analyst_agent(state: AgentState) -> AgentState:
 
 ⛔ 先输出「📊 数据事实区」「🔍 分析判断区」的自然语言分析。
 末尾输出: <SIGNAL_PACK>{{JSON}}</SIGNAL_PACK>
-JSON含: bias, confidence, key_points(≤5条), signals(≤8条,含factor/direction/strength/confidence/time_horizon/source_level/freshness/note), risk_flags, missing_data, source_summary
+JSON含: bias, confidence, key_points(≤5条), signals(≤8条,含factor/category/direction/strength/confidence/time_horizon/source_level/freshness/note), risk_flags, missing_data, source_summary。每条signal必须包含category字段，从以下枚举选择最贴切的一项: fundamentals_growth(业绩成长), fundamentals_profit_quality(盈利质量), valuation(估值), balance_sheet(资产负债), cashflow(现金流), governance(公司治理), capital_flow(资金流向), technical_trend(技术趋势), sentiment(舆情情绪), catalyst_event(事件催化), dividend(分红回报), ownership(股权结构), industry_policy(行业政策), liquidity(流动性/量价), risk_flag(风险事件), other(无法归类)
 signal中source_level优先使用structured(如moneyflow/top_list等数值工具)和news(龙虎榜评论)
 """
 

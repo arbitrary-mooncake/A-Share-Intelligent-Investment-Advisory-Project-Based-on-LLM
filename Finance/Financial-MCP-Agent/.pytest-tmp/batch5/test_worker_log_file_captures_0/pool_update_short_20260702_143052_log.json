@@ -1,0 +1,27 @@
+{
+  "job_id": "pool_update_short_20260702_143052_log",
+  "term": "short",
+  "status": "completed",
+  "mode": "full",
+  "pid": 22636,
+  "parent_pid": 20688,
+  "started_at": null,
+  "finished_at": "2026-07-22T14:44:31.387270",
+  "error": null,
+  "progress": {
+    "overall_pct": 10.0,
+    "elapsed_s": 1,
+    "eta_s": 1,
+    "eta_str": "1s",
+    "queue_depth": 0,
+    "stall_s": 0,
+    "stages": {},
+    "result": {
+      "term": "short",
+      "pool": [],
+      "final_pool_size": 0,
+      "stats": {}
+    }
+  },
+  "completed_stocks": []
+}

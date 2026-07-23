@@ -20,6 +20,7 @@ import os
 import sys
 import time
 import asyncio
+import math
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
@@ -77,6 +78,20 @@ class ScoringEngine:
         else:
             self.pool_manager = pool_manager or StockPoolManager()
         self._workflow = None
+        self._term_workflows: Dict[str, Any] = {}
+
+    @staticmethod
+    async def _prefetch(term: str, stock_code: str, initial_state: AgentState) -> None:
+        """4.1 DataGateway：打分前按期限统一预取数据（失败不影响主流程）。"""
+        from src.data.data_gateway import prefetch_term_bundle
+
+        data = initial_state.get("data", {})
+        await prefetch_term_bundle(
+            term,
+            stock_code,
+            current_date=data.get("current_date", ""),
+            is_etf=data.get("is_etf", False),
+        )
 
     def _build_workflow(self) -> StateGraph:
         """构建LangGraph工作流"""
@@ -143,6 +158,69 @@ class ScoringEngine:
             self._workflow = workflow.compile()
         return self._workflow
 
+    # 各期限打分实际依赖的分析 Agent（4.2 期限子图）
+    _TERM_AGENTS = {
+        "short": ["technical", "news", "event", "moneyflow"],
+        "medium": ["fundamental", "technical", "value", "news", "event", "quality_risk", "moneyflow"],
+        "long": ["fundamental", "technical", "value", "news", "event", "quality_risk", "moneyflow"],
+    }
+    _AGENT_NODE_SPECS = {
+        "fundamental": ("fundamental_analyst", fundamental_agent),
+        "technical": ("technical_analyst", technical_agent),
+        "value": ("value_analyst", value_agent),
+        "news": ("news_analyst", news_agent),
+        "event": ("event_analyst", event_analyst_agent),
+        "quality_risk": ("quality_risk_analyst", quality_risk_analyst_agent),
+        "moneyflow": ("moneyflow_analyst", moneyflow_analyst_agent),
+    }
+
+    def _build_term_workflow(self, term: str) -> StateGraph:
+        """构建单期限评分子图（4.2）：只挂该期限实际需要的分析 Agent 和 scorer。
+
+        - short: technical/news/event/moneyflow + short_term_scorer
+        - medium/long: 全部 7 个分析 Agent + 对应期限 scorer
+
+        score_stock() 使用的全图保持不变；本方法仅服务于 score_stock_for_term()
+        与 score_for_quick_screen()，消除单期限打分白跑另外两个 scorer 及
+        短期不需要的三个财务 Agent 的浪费。
+        """
+        if term not in self._TERM_AGENTS:
+            raise ValueError(f"未知期限: {term} (应为 short/medium/long)")
+        if term in self._term_workflows:
+            return self._term_workflows[term]
+
+        from src.agents.scoring_nodes import (
+            short_term_scorer_node,
+            medium_term_scorer_node,
+            long_term_scorer_node,
+        )
+        scorer_specs = {
+            "short": ("short_term_scorer", short_term_scorer_node),
+            "medium": ("medium_term_scorer", medium_term_scorer_node),
+            "long": ("long_term_scorer", long_term_scorer_node),
+        }
+
+        workflow = StateGraph(AgentState)
+        workflow.add_node("start_node", lambda state: state)
+
+        agent_nodes = []
+        for agent_key in self._TERM_AGENTS[term]:
+            node_name, node_fn = self._AGENT_NODE_SPECS[agent_key]
+            workflow.add_node(node_name, node_fn)
+            agent_nodes.append(node_name)
+
+        scorer_name, scorer_fn = scorer_specs[term]
+        workflow.add_node(scorer_name, scorer_fn)
+
+        workflow.set_entry_point("start_node")
+        for node_name in agent_nodes:
+            workflow.add_edge("start_node", node_name)
+            workflow.add_edge(node_name, scorer_name)
+        workflow.add_edge(scorer_name, END)
+
+        self._term_workflows[term] = workflow.compile()
+        return self._term_workflows[term]
+
     @staticmethod
     def _build_initial_state(
         stock_code: str, company_name: str,
@@ -200,6 +278,16 @@ class ScoringEngine:
         code = stock_code.replace("sh.", "").replace("sz.", "").replace(".SH", "").replace(".SZ", "").strip()
         return code.startswith(("51", "58", "15", "16", "18"))
 
+    @staticmethod
+    def _has_valid_score(score_payload: Any) -> bool:
+        """Return True only for a finite, bounded numeric scorer result."""
+        if not isinstance(score_payload, dict):
+            return False
+        score = score_payload.get("score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            return False
+        return math.isfinite(float(score)) and 0.0 <= float(score) <= 100.0
+
     async def score_stock(self, stock_code: str, company_name: str) -> Dict[str, Any]:
         """
         对指定股票运行完整分析+打分Pipeline
@@ -225,6 +313,9 @@ class ScoringEngine:
             # 2. 构建初始状态
             initial_state = self._build_initial_state(stock_code, company_name)
 
+            # 2.5 统一预取（4.1）：全图所需数据一次取齐，Agent 共享快照
+            await self._prefetch("full", stock_code, initial_state)
+
             # 3. 执行Pipeline: 7个分析Agent并行 → 3个打分Agent并行
             logger.info(f"{WAIT_ICON} 正在运行分析+打分Pipeline...")
             final_state = await asyncio.wait_for(
@@ -237,8 +328,18 @@ class ScoringEngine:
             medium_term_score = data.get("medium_term_score", {})
             long_term_score = data.get("long_term_score", {})
 
-            if not medium_term_score:
-                raise ValueError("Pipeline未生成中线评分")
+            missing_scores = [
+                term for term, payload in (
+                    ("短线", short_term_score),
+                    ("中线", medium_term_score),
+                    ("长线", long_term_score),
+                )
+                if not self._has_valid_score(payload)
+            ]
+            if missing_scores:
+                raise ValueError(
+                    f"Pipeline未生成有效评分: {', '.join(missing_scores)}"
+                )
 
             # 5. 构建存储数据：以中线评分为主评分
             score_data = {
@@ -293,15 +394,9 @@ class ScoringEngine:
             if self.pool_manager:
                 for t in ("short", "medium", "long"):
                     self.pool_manager.update_stock_status(t, stock_code, "failed")
-                self.pool_manager.update_stock_score(stock_code, {
-                    "score": None,
-                    "recommendation": "",
-                    "short_term_score": {},
-                    "medium_term_score": {},
-                    "long_term_score": {},
-                    "company_name": company_name,
-                    "status": "failed",
-                })
+                # Failure must not overwrite a previously valid score with None.
+                # The explicit failed status above is sufficient for retry/UI
+                # visibility; score persistence is reserved for valid results.
 
             return {
                 "stock_code": stock_code,
@@ -330,8 +425,10 @@ class ScoringEngine:
         start_time = time.time()
 
         try:
-            app = self._build_workflow()
+            # 4.2 期限子图：只运行该期限实际需要的 Agent 和 scorer
+            app = self._build_term_workflow(term)
             initial_state = self._build_initial_state(stock_code, company_name)
+            await self._prefetch(term, stock_code, initial_state)
             final_state = await asyncio.wait_for(
                 app.ainvoke(initial_state), timeout=2400.0
             )
@@ -344,8 +441,8 @@ class ScoringEngine:
             }
 
             target_score = term_scores.get(term, {})
-            if not target_score:
-                raise ValueError(f"Pipeline未生成{term}评分")
+            if not self._has_valid_score(target_score):
+                raise ValueError(f"Pipeline未生成有效{term}评分")
 
             score_data = {
                 "score": target_score.get("score"),
@@ -432,13 +529,15 @@ class ScoringEngine:
         start_time = time.time()
 
         try:
-            app = self._build_workflow()
+            # 4.2 期限子图：快筛同样只运行目标期限所需节点
+            app = self._build_term_workflow(term)
             initial_state = self._build_initial_state(
                 stock_code, company_name,
                 model_config=model_config,
                 skip_cache=True,
                 thinking_enabled=True,  # MCP已绕过，thinking对速度影响可忽略
             )
+            await self._prefetch(term, stock_code, initial_state)
             final_state = await asyncio.wait_for(
                 app.ainvoke(initial_state), timeout=2400.0
             )
@@ -451,8 +550,8 @@ class ScoringEngine:
             }
             target_score = term_scores.get(term, {})
 
-            if not target_score:
-                raise ValueError(f"Pipeline未生成{term}评分")
+            if not self._has_valid_score(target_score):
+                raise ValueError(f"Pipeline未生成有效{term}评分")
 
             elapsed = time.time() - start_time
             logger.info(

@@ -23,6 +23,33 @@ SOURCE_PRIORITY = {
     SourceLevel.PROXY: 1,
 }
 
+# ── 信号类目枚举（4.3 冲突检测归组用） ──
+# 由分析 Agent 的 LLM 在产出 signal_pack 时按枚举自行声明，
+# 代码侧只做枚举相等比较，不做词典/正则匹配。
+SIGNAL_CATEGORIES = [
+    "fundamentals_growth",          # 业绩成长性
+    "fundamentals_profit_quality",  # 盈利质量
+    "valuation",                    # 估值
+    "balance_sheet",                # 资产负债结构
+    "cashflow",                     # 现金流
+    "governance",                   # 公司治理
+    "capital_flow",                 # 资金流向
+    "technical_trend",              # 技术趋势
+    "sentiment",                    # 舆情情绪
+    "catalyst_event",               # 事件催化
+    "dividend",                     # 分红回报
+    "ownership",                    # 股权结构
+    "industry_policy",              # 行业与政策
+    "liquidity",                    # 流动性/量价
+    "risk_flag",                    # 风险事件
+    "other",                        # 无法归类（兜底）
+]
+
+# signal_pack 缓存 schema 版本：
+# v1 = 无 category 字段的旧格式；v2 = 信号含 category 枚举字段。
+# read_signal_pack_cache 对版本低于当前版本的缓存按 miss 处理（4.9-1 兜底路径）。
+SIGNAL_PACK_SCHEMA_VERSION = 2
+
 
 @dataclass
 class Signal:

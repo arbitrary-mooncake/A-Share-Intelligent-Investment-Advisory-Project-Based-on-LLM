@@ -63,6 +63,87 @@ def _invalid_score_record(
     }
 
 
+_LAYER2_RETRYABLE_ERROR_TYPES = frozenset({
+    "layer2_data_unavailable",
+    "layer2_timeout",
+    "layer2_error",
+    "layer2_provider_error",
+    "empty_layer2_response",
+    "missing_layer2_item",
+    "invalid_layer2_score",
+})
+
+
+def _is_layer2_provider_exception(error: BaseException) -> bool:
+    """识别可短暂恢复的 Layer 2 供应商/网络异常。"""
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        return True
+    module = type(error).__module__.lower()
+    if module.startswith(("httpx", "httpcore", "openai")):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        "provider unavailable",
+        "service unavailable",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "connect error",
+        "rate limit",
+        "too many requests",
+        "upstream timeout",
+        "gateway timeout",
+        "api unavailable",
+    ))
+
+
+def _layer2_results_need_retry(results: List[Dict[str, Any]]) -> bool:
+    """仅对空响应或可恢复故障结果进行一次重试。"""
+    if not results:
+        return True
+    error_types = {
+        str(item.get("error_type") or "")
+        for item in results
+        if isinstance(item, dict) and item.get("validity") != "valid"
+    }
+    return bool(error_types & _LAYER2_RETRYABLE_ERROR_TYPES)
+
+
+def _normalize_layer2_results(
+    chunk: List[Dict[str, Any]],
+    results: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """为每个输入 code 生成且只生成一条结果，避免空响应静默丢候选。"""
+    expected_codes = {
+        stock.get("code", "") for stock in chunk if stock.get("code", "")
+    }
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        code = item.get("code", "")
+        if code in expected_codes and code not in by_code:
+            by_code[code] = item
+
+    normalized: List[Dict[str, Any]] = []
+    seen_codes = set()
+    for stock in chunk:
+        code = stock.get("code", "")
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        normalized.append(
+            by_code.get(code)
+            or _invalid_score_record(
+                stock,
+                "layer2_ranking",
+                "missing_layer2_item",
+                "Layer 2 响应缺少该股票",
+            )
+        )
+    return normalized
+
+
 def _assess_fresh_term_score(
     score_data: Any,
     signal_packs: Dict[str, Any],
@@ -309,6 +390,7 @@ class StreamingTopAlphaHeap:
         self.high: List[tuple] = []   # min-heap: (score, stock_code)
         self.low: List[tuple] = []    # max-heap: (-score, stock_code)
         self._dispatched: set = set()
+        self._dispatch_reserved: set = set()
         self._tau_history: List[float] = []
         self._total = 0
         self._stock_map: Dict[str, Any] = {}  # code → stock dict
@@ -325,6 +407,10 @@ class StreamingTopAlphaHeap:
     def feed(self, score: float, stock: Dict[str, Any]):
         """喂入一个新分数和对应的股票."""
         code = stock.get("code", str(id(stock)))
+        if code in self._stock_map:
+            # A code is a single candidate in one screening run.  Ignore
+            # duplicate routes/replies rather than corrupting alpha counts.
+            return
         self._stock_map[code] = stock
         self._total += 1
 
@@ -367,10 +453,27 @@ class StreamingTopAlphaHeap:
         """获取 High 中尚未 dispatch 的股票列表."""
         result = []
         for _, code in self.high:
-            if code not in self._dispatched and code in self._stock_map:
+            if (
+                code not in self._dispatched
+                and code not in self._dispatch_reserved
+                and code in self._stock_map
+            ):
                 result.append(self._stock_map[code])
-                self._dispatched.add(code)
+                self._dispatch_reserved.add(code)
         return result
+
+    def mark_dispatched(self, code: str) -> None:
+        """确认候选已成功入队。"""
+        self._dispatch_reserved.discard(code)
+        self._dispatched.add(code)
+
+    def release_dispatch(self, code: str) -> None:
+        """释放入队失败/取消的候选，允许后续再次派发。"""
+        self._dispatch_reserved.discard(code)
+
+    def release_dispatches(self, codes: List[str]) -> None:
+        for code in codes:
+            self.release_dispatch(code)
 
     def finalize(self) -> List[Dict[str, Any]]:
         """Layer 1 完成后调用, dispatch High 中所有剩余的."""
@@ -985,7 +1088,7 @@ async def score_layer2_batch(
     from src.utils.model_config import get_thinking_body
     llm = OpenAICompatibleClient(
         api_key=api_key, base_url=base_url, model=model, env_prefix="",
-        extra_body=get_thinking_body(base_url, enabled=True),
+        extra_body=get_thinking_body(base_url, enabled=False),
         http_timeout=180, http_connect_timeout=10,
     )
 
@@ -1144,6 +1247,10 @@ reason(30字内), risk(30字内)。核心数据不足必须 abstain 且 score=nu
                 "error_message": "Layer 2 打分超时",
             } for code in expected)
         except Exception as e:
+            if not _is_layer2_provider_exception(e):
+                # Programming/configuration/schema failures must remain
+                # observable and reach the V3 fatal-stage guard.
+                raise
             logger.error("[Layer 2] 批次失败: %s", e)
             chunk_results.extend({
                 "code": code,
@@ -1151,7 +1258,7 @@ reason(30字内), risk(30字内)。核心数据不足必须 abstain 且 score=nu
                 "validity": "invalid",
                 "coverage": 0.0,
                 "missing_core_fields": ["score"],
-                "error_type": "layer2_error",
+                "error_type": "layer2_provider_error",
                 "error_message": str(e),
             } for code in expected)
         async with score_lock:
@@ -1329,7 +1436,7 @@ async def _dynamic_threshold(scores: List[float], target_size: int) -> float:
             base_url=model_cfg["base_url"],
             model=model_cfg["model_name"],
             env_prefix="",
-            extra_body=get_thinking_body(model_cfg["base_url"], enabled=True),
+            extra_body=get_thinking_body(model_cfg["base_url"], enabled=False),
             http_timeout=60,
         )
 
@@ -2095,6 +2202,10 @@ async def run_pool_update_v3(
     # Layer 2 后台任务队列 (流水线: L2 与 L1 并行, 避免阻塞)
     layer2_pending_tasks: List[asyncio.Task] = []
     layer2_task_lock = asyncio.Lock()
+    # score_layer2_batch() already starts up to 8 inner LLM requests.  A
+    # semaphore local to each background task would multiply that concurrency
+    # across all L1 chunks, so keep one L2 batch in flight at a time.
+    layer2_batch_semaphore = asyncio.Semaphore(1)
 
     # Checkpoint: 每 5 分钟写一次 refined_pools.json, crash 时最多丢 5 分钟工作
     CHECKPOINT_INTERVAL = 300  # 5 分钟
@@ -2158,6 +2269,17 @@ async def run_pool_update_v3(
         _fetch_acc[0] += _fetch_step
         progress.stage_progress("1_batch_score", int(min(_fetch_acc[0], len(ts_stocks) * 0.35)))
 
+    async def _dispatch_heap_candidates(candidates: List[Dict[str, Any]], label: str):
+        """入队成功后才确认 dispatched；取消/失败时释放保留标记。"""
+        codes = [stock.get("code", "") for stock in candidates]
+        try:
+            for stock in candidates:
+                await _safe_queue_put(layer3_queue, stock, label)
+                stream_heap.mark_dispatched(stock.get("code", ""))
+        except BaseException:
+            stream_heap.release_dispatches(codes)
+            raise
+
     async for batch in batch_score_layer1_stream(
         ts_stocks, term, on_progress=None,
         progress_touch=_progress_touch
@@ -2186,6 +2308,9 @@ async def run_pool_update_v3(
                         stock.get("_score_missing_core_fields") or ["level"]
                     ),
                 ))
+                continue
+            if not code or code in code_to_stock:
+                logger.warning("[V3:%s] 忽略 Layer 1 重复/空股票代码: %s", term, code)
                 continue
             # 累积 L1 raw data (供 Layer 2 复用, 避免冗余 fetch)
             raw_data = stock.pop("_raw_data", None)
@@ -2221,21 +2346,75 @@ async def run_pool_update_v3(
 
             async def _process_l2_chunk(chunk, raw_map_snapshot):
                 nonlocal layer2_fallback
+                layer2_scored: Optional[List[Dict[str, Any]]] = None
+                layer2_error: Optional[BaseException] = None
                 try:
-                    layer2_scored = await score_layer2_batch(
-                        chunk, term, pre_fetched_data=raw_map_snapshot,
-                    )
+                    # One retry is enough to absorb a transient provider/empty
+                    # response without multiplying load during a longer outage.
+                    for attempt in range(2):
+                        try:
+                            async with layer2_batch_semaphore:
+                                raw_results = await score_layer2_batch(
+                                    chunk, term, pre_fetched_data=raw_map_snapshot,
+                                )
+                        except Exception as e:
+                            layer2_error = e
+                            if attempt == 0 and _is_layer2_provider_exception(e):
+                                logger.warning(
+                                    "Layer 2 chunk(%d只)遇到可恢复异常，第%d次重试: %s",
+                                    len(chunk), attempt + 2, e,
+                                )
+                                await asyncio.sleep(1.0)
+                                continue
+                            break
+
+                        normalized = _normalize_layer2_results(chunk, raw_results)
+                        valid_count = sum(
+                            1 for item in normalized
+                            if item.get("validity") == "valid"
+                        )
+                        layer2_scored = normalized
+                        layer2_error = None
+                        if (
+                            valid_count > 0
+                            or attempt == 1
+                            or not _layer2_results_need_retry(normalized)
+                        ):
+                            break
+                        logger.warning(
+                            "Layer 2 chunk(%d只)无有效分数，第%d次重试",
+                            len(chunk), attempt + 2,
+                        )
+                        await asyncio.sleep(1.0)
+
+                    if layer2_error is not None:
+                        logger.error(
+                            "Layer 2 DSV4Pro 阶段失败，不生成替代分数: %s",
+                            layer2_error,
+                        )
+                        layer2_scored = [
+                            _invalid_score_record(
+                                stock,
+                                "layer2_ranking",
+                                type(layer2_error).__name__,
+                                str(layer2_error),
+                            )
+                            for stock in chunk
+                        ]
+                        if not _is_layer2_provider_exception(layer2_error):
+                            layer2_stage_failures.append(str(layer2_error))
+
                     valid_in_chunk = 0
-                    for s in layer2_scored:
+                    for s in layer2_scored or []:
                         if s.get("validity") == "valid":
-                            numeric = s["score"]
+                            numeric = float(s["score"])
                             valid_in_chunk += 1
                             code = s.get("code", "")
-                            recommended_score_map[code] = float(numeric)
+                            recommended_score_map[code] = numeric
                             stock = code_to_stock.get(code)
                             if stock:
-                                stock["layer2_score"] = float(numeric)
-                                stream_heap.feed(float(numeric), stock)
+                                stock["layer2_score"] = numeric
+                                stream_heap.feed(numeric, stock)
                         else:
                             stock = code_to_stock.get(s.get("code", ""), s)
                             layer2_invalid.append(_invalid_score_record(
@@ -2249,11 +2428,10 @@ async def run_pool_update_v3(
                                     s.get("missing_core_fields") or ["score"]
                                 ),
                             ))
-                    if chunk and valid_in_chunk == 0:
-                        layer2_stage_failures.append(
-                            f"Layer 2 chunk({len(chunk)}只)没有任何有效分数"
-                        )
-                    stream_heap.batch_done()
+                    if valid_in_chunk > 0:
+                        # A failed-only batch must not advance τ stability using
+                        # an unchanged threshold.
+                        stream_heap.batch_done()
                 except Exception as e:
                     logger.error("Layer 2 DSV4Pro 阶段失败，不生成替代分数: %s", e)
                     layer2_stage_failures.append(str(e))
@@ -2261,12 +2439,15 @@ async def run_pool_update_v3(
                         layer2_invalid.append(_invalid_score_record(
                             stock, "layer2_ranking", type(e).__name__, str(e)
                         ))
-                    stream_heap.batch_done()
 
                 # τ 稳定 → dispatch
                 if stream_heap.is_tau_stable():
-                    for stock in stream_heap.get_undispatched():
-                        await _safe_queue_put(layer3_queue, stock, "L3-heap")
+                    try:
+                        candidates = stream_heap.get_undispatched()
+                        await _dispatch_heap_candidates(candidates, "L3-heap")
+                    except Exception as e:
+                        logger.error("Layer 2 → Layer 3 派发失败: %s", e)
+                        layer2_stage_failures.append(f"Layer 2 派发失败: {e}")
 
             # 仅把本批 chunk 对应的 raw_data 快照传给后台任务, 避免 dict 共享竞态
             raw_snapshot = {code: layer1_raw_data_map[code]
@@ -2283,7 +2464,15 @@ async def run_pool_update_v3(
     # Layer 1 完成: 等待所有后台 L2 任务结束
     if layer2_pending_tasks:
         _stage("1_wait_l2", f"等待 {len(layer2_pending_tasks)} 个 L2 后台任务完成...")
-        await asyncio.gather(*layer2_pending_tasks, return_exceptions=True)
+        layer2_outcomes = await asyncio.gather(
+            *layer2_pending_tasks, return_exceptions=True
+        )
+        for outcome in layer2_outcomes:
+            if isinstance(outcome, BaseException):
+                logger.error("Layer 2 后台任务未正常完成: %s", outcome)
+                layer2_stage_failures.append(
+                    f"Layer 2 后台任务异常: {type(outcome).__name__}: {outcome}"
+                )
         async with layer2_task_lock:
             layer2_pending_tasks.clear()
 
@@ -2301,8 +2490,7 @@ async def run_pool_update_v3(
     progress.stage_start("2_stream_heap", total=stream_heap.total)
     _stage("2_finalize", f"Layer 2 流式堆 finalize: {stream_heap.total}只推荐, "
            f"high={stream_heap.high_size}, τ={stream_heap.tau:.1f}, fallback={layer2_fallback}")
-    for stock in stream_heap.finalize():
-        await _safe_queue_put(layer3_queue, stock, "L3-finalize")
+    await _dispatch_heap_candidates(stream_heap.finalize(), "L3-finalize")
     progress.stage_end("2_stream_heap")
     progress.queue_depth = layer3_queue.qsize()
 

@@ -331,8 +331,9 @@ async def news_agent(state: AgentState) -> AgentState:
             "换言之：你分析的是'市场如何看、如何传'，而不是'真实发生了什么'。\n\n"
             "⛔ 输出格式：先输出「📊 数据事实区」「🔍 分析判断区」，"
             "然后在末尾输出: <SIGNAL_PACK>{JSON}</SIGNAL_PACK>\n"
-            "其中JSON包含: bias, confidence, key_points(≤5条), signals(≤5条, source_level=\"news\"), "
-            "risk_flags, source_summary\n"
+            "其中JSON包含: bias, confidence, key_points(≤5条), signals(≤5条,含factor/category/direction/strength/confidence/note, source_level=\"news\"), "
+            "risk_flags, source_summary。"
+            "每条signal必须包含category字段，从以下枚举选择最贴切的一项: fundamentals_growth(业绩成长), fundamentals_profit_quality(盈利质量), valuation(估值), balance_sheet(资产负债), cashflow(现金流), governance(公司治理), capital_flow(资金流向), technical_trend(技术趋势), sentiment(舆情情绪), catalyst_event(事件催化), dividend(分红回报), ownership(股权结构), industry_policy(行业政策), liquidity(流动性/量价), risk_flag(风险事件), other(无法归类)\n"
         )}
     ]
     if news_text:

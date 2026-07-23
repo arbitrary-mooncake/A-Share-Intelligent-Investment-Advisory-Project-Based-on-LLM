@@ -7,6 +7,8 @@ StockPoolManager: 股票池持久化与管理
 import os
 import json
 import time
+import math
+from numbers import Real
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -391,6 +393,14 @@ class StockPoolManager:
 
     # ─── 评分更新 ───
 
+    @staticmethod
+    def _is_valid_score_value(value: Any) -> bool:
+        """只接受有限的 0-100 数值，避免无效分数进入股票池。"""
+        if isinstance(value, bool) or not isinstance(value, Real):
+            return False
+        value = float(value)
+        return math.isfinite(value) and 0.0 <= value <= 100.0
+
     def update_stock_score(self, stock_code: str, score_data: Dict[str, Any]):
         """
         更新股票评分（CLI 兼容：写入所有三个池的评分）
@@ -402,11 +412,42 @@ class StockPoolManager:
             score_data: 包含 score, recommendation, short_term_score,
                        medium_term_score, long_term_score 等字段
         """
+        if not isinstance(score_data, dict):
+            logger.warning("跳过非字典评分结果: %s", stock_code)
+            return
+
+        status = str(score_data.get("status") or "").lower()
+        main_score = score_data.get("score")
+        if status in {"failed", "invalid", "abstain"} or not self._is_valid_score_value(main_score):
+            # Failure/invalid payloads may update an existing status, but must
+            # never add a stock or overwrite a previous valid score.
+            changed = False
+            if status in {"failed", "invalid", "abstain"}:
+                for term in ("short", "medium", "long"):
+                    stock = self.pools[term]["stocks"].get(stock_code)
+                    if stock is not None and stock.get("status") != status:
+                        stock["status"] = status
+                        changed = True
+            if changed:
+                self._save()
+            logger.warning(
+                "跳过无效评分写入: %s status=%s score=%r",
+                stock_code, status or "unspecified", main_score,
+            )
+            return
+
         term_scores = {
             "short": score_data.get("short_term_score", {}),
             "medium": score_data.get("medium_term_score", {}),
             "long": score_data.get("long_term_score", {}),
         }
+        if any(
+            not isinstance(term_score, dict)
+            or not self._is_valid_score_value(term_score.get("score"))
+            for term_score in term_scores.values()
+        ):
+            logger.warning("跳过不完整三期限评分写入: %s", stock_code)
+            return
 
         new_company_name = score_data.get("company_name", "")
 
@@ -442,7 +483,6 @@ class StockPoolManager:
                 fine_stock["company_name"] = new_company_name
 
         self._save()
-        main_score = score_data.get("score")
         main_rec = score_data.get("recommendation", "")
         logger.info(f"{SUCCESS_ICON} 已更新评分: {main_score} ({main_rec})")
 
@@ -457,6 +497,22 @@ class StockPoolManager:
         """
         if stock_code not in self.pools[term]["stocks"]:
             raise ValueError(f"股票 {stock_code} 不在{TERM_LABELS[term]}池中")
+
+        if not isinstance(score_data, dict):
+            logger.warning("跳过非字典%s评分结果: %s", TERM_LABELS[term], stock_code)
+            return
+        status = str(score_data.get("status") or "").lower()
+        score = score_data.get("score")
+        if status in {"failed", "invalid", "abstain"} or not self._is_valid_score_value(score):
+            stock = self.pools[term]["stocks"][stock_code]
+            if status in {"failed", "invalid", "abstain"}:
+                stock["status"] = status
+                self._save()
+            logger.warning(
+                "跳过无效%s评分写入: %s status=%s score=%r",
+                TERM_LABELS[term], stock_code, status or "unspecified", score,
+            )
+            return
 
         stock = self.pools[term]["stocks"][stock_code]
         if stock["score"] is not None:

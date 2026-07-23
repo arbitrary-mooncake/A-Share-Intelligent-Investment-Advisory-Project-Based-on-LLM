@@ -18,6 +18,8 @@ import streamlit as st
 st.set_page_config(page_title="AI 智能问答", page_icon="💬", layout="wide")
 
 from components.shared_sidebar import render_sidebar
+from theme import inject_global_styles
+inject_global_styles()
 render_sidebar()
 
 # ──────────────────────────────────────────────
@@ -466,5 +468,4 @@ else:
         _render_messages()
         _process_pending()
         _render_chat_input(active_id, current_name)
-
 

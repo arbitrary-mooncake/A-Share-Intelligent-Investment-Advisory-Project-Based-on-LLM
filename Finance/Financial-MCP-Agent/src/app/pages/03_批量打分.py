@@ -36,6 +36,7 @@ from api_client import (
     poll_batch_results,
 )
 from components.shared_sidebar import render_sidebar
+from theme import inject_global_styles, page_title
 
 # ──────────────────────────────────────────────
 # 持久化存储 — 结果存磁盘，刷新不丢失
@@ -116,6 +117,7 @@ def _stock_key(stock: dict) -> str:
 # 页面配置
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="批量打分", page_icon="📋", layout="wide")
+inject_global_styles()
 render_sidebar()
 
 # ──────────────────────────────────────────────
@@ -207,7 +209,7 @@ for k, v in _defaults.items():
 # ──────────────────────────────────────────────
 # 页面标题
 # ──────────────────────────────────────────────
-st.title("📋 批量打分")
+page_title("📋 批量打分")
 st.caption("上传 Excel 文件，快速筛选数百只股票。支持最多 1000 只，给出 5 级推荐分类。"
            "结果自动保存，刷新不丢失。")
 

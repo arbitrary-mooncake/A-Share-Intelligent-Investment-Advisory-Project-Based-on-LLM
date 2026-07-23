@@ -16,7 +16,7 @@ import httpx
 
 from api_client import APIError
 from config import API_BASE_URL
-from theme import page_title
+from theme import inject_global_styles, page_title
 from components.common import safe_str
 from components.shared_sidebar import render_sidebar
 
@@ -29,6 +29,7 @@ st.set_page_config(
     page_icon="🏦",
     layout="wide",
 )
+inject_global_styles()
 render_sidebar()
 
 # ──────────────────────────────────────────────
@@ -1010,4 +1011,3 @@ with tab2:
                 st.caption(last_upd[:10] if last_upd else "-")
 
             st.markdown("<div style='margin-bottom:0.3rem;'></div>", unsafe_allow_html=True)
-

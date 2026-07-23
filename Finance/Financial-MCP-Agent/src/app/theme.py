@@ -45,9 +45,37 @@ def inject_global_styles():
     """注入全局自定义 CSS（在页面 st.set_page_config 之后调用）"""
     st.markdown(f"""
     <style>
-    /* ── 全局字体优化 ── */
+    /* ── 全局字体优化（中文优先字体栈） ── */
     html, body, [class*="css"] {{
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+            "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }}
+
+    /* ── 平滑滚动（减少页面跳转的生硬感） ── */
+    html {{
+        scroll-behavior: smooth;
+    }}
+
+    /* ── 文本选中色 ── */
+    ::selection {{
+        background: #bfdbfe;
+        color: #1e3a8a;
+    }}
+
+    /* ── 全局滚动条精修 ── */
+    ::-webkit-scrollbar {{
+        width: 8px;
+        height: 8px;
+    }}
+    ::-webkit-scrollbar-thumb {{
+        background: #cbd5e1;
+        border-radius: 8px;
+    }}
+    ::-webkit-scrollbar-thumb:hover {{
+        background: #94a3b8;
+    }}
+    ::-webkit-scrollbar-track {{
+        background: transparent;
     }}
 
     /* ── 卡片容器（L2 浮起卡片，默认样式） ── */
@@ -114,15 +142,96 @@ def inject_global_styles():
 
     /* ── Metric 美化 ── */
     .stMetric {{
-        background: {COLORS["bg"]};
-        border-radius: 8px;
-        padding: 0.5rem;
+        background: {COLORS["white"]};
+        border: 1px solid {COLORS["border"]};
+        border-radius: 10px;
+        padding: 0.6rem 0.8rem;
+        box-shadow: {SHADOWS[1]};
+        transition: box-shadow 0.18s ease, transform 0.18s ease;
+    }}
+    .stMetric:hover {{
+        box-shadow: 0 4px 12px rgba(37,99,235,0.10);
+        transform: translateY(-1px);
     }}
 
-    /* ── Button 主色覆盖 ── */
+    /* ── Button 全局精修：圆角 + 过渡 + 悬停浮起 ── */
+    .stButton > button, .stDownloadButton > button {{
+        border-radius: 8px;
+        font-weight: 600;
+        transition: all 0.18s ease;
+    }}
+    .stButton > button:hover:not(:disabled),
+    .stDownloadButton > button:hover:not(:disabled) {{
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(37,99,235,0.16);
+        border-color: #93c5fd;
+    }}
+    .stButton > button:active:not(:disabled),
+    .stDownloadButton > button:active:not(:disabled) {{
+        transform: translateY(0);
+        box-shadow: 0 1px 4px rgba(37,99,235,0.12);
+    }}
+    .stButton > button:disabled {{
+        opacity: 0.55;
+    }}
+
+    /* ── Button 主色覆盖（微妙渐变 + 悬停加深阴影） ── */
     .stButton > button[kind="primary"] {{
         background-color: {COLORS["primary"]} !important;
+        background-image: linear-gradient(160deg, #3b82f6 0%, #2563eb 55%, #1d4ed8 100%) !important;
         border-color: {COLORS["primary"]} !important;
+    }}
+    .stButton > button[kind="primary"]:hover:not(:disabled) {{
+        box-shadow: 0 6px 16px rgba(37,99,235,0.30) !important;
+        border-color: {COLORS["primary_dark"]} !important;
+    }}
+
+    /* ── 进度条精修：圆角胶囊 + 渐变填充 + 平滑宽度动画 ── */
+    [data-testid="stProgress"] > div > div {{
+        border-radius: 999px;
+        background-color: #e2e8f0;
+    }}
+    [data-testid="stProgress"] [role="progressbar"] {{
+        border-radius: 999px;
+        background-image: linear-gradient(90deg, #60a5fa 0%, #2563eb 100%);
+        transition: width 0.4s ease;
+    }}
+
+    /* ── Tabs 精修 ── */
+    [data-testid="stTabs"] [data-baseweb="tab"] {{
+        font-weight: 600;
+        border-radius: 8px 8px 0 0;
+        transition: background-color 0.15s ease, color 0.15s ease;
+    }}
+    [data-testid="stTabs"] [data-baseweb="tab"]:hover {{
+        background-color: #eff6ff;
+        color: {COLORS["primary_dark"]};
+    }}
+
+    /* ── Expander 卡片化 ── */
+    [data-testid="stExpander"] {{
+        border: 1px solid {COLORS["border"]};
+        border-radius: 10px;
+        background: {COLORS["white"]};
+        box-shadow: {SHADOWS[1]};
+        overflow: hidden;
+    }}
+
+    /* ── Alert 提示框圆角 ── */
+    [data-testid="stAlert"] {{
+        border-radius: 10px;
+    }}
+
+    /* ── DataFrame 圆角裁切 ── */
+    [data-testid="stDataFrame"] {{
+        border-radius: 10px;
+        overflow: hidden;
+    }}
+
+    /* ── 侧边栏链接过渡 ── */
+    [data-testid="stSidebar"] a {{
+        border-radius: 8px;
+        transition: background-color 0.15s ease;
     }}
 
     /* ── 选中行高亮 ── */

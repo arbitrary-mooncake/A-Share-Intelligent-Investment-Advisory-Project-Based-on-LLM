@@ -1,0 +1,36 @@
+{
+  "short": {
+    "stocks": [
+      {
+        "code": "sh.600000",
+        "name": "浦发银行",
+        "final_score": 83,
+        "validity": "valid",
+        "coverage": 1.0,
+        "missing_core_fields": [],
+        "scored_at": "2026-07-22T13:49:04.371709"
+      }
+    ],
+    "updated_at": "2026-07-22T13:49:04.371709",
+    "version": 1
+  },
+  "medium": {
+    "stocks": [],
+    "updated_at": "2026-07-22T13:49:04.371709",
+    "version": 1
+  },
+  "long": {
+    "stocks": [],
+    "updated_at": "2026-07-22T13:49:04.371709",
+    "version": 1
+  },
+  "_repository": {
+    "schema_version": 2,
+    "generation": 2,
+    "published_at": "2026-07-22T05:49:06.022456+00:00",
+    "publication_id": "8f8a74acf64340fda539c4301dacf87e",
+    "status": "current",
+    "contract_status": "current",
+    "legacy_terms": []
+  }
+}

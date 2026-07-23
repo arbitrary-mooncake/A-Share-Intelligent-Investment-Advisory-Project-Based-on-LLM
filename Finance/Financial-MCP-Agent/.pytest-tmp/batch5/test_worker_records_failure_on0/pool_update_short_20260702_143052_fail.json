@@ -1,0 +1,13 @@
+{
+  "job_id": "pool_update_short_20260702_143052_fail",
+  "term": "short",
+  "status": "failed",
+  "mode": "full",
+  "pid": 7680,
+  "parent_pid": 19940,
+  "started_at": null,
+  "finished_at": "2026-07-22T14:44:29.046797",
+  "error": "RuntimeError: simulated orchestrator failure\nTraceback (most recent call last):\n  File \"C:\\Users\\龙皇异次元\\Desktop\\cc_work\\A股智能投顾Agent助手\\Finance\\Financial-MCP-Agent\\src\\eval\\pool_update_worker.py\", line 169, in <module>\n    main()\n    ~~~~^^\n  File \"C:\\Users\\龙皇异次元\\Desktop\\cc_work\\A股智能投顾Agent助手\\Finance\\Financial-MCP-Agent\\src\\eval\\pool_update_worker.py\", line 112, in main\n    result = asyncio.run(\n        orch.run_pool_update(term, mode=mode, on_progress=on_progress, on_stage=on_stage)\n    )\n  File \"C:\\ProgramData\\anaconda3\\Lib\\asyncio\\runners.py\", line 195, in run\n    return runner.run(main)\n           ~~~~~~~~~~^^^^^^\n  File \"C:\\ProgramData\\anaconda3\\Lib\\asyncio\\runners.py\", line 118, in run\n    return self._loop.run_until_complete(task)\n           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n  File \"C:\\ProgramData\\anaconda3\\Lib\\asyncio\\base_events.py\", line 725, in run_until_complete\n    return future.result()\n           ~~~~~~~~~~~~~^^\n  File \"C:\\Users\\龙皇异次元\\Desktop\\cc_work\\A股智能投顾Agent助手\\Finance\\Financial-MCP-Agent\\src\\eval\\pool_update_worker.py\", line 66, in _raise\n    raise RuntimeError(\"simulated orchestrator failure\")\nRuntimeError: simulated orchestrator failure\n",
+  "progress": {},
+  "completed_stocks": []
+}

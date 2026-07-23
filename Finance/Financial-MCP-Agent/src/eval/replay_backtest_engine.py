@@ -1086,54 +1086,6 @@ class ReplayBacktestEngine:
 
         return base_score * (1.0 - discount)
 
-    def _fallback_composite_score(
-        self, stock_code: str, anchor_date: str
-    ) -> float:
-        """
-        当Tushare不可用时的回退方案：基于股票代码段位+日期的确定性估算。
-        不使用任何随机数或哈希。
-        """
-        code_clean = stock_code.replace("sh.", "").replace("sz.", "")
-
-        # 基于代码段位的基准分
-        if code_clean.startswith("60"):
-            base = 55.0  # 上海主板
-        elif code_clean.startswith("00"):
-            base = 53.0  # 深圳主板
-        elif code_clean.startswith("30"):
-            base = 50.0  # 创业板
-        elif code_clean.startswith("68"):
-            base = 48.0  # 科创板
-        else:
-            base = 50.0
-
-        # 基于anchor_date的年代/月份做市场面貌修正
-        try:
-            ad = datetime.strptime(anchor_date, "%Y-%m-%d")
-            # 月份季节性 (A股年报/一季报行情)
-            month = ad.month
-            if month in (3, 4):
-                base += 3.0  # 年报/一季报行情
-            elif month in (9, 10):
-                base += 2.0  # 三季报+国庆行情
-            elif month in (1, 12):
-                base -= 2.0  # 年末流动性偏紧
-
-            # 年代因子
-            year = ad.year
-            if year == 2022:
-                base -= 4.0  # 熊市年
-            elif year == 2023:
-                base -= 3.0  # 震荡偏熊
-            elif year == 2024:
-                base += 0.0  # 震荡
-            elif year >= 2025:
-                base += 2.0  # 政策牛
-        except Exception:
-            pass
-
-        return min(max(base, 35.0), 80.0)
-
     @staticmethod
     def _bounded_score(value: float) -> float:
         return min(max(float(value), 0.0), 100.0)
